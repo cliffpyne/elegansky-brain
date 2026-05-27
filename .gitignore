@@ -4,3 +4,4 @@ tokens.json
 legal/
 *.log
 .DS_Store
+google-service-account.json

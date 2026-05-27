@@ -3,6 +3,7 @@ import express from 'express';
 import OAuthClient from 'intuit-oauth';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from './sheets.js';
 
 const {
   QB_CLIENT_ID,
@@ -188,7 +189,43 @@ app.get('/summary', async (req, res) => {
   }
 });
 
+// --- Google Sheets endpoints ---
+
+app.get('/sheets', async (req, res) => {
+  try {
+    const files = await listSharedSheets();
+    res.json({
+      serviceAccount: serviceAccountEmail(),
+      count: files.length,
+      files,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/sheets/:id/meta', async (req, res) => {
+  try {
+    res.json(await sheetMetadata(req.params.id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/sheets/:id', async (req, res) => {
+  try {
+    res.json(await readSheet(req.params.id, req.query.range));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`EleganskyBrain → http://localhost:${PORT}`);
   console.log(`Environment: ${QB_ENVIRONMENT}`);
+  try {
+    console.log(`Google Sheets service account: ${serviceAccountEmail()}`);
+  } catch (e) {
+    console.log(`Google Sheets: not configured (${e.message})`);
+  }
 });
