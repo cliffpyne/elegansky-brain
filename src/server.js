@@ -22,6 +22,7 @@ const oauthClient = new OAuthClient({
   clientSecret: QB_CLIENT_SECRET,
   environment: QB_ENVIRONMENT,
   redirectUri: QB_REDIRECT_URI,
+  timeout: 90000,
 });
 
 const TOKENS_FILE = 'tokens.json';
@@ -154,9 +155,15 @@ app.get('/disconnect', async (req, res) => {
 
 app.get('/invoices', async (req, res) => {
   try {
-    const result = await qbQuery('SELECT * FROM Invoice MAXRESULTS 1000');
+    const pageSize = Math.min(Number(req.query.pageSize) || 100, 1000);
+    const start = Math.max(Number(req.query.start) || 1, 1);
+    const result = await qbQuery(`SELECT * FROM Invoice STARTPOSITION ${start} MAXRESULTS ${pageSize}`);
     const invoices = result.QueryResponse?.Invoice ?? [];
-    res.json({ count: invoices.length, invoices });
+    const nextStart = invoices.length === pageSize ? start + pageSize : null;
+    res.json({
+      page: { start, pageSize, returned: invoices.length, nextStart },
+      invoices,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
   }
