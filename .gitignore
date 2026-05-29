@@ -1,5 +1,7 @@
 node_modules/
 .env
+# allow web/.env so Vite picks up VITE_* (Supabase anon, brand) at build
+!web/.env
 tokens.json
 legal/
 *.log

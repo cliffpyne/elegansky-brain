@@ -1,6 +1,8 @@
 node_modules/
 dist/
-.env
+# .env is committed — Vite inlines VITE_* at build time, and these are
+# public by design (Supabase anon key, brand strings). Service-role keys
+# never go in here.
 .env.local
 *.log
 .DS_Store
