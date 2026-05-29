@@ -113,19 +113,10 @@ export function mountCyclesApi(app) {
     }
   });
 
-  // ── GET /api/cycles/:id — single cycle (with screenshots) ────────────────
-  app.get('/api/cycles/:id', requireSupabaseJwt, async (req, res) => {
-    try {
-      const r = await db().query(`SELECT * FROM statement_cycles WHERE id = $1`, [req.params.id]);
-      if (!r.rows.length) return res.status(404).json({ error: 'not found' });
-      res.json({ cycle: r.rows[0] });
-    } catch (err) {
-      console.error('[GET /api/cycles/:id] ', err);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
   // ── GET /api/cycles/_summary — last NMB + last CRDB + 24h counts ─────────
+  // MUST be registered before /:id below — Express matches in declaration
+  // order, so /:id would otherwise swallow /_summary and Postgres rejects
+  // "_summary" as a UUID.
   // Drives the top status cards on the dashboard. Cheap query, cached for 5s
   // would be nice later but we just hit the DB each time for v1.
   app.get('/api/cycles/_summary', requireSupabaseJwt, async (_req, res) => {
@@ -146,6 +137,19 @@ export function mountCyclesApi(app) {
       res.json({ last: last.rows, counts_24h: counts.rows });
     } catch (err) {
       console.error('[GET /api/cycles/_summary] ', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── GET /api/cycles/:id — single cycle (with screenshots) ────────────────
+  // Registered LAST so static sub-paths above (e.g. /_summary) win the match.
+  app.get('/api/cycles/:id', requireSupabaseJwt, async (req, res) => {
+    try {
+      const r = await db().query(`SELECT * FROM statement_cycles WHERE id = $1`, [req.params.id]);
+      if (!r.rows.length) return res.status(404).json({ error: 'not found' });
+      res.json({ cycle: r.rows[0] });
+    } catch (err) {
+      console.error('[GET /api/cycles/:id] ', err);
       res.status(500).json({ error: err.message });
     }
   });
