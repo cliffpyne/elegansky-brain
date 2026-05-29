@@ -3,7 +3,12 @@ import express from 'express';
 import OAuthClient from 'intuit-oauth';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from './sheets.js';
+import { mountCyclesApi } from './cycles.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const {
   QB_CLIENT_ID,
@@ -79,26 +84,18 @@ async function qbQuery(sql) {
 
 const app = express();
 app.set('trust proxy', true); // ngrok / Cloudflare / any reverse proxy
+// Worker reports + screenshots can be a few hundred KB. Default 100kb won't fit.
+app.use(express.json({ limit: '4mb' }));
 
-app.get('/', (req, res) => {
+// /api/cycles* — statement-pull dashboard data plane.
+mountCyclesApi(app);
+
+// (legacy / homepage removed — the Vite dashboard now owns "/" and the React
+// router handles all client-side paths. QB OAuth status moves to /api/qb/status
+// for the dashboard to consume in a follow-up.)
+app.get('/api/qb/status', (_req, res) => {
   const tokens = loadTokens();
-  const connected = !!tokens;
-  res.send(`<!doctype html>
-<html><head><meta charset="utf-8"><title>EleganskyBrain</title>
-<style>body{font-family:system-ui;max-width:680px;margin:3rem auto;padding:0 1rem;line-height:1.6}
-a.btn{display:inline-block;padding:.6rem 1.2rem;background:#0a5fdb;color:#fff;text-decoration:none;border-radius:6px;margin-right:.5rem}
-a.btn.alt{background:#444}
-code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style>
-</head><body>
-<h1>EleganskyBrain — BRAIN</h1>
-<p>Status: <strong>${connected ? '🟢 Connected to QuickBooks' : '🔴 Not connected'}</strong></p>
-${connected
-  ? `<p>Realm: <code>${tokens.realmId}</code></p>
-     <p><a class="btn" href="/invoices">View invoices</a>
-        <a class="btn" href="/summary">Master summary</a>
-        <a class="btn alt" href="/disconnect">Disconnect</a></p>`
-  : `<p><a class="btn" href="/connect">Connect to QuickBooks</a></p>`}
-</body></html>`);
+  res.json({ connected: !!tokens, realmId: tokens?.realmId ?? null });
 });
 
 app.get('/connect', (req, res) => {
@@ -219,6 +216,28 @@ app.get('/sheets/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── Serve the Vite dashboard (build output) ────────────────────────────────
+// `web/dist/` is produced by `npm --prefix web run build`. In production we
+// serve it as static assets at root, with SPA fallback so client-side routes
+// like /statement-cycles work even when the user reloads.
+const DASHBOARD_DIR = path.join(__dirname, '..', 'web', 'dist');
+if (existsSync(DASHBOARD_DIR)) {
+  console.log(`Dashboard: serving ${DASHBOARD_DIR}`);
+  app.use(express.static(DASHBOARD_DIR, { index: false, maxAge: '1d' }));
+  // SPA fallback — anything not already handled by an /api/* / OAuth / QB
+  // legacy route gets the React shell so the client router can resolve.
+  app.get(
+    /^\/(?!api\/|connect$|callback$|disconnect$|invoices$|summary$|sheets(\/|$)).*/,
+    (_req, res, next) => {
+      const indexFile = path.join(DASHBOARD_DIR, 'index.html');
+      if (!existsSync(indexFile)) return next();
+      res.sendFile(indexFile);
+    },
+  );
+} else {
+  console.log(`Dashboard: ${DASHBOARD_DIR} not built — skipping static serve`);
+}
 
 app.listen(PORT, () => {
   console.log(`EleganskyBrain → http://localhost:${PORT}`);

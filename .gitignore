@@ -5,3 +5,5 @@ legal/
 *.log
 .DS_Store
 google-service-account.json
+web/dist/
+web/node_modules/

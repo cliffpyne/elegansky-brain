@@ -1,0 +1,34 @@
+import { Navigate, Route, Routes } from 'react-router';
+import { AuthRouting } from '@/auth/auth-routing';
+import { RequireAuth } from '@/auth/require-auth';
+import { ErrorRouting } from '@/errors/error-routing';
+import { Demo1Layout } from '@/layouts/demo1/layout';
+import { StatementCyclesPage } from '@/pages/statement-cycles/statement-cycles-page';
+import { StatementCycleDetailPage } from '@/pages/statement-cycles/statement-cycle-detail-page';
+
+/**
+ * BRAIN dashboard routing — slimmed down from Metronic's giant demo router.
+ * Only one functional area for now: Statement Cycles.
+ *
+ *   /                       → redirect to /statement-cycles
+ *   /statement-cycles       → list view
+ *   /statement-cycles/:id   → drilldown
+ *   /auth/*                 → magic-link sign-in
+ *   /error/*                → 404 etc.
+ */
+export function AppRoutingSetup() {
+  return (
+    <Routes>
+      <Route element={<RequireAuth />}>
+        <Route element={<Demo1Layout />}>
+          <Route index element={<Navigate to="/statement-cycles" replace />} />
+          <Route path="/statement-cycles" element={<StatementCyclesPage />} />
+          <Route path="/statement-cycles/:id" element={<StatementCycleDetailPage />} />
+        </Route>
+      </Route>
+      <Route path="error/*" element={<ErrorRouting />} />
+      <Route path="auth/*" element={<AuthRouting />} />
+      <Route path="*" element={<Navigate to="/error/404" />} />
+    </Routes>
+  );
+}

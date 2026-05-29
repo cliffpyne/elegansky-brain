@@ -6,13 +6,19 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "web:install": "npm --prefix web install",
+    "web:build": "npm --prefix web run build",
+    "build": "npm run web:install && npm run web:build",
+    "postinstall": "npm run web:install || true"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "googleapis": "^172.0.0",
-    "intuit-oauth": "^4.2.0"
+    "intuit-oauth": "^4.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.21.0"
   },
   "engines": {
     "node": ">=20"

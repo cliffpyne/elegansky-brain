@@ -1,0 +1,33 @@
+# Render blueprint for BRAIN — Express API + Vite dashboard served from the
+# same web service. Domain target: brain.eleganskyboda.com (swap CNAME from
+# GitHub Pages → Render after first deploy).
+services:
+  - type: web
+    name: elegansky-brain
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/qb/status
+    envVars:
+      # QuickBooks OAuth (production app keys — set in dashboard, never commit)
+      - key: QB_CLIENT_ID
+        sync: false
+      - key: QB_CLIENT_SECRET
+        sync: false
+      - key: QB_REDIRECT_URI
+        sync: false # e.g. https://brain.eleganskyboda.com/callback
+      - key: QB_ENVIRONMENT
+        value: production
+
+      # Supabase Postgres — same DB as the disburser/statement-pull workers
+      - key: DATABASE_URL
+        sync: false
+      # Used to verify the dashboard's Supabase JWT on /api/cycles GET
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+
+      # Shared secret — the statement-pull worker sends X-Report-Secret with
+      # this value on every POST /api/cycles. Must match the worker's env.
+      - key: STATEMENT_REPORT_SECRET
+        sync: false
