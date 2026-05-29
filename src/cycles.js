@@ -1,10 +1,19 @@
-import jwt from 'jsonwebtoken';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 
 const {
   STATEMENT_REPORT_SECRET,
-  SUPABASE_JWT_SECRET,
+  SUPABASE_URL,
 } = process.env;
+
+// Verify Supabase access tokens via the project's JWKS endpoint. Works with
+// both the legacy HS256 shared secret AND the new ECC P-256 asymmetric keys
+// — Supabase publishes both at /auth/v1/.well-known/jwks.json and the jose
+// library picks the right key per token's `kid` header. The JWKSet caches
+// in memory + refreshes on key rotation.
+const SUPABASE_JWKS = SUPABASE_URL
+  ? createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`))
+  : null;
 
 /**
  * Mount the statement-cycles API on the given Express app.
@@ -151,15 +160,17 @@ function requireReportSecret(req, res, next) {
   next();
 }
 
-function requireSupabaseJwt(req, res, next) {
-  if (!SUPABASE_JWT_SECRET) {
-    return res.status(503).json({ error: 'SUPABASE_JWT_SECRET not configured on server' });
+async function requireSupabaseJwt(req, res, next) {
+  if (!SUPABASE_JWKS) {
+    return res.status(503).json({ error: 'SUPABASE_URL not configured on server' });
   }
   const auth = req.get('authorization') || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'missing bearer token' });
   try {
-    const payload = jwt.verify(token, SUPABASE_JWT_SECRET);
+    const { payload } = await jwtVerify(token, SUPABASE_JWKS, {
+      issuer: `${SUPABASE_URL}/auth/v1`,
+    });
     req.user = { id: payload.sub, email: payload.email, role: payload.role };
     next();
   } catch (err) {

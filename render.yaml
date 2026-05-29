@@ -23,9 +23,11 @@ services:
       # Supabase Postgres — same DB as the disburser/statement-pull workers
       - key: DATABASE_URL
         sync: false
-      # Used to verify the dashboard's Supabase JWT on /api/cycles GET
-      - key: SUPABASE_JWT_SECRET
-        sync: false
+      # Supabase project URL — used to fetch the JWKS (public keys) for
+      # verifying the dashboard's access tokens. Works with both legacy
+      # HS256 and current ECC P-256 keys.
+      - key: SUPABASE_URL
+        value: "https://vmuuzxgqfagwmbxfhcqh.supabase.co"
 
       # Shared secret — the statement-pull worker sends X-Report-Secret with
       # this value on every POST /api/cycles. Must match the worker's env.
