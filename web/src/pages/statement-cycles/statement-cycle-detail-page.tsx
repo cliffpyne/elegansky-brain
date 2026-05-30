@@ -19,6 +19,13 @@ export function StatementCycleDetailPage() {
   const [activeShot, setActiveShot] = useState(0);
 
   useEffect(() => {
+    document.title = cycle ? `BRAIN — ${cycle.bank} cycle` : 'BRAIN — Cycle';
+    return () => {
+      document.title = 'BRAIN';
+    };
+  }, [cycle]);
+
+  useEffect(() => {
     if (!id) return;
     getCycle(id)
       .then((r) => setCycle(r.cycle))
