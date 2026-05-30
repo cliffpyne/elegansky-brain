@@ -171,45 +171,126 @@ app.get('/invoices', async (req, res) => {
 });
 
 /**
- * /arrears — overdue, still-unpaid invoices, equivalent to your existing
- *           ARREAR.xls (Type=Invoices, Status=Overdue, Date=All).
+ * Customer id → FullyQualifiedName cache.
  *
- * QB "overdue" = Balance > 0 AND DueDate < today. We page through QB and
- * either return JSON (default) or a stats summary (?summary=1) so you can
- * cheaply compare against the .xls totals (count + outstanding balance).
+ * QB's Invoice rows only carry CustomerRef = { value: id, name: leafName },
+ * not the full hierarchical "BRANCH:LEADER:GROUP:CUSTOMER" path needed to
+ * match the operator's ARREAR.xls. We pull every Customer once and key by
+ * id. Refreshed on demand if more than 5 min stale (customer hierarchy
+ * changes rarely; invoices reference existing customers).
+ */
+const CUSTOMER_CACHE = { map: null, builtAt: 0 };
+const CUSTOMER_TTL_MS = 5 * 60_000;
+
+async function getCustomerPathMap() {
+  if (CUSTOMER_CACHE.map && Date.now() - CUSTOMER_CACHE.builtAt < CUSTOMER_TTL_MS) {
+    return CUSTOMER_CACHE.map;
+  }
+  const map = new Map();
+  const PAGE = 1000;
+  let start = 1;
+  // QB's "Active" filter excludes archived customers; we include both because
+  // an active invoice could still reference an archived customer.
+  while (start < 200_000) {
+    const sql = `SELECT Id, FullyQualifiedName, DisplayName FROM Customer STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
+    const r = await qbQuery(sql);
+    const customers = r.QueryResponse?.Customer ?? [];
+    if (!customers.length) break;
+    for (const c of customers) {
+      map.set(String(c.Id), c.FullyQualifiedName || c.DisplayName || `Customer ${c.Id}`);
+    }
+    if (customers.length < PAGE) break;
+    start += PAGE;
+  }
+  CUSTOMER_CACHE.map = map;
+  CUSTOMER_CACHE.builtAt = Date.now();
+  console.log(`[customers] built cache: ${map.size} customers`);
+  return map;
+}
+
+/**
+ * /arrears — overdue, still-unpaid invoices, equivalent to ARREAR.xls
+ *           (Type=Invoices, Status=Overdue, Date=All).
+ *
+ * QB "overdue" = Balance > 0 AND DueDate < today. We page through QB,
+ * enrich each invoice with the customer's full path (BRANCH:LEADER:
+ * GROUP:CUSTOMER) using a cached Customer table lookup, and return the
+ * .xls schema:
+ *
+ *   { date, type, no, customer, memo, balance, amount, status, qbId,
+ *     dueDate, branch, customerLeaf }
+ *
+ * Plus aggregate fields (asOf, page) on the envelope.
  *
  * Query params:
- *   ?summary=1       — return only { count, totalBalance, asOf } (cheap)
- *   ?pageSize=1000   — invoices per page (max 1000, QB default 100)
+ *   ?summary=1       — return only { count, totalBalance, branches } (cheap)
+ *   ?pageSize=100    — invoices per page (max 1000)
  *   ?start=1         — STARTPOSITION (1-based)
- *   ?asOf=YYYY-MM-DD — override "today" cutoff (default = server today)
+ *   ?asOf=YYYY-MM-DD — override "today" cutoff
+ *   ?branch=<name>   — filter to one branch (matches first ":" segment)
+ *   ?q=<text>        — match in customer path OR invoice number (substring)
  */
 app.get('/arrears', async (req, res) => {
   try {
     const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
     const wantSummary = req.query.summary === '1' || req.query.summary === 'true';
+    const branchFilter = (req.query.branch || '').toString().toLowerCase();
+    const qFilter = (req.query.q || '').toString().toLowerCase();
+
+    const customerMap = await getCustomerPathMap();
+
+    /** Enrich one QB Invoice → flat .xls-shaped row. */
+    const enrich = (inv) => {
+      const customerId = String(inv.CustomerRef?.value ?? '');
+      const customer =
+        customerMap.get(customerId) || inv.CustomerRef?.name || '(unknown customer)';
+      const parts = customer.split(':');
+      const branch = parts[0] || '(unknown)';
+      const customerLeaf = parts[parts.length - 1] || customer;
+      return {
+        qbId: inv.Id,
+        date: inv.TxnDate,
+        dueDate: inv.DueDate,
+        type: 'Invoice',
+        no: inv.DocNumber || '',
+        customer,
+        branch,
+        customerLeaf,
+        memo: inv.CustomerMemo?.value || inv.PrivateNote || '',
+        balance: Number(inv.Balance ?? 0),
+        amount: Number(inv.TotalAmt ?? 0),
+        status: 'overdue',
+      };
+    };
+
+    const matchesFilters = (row) => {
+      if (branchFilter && row.branch.toLowerCase() !== branchFilter) return false;
+      if (qFilter && !`${row.customer} ${row.no}`.toLowerCase().includes(qFilter)) return false;
+      return true;
+    };
 
     if (wantSummary) {
-      // QB doesn't expose SUM() in its SQL dialect — we page-walk and tally.
+      // QB doesn't expose SUM(); page-walk the whole filtered set in chunks
+      // of 1000 and tally on our side.
       const PAGE = 1000;
       let start = 1;
       let count = 0;
       let totalBalance = 0;
       const branchCounts = {};
-      // Hard cap to avoid runaways — your file has ~13.5k rows.
-      while (start < 50_000) {
+      while (start < 200_000) {
         const sql =
-          `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef ` +
+          `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
           `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
           `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
         const r = await qbQuery(sql);
         const invs = r.QueryResponse?.Invoice ?? [];
         if (!invs.length) break;
         for (const inv of invs) {
+          const row = enrich(inv);
+          if (!matchesFilters(row)) continue;
           count++;
-          totalBalance += Number(inv.Balance ?? 0);
-          const branchName = (inv.CustomerRef?.name ?? '').split(':')[0] || '(unknown)';
-          branchCounts[branchName] = (branchCounts[branchName] || 0) + 1;
+          totalBalance += row.balance;
+          branchCounts[row.branch] = (branchCounts[row.branch] || 0) + 1;
         }
         if (invs.length < PAGE) break;
         start += PAGE;
@@ -222,20 +303,23 @@ app.get('/arrears', async (req, res) => {
       });
     }
 
-    // Full list (paginated).
+    // Paginated list. We over-fetch by 50% to absorb filter drop-outs without
+    // shipping multiple round-trips for one dashboard page request.
     const pageSize = Math.min(Number(req.query.pageSize) || 100, 1000);
     const start = Math.max(Number(req.query.start) || 1, 1);
+    const fetchSize = branchFilter || qFilter ? Math.min(1000, pageSize * 4) : pageSize;
     const sql =
-      `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef ` +
+      `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
       `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
-      `STARTPOSITION ${start} MAXRESULTS ${pageSize}`;
+      `STARTPOSITION ${start} MAXRESULTS ${fetchSize}`;
     const r = await qbQuery(sql);
-    const invoices = r.QueryResponse?.Invoice ?? [];
-    const nextStart = invoices.length === pageSize ? start + pageSize : null;
+    const raw = r.QueryResponse?.Invoice ?? [];
+    const rows = raw.map(enrich).filter(matchesFilters).slice(0, pageSize);
+    const nextStart = raw.length === fetchSize ? start + fetchSize : null;
     res.json({
       asOf,
-      page: { start, pageSize, returned: invoices.length, nextStart },
-      invoices,
+      page: { start, pageSize, returned: rows.length, nextStart },
+      invoices: rows,
     });
   } catch (err) {
     console.error('[GET /arrears]', err);
