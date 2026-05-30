@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from './sheets.js';
 import { mountCyclesApi } from './cycles.js';
+import { mountSettingsApi } from './settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -89,6 +90,8 @@ app.use(express.json({ limit: '4mb' }));
 
 // /api/cycles* — statement-pull dashboard data plane.
 mountCyclesApi(app);
+// /api/settings* — runtime toggles (loop kill switch).
+mountSettingsApi(app);
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status

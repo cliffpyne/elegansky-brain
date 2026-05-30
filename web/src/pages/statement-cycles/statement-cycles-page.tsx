@@ -17,14 +17,17 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { RefreshCw, AlertCircle, CheckCircle2, ChevronRight } from 'lucide-react';
+import { RefreshCw, AlertCircle, CheckCircle2, ChevronRight, Power, PowerOff } from 'lucide-react';
 import {
   listCycles,
   getSummary,
   relativeTime,
   formatDuration,
+  getSetting,
+  setSetting,
   type CycleSummaryRow,
   type SummaryResp,
+  type Setting,
 } from '@/lib/brain-api';
 
 const REFRESH_MS = 30_000;
@@ -32,15 +35,22 @@ const REFRESH_MS = 30_000;
 export function StatementCyclesPage() {
   const [summary, setSummary] = useState<SummaryResp | null>(null);
   const [cycles, setCycles] = useState<CycleSummaryRow[]>([]);
+  const [loopSetting, setLoopSetting] = useState<Setting | null>(null);
   const [loading, setLoading] = useState(true);
+  const [toggling, setToggling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [s, l] = await Promise.all([getSummary(), listCycles({ limit: 50 })]);
+      const [s, l, ls] = await Promise.all([
+        getSummary(),
+        listCycles({ limit: 50 }),
+        getSetting('statement_pull_enabled').catch(() => null),
+      ]);
       setSummary(s);
       setCycles(l.cycles);
+      if (ls) setLoopSetting(ls);
       setError(null);
       setLastFetched(new Date());
     } catch (e) {
@@ -49,6 +59,23 @@ export function StatementCyclesPage() {
       setLoading(false);
     }
   }, []);
+
+  const toggleLoop = useCallback(async () => {
+    if (!loopSetting) return;
+    const next = loopSetting.value === 'true' ? 'false' : 'true';
+    setToggling(true);
+    try {
+      const updated = await setSetting('statement_pull_enabled', next);
+      setLoopSetting(updated);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setToggling(false);
+    }
+  }, [loopSetting]);
+
+  const loopEnabled = loopSetting?.value === 'true';
+  const loopAutoDisabled = loopSetting?.updated_by?.startsWith('worker:auto-disable');
 
   useEffect(() => {
     refresh();
@@ -85,12 +112,57 @@ export function StatementCyclesPage() {
             description="Live status of NMB + CRDB statement-pull worker on Render. Auto-refresh every 30s."
           />
           <ToolbarActions>
+            {loopSetting && (
+              <Button
+                variant={loopEnabled ? 'default' : 'destructive'}
+                onClick={toggleLoop}
+                disabled={toggling}
+                className="gap-2"
+              >
+                {loopEnabled ? (
+                  <>
+                    <Power className="size-4" /> Loop ON
+                  </>
+                ) : (
+                  <>
+                    <PowerOff className="size-4" /> Loop OFF
+                  </>
+                )}
+              </Button>
+            )}
             <Button variant="outline" onClick={refresh} disabled={loading}>
               <RefreshCw className={`size-4 ${loading ? 'animate-spin' : ''}`} />
               Refresh
             </Button>
           </ToolbarActions>
         </Toolbar>
+
+        {/* Auto-disabled banner — explains why the loop is off so admin knows
+            what to investigate before flipping it back on. */}
+        {loopSetting && !loopEnabled && (
+          <Card
+            className={`mb-4 ${loopAutoDisabled ? 'border-destructive/30 bg-destructive/5' : 'border-amber-500/30 bg-amber-500/5'}`}
+          >
+            <CardContent className="flex items-start gap-3 py-4">
+              <AlertCircle
+                className={`size-5 shrink-0 mt-0.5 ${loopAutoDisabled ? 'text-destructive' : 'text-amber-600'}`}
+              />
+              <div className="flex-1">
+                <div className={`font-medium ${loopAutoDisabled ? 'text-destructive' : 'text-amber-700'}`}>
+                  Loop is OFF — no new cycles will run until you turn it back on.
+                </div>
+                <div className="text-sm text-muted-foreground mt-1">
+                  {loopAutoDisabled
+                    ? 'The worker auto-disabled the loop after 3 failed retries. Reason: '
+                    : 'Disabled by '}
+                  <span className="font-mono">{loopSetting.updated_by ?? 'unknown'}</span>
+                  {' · '}
+                  <span>{new Date(loopSetting.updated_at).toLocaleString()}</span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {error && (
           <Card className="mb-4 border-destructive/30 bg-destructive/5">

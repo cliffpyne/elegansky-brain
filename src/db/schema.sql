@@ -33,3 +33,21 @@ CREATE INDEX IF NOT EXISTS idx_statement_cycles_bank_reported_at
 
 CREATE INDEX IF NOT EXISTS idx_statement_cycles_status
   ON statement_cycles (status);
+
+-- BRAIN: small key/value store for runtime toggles + audit log.
+-- Used right now for the statement-pull "loop enabled" kill switch.
+-- The worker reads `statement_pull_enabled` before each tick; if it's
+-- "false", the tick is skipped. The dashboard exposes a toggle that
+-- writes here. When retries exhaust, the worker auto-flips it to false
+-- and (when SMS is wired) notifies the admin.
+CREATE TABLE IF NOT EXISTS app_settings (
+  key         text         PRIMARY KEY,
+  value       text         NOT NULL,
+  updated_at  timestamptz  NOT NULL DEFAULT now(),
+  updated_by  text         -- "admin:fmlaki@gmail.com" or "worker:auto-disable"
+);
+
+-- Seed: loop is enabled by default. Admin can toggle in dashboard.
+INSERT INTO app_settings (key, value, updated_by)
+VALUES ('statement_pull_enabled', 'true', 'migration:initial-seed')
+ON CONFLICT (key) DO NOTHING;

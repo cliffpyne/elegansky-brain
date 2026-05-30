@@ -94,3 +94,34 @@ export function formatDuration(ms: number): string {
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60_000).toFixed(1)}m`;
 }
+
+// ── Settings (loop kill switch) ────────────────────────────────────────
+export interface Setting {
+  key: string;
+  value: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+
+export async function getSetting(key: string): Promise<Setting> {
+  const r = await authed(`/api/settings/${encodeURIComponent(key)}`);
+  if (!r.ok) throw new Error(`getSetting ${r.status}: ${await r.text()}`);
+  const body = (await r.json()) as { setting: Setting };
+  return body.setting;
+}
+
+export async function setSetting(key: string, value: string): Promise<Setting> {
+  const session = (await supabase.auth.getSession()).data.session;
+  const token = session?.access_token;
+  const r = await fetch(`${API_BASE}/api/settings/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ value }),
+  });
+  if (!r.ok) throw new Error(`setSetting ${r.status}: ${await r.text()}`);
+  const body = (await r.json()) as { setting: Setting };
+  return body.setting;
+}
