@@ -170,6 +170,79 @@ app.get('/invoices', async (req, res) => {
   }
 });
 
+/**
+ * /arrears — overdue, still-unpaid invoices, equivalent to your existing
+ *           ARREAR.xls (Type=Invoices, Status=Overdue, Date=All).
+ *
+ * QB "overdue" = Balance > 0 AND DueDate < today. We page through QB and
+ * either return JSON (default) or a stats summary (?summary=1) so you can
+ * cheaply compare against the .xls totals (count + outstanding balance).
+ *
+ * Query params:
+ *   ?summary=1       — return only { count, totalBalance, asOf } (cheap)
+ *   ?pageSize=1000   — invoices per page (max 1000, QB default 100)
+ *   ?start=1         — STARTPOSITION (1-based)
+ *   ?asOf=YYYY-MM-DD — override "today" cutoff (default = server today)
+ */
+app.get('/arrears', async (req, res) => {
+  try {
+    const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
+    const wantSummary = req.query.summary === '1' || req.query.summary === 'true';
+
+    if (wantSummary) {
+      // QB doesn't expose SUM() in its SQL dialect — we page-walk and tally.
+      const PAGE = 1000;
+      let start = 1;
+      let count = 0;
+      let totalBalance = 0;
+      const branchCounts = {};
+      // Hard cap to avoid runaways — your file has ~13.5k rows.
+      while (start < 50_000) {
+        const sql =
+          `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef ` +
+          `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
+          `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
+        const r = await qbQuery(sql);
+        const invs = r.QueryResponse?.Invoice ?? [];
+        if (!invs.length) break;
+        for (const inv of invs) {
+          count++;
+          totalBalance += Number(inv.Balance ?? 0);
+          const branchName = (inv.CustomerRef?.name ?? '').split(':')[0] || '(unknown)';
+          branchCounts[branchName] = (branchCounts[branchName] || 0) + 1;
+        }
+        if (invs.length < PAGE) break;
+        start += PAGE;
+      }
+      return res.json({
+        asOf,
+        count,
+        totalBalance: Math.round(totalBalance * 100) / 100,
+        branches: branchCounts,
+      });
+    }
+
+    // Full list (paginated).
+    const pageSize = Math.min(Number(req.query.pageSize) || 100, 1000);
+    const start = Math.max(Number(req.query.start) || 1, 1);
+    const sql =
+      `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${pageSize}`;
+    const r = await qbQuery(sql);
+    const invoices = r.QueryResponse?.Invoice ?? [];
+    const nextStart = invoices.length === pageSize ? start + pageSize : null;
+    res.json({
+      asOf,
+      page: { start, pageSize, returned: invoices.length, nextStart },
+      invoices,
+    });
+  } catch (err) {
+    console.error('[GET /arrears]', err);
+    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
 app.get('/summary', async (req, res) => {
   try {
     const [inv, cust, pay, bill] = await Promise.all([
