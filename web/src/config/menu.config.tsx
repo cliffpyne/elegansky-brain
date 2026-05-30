@@ -55,7 +55,19 @@ export const MENU_SIDEBAR: MenuConfig = [
 // don't break, but they're effectively unused by BRAIN.
 export const MENU_SIDEBAR_CUSTOM: MenuConfig = MENU_SIDEBAR;
 export const MENU_SIDEBAR_COMPACT: MenuConfig = MENU_SIDEBAR;
-export const MENU_MEGA: MenuConfig = [];
+// MENU_MEGA must have at least 6 items because demo1's mega-menu reads them
+// by index ([0]..[5]) — `undefined.title` blanks the whole React tree. We
+// fill the slots with the sidebar items so accesses are safe even though the
+// top horizontal nav becomes a (harmless) duplicate of the sidebar.
+const _megaSlots: MenuConfig = [
+  { title: 'Overview', path: '/statement-cycles', children: [] },
+  { title: 'Operations', path: '/statement-cycles', children: [] },
+  { title: 'Insights', path: '/coming-soon', children: [], disabled: true },
+  { title: 'System', path: '/coming-soon', children: [], disabled: true },
+  { title: 'Settings', path: '/coming-soon', children: [], disabled: true },
+  { title: 'Help', path: '/coming-soon', children: [], disabled: true },
+];
+export const MENU_MEGA: MenuConfig = _megaSlots;
 export const MENU_MEGA_MOBILE: MenuConfig = MENU_SIDEBAR;
 export const MENU_HELP: MenuConfig = [];
 export const MENU_ROOT: MenuConfig = MENU_SIDEBAR;
