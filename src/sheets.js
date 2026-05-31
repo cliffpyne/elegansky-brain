@@ -132,12 +132,36 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
       }
       return null;
     }
-    m = txt.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
+    // "DD Mon YYYY" or "DD-Mon-YYYY" or "DD/Mon/YYYY"
+    m = txt.match(/^(\d{1,2})[\s\-\/]+([A-Za-z]{3,9})[\s\-\/]+(\d{4})$/);
     if (m) {
       const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
       if (mo == null) return null;
       const t = Date.UTC(+m[3], mo, +m[1]);
       return { ts: t, normalized: fmtDate(+m[1], mo + 1, +m[3], 0, 0, 0) };
+    }
+    // ISO-ish: "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+    m = txt.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[\sT](\d{1,2}):(\d{1,2}):(\d{1,2}))?/);
+    if (m) {
+      const [y, mo, d, hh, mm, ss] = [+m[1], +m[2], +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0)];
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        const t = Date.UTC(y, mo - 1, d, hh, mm, ss);
+        if (t <= NOW + SLOP_MS) return { ts: t, normalized: fmtDate(d, mo, y, hh, mm, ss) };
+      }
+      return null;
+    }
+    // Excel serial date (days since 1899-12-30, the Lotus 1-2-3 epoch).
+    // Pure-integer cells like "46139" are these.
+    m = txt.match(/^(\d{4,6})(?:\.\d+)?$/);
+    if (m) {
+      const days = +m[1];
+      if (days > 25569 && days < 80000) {  // 1970-01-01 .. 2118-something
+        const t = (days - 25569) * 86400 * 1000;
+        if (t <= NOW + SLOP_MS) {
+          const d = new Date(t);
+          return { ts: t, normalized: fmtDate(d.getUTCDate(), d.getUTCMonth() + 1, d.getUTCFullYear(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()) };
+        }
+      }
     }
     return null;
   };
@@ -167,6 +191,15 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
     }
     // Pattern 2: "Agency banking - DDMM HH MM SS agency"  (no year)
     m = t.match(/Agency banking\s*-\s*(\d{2})(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+agency/);
+    if (m) {
+      const [d, mo, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5]];
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        const ts = Date.UTC(fallbackYear, mo - 1, d, hh, mm, ss);
+        if (ts <= NOW + SLOP_MS) return { ts, normalized: fmtDate(d, mo, fallbackYear, hh, mm, ss) };
+      }
+    }
+    // Pattern 3: "Funds Transfer  - DD MM HH MM SS FUND-TRANSFER" (no year)
+    m = t.match(/Funds Transfer\s*-\s*(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+FUND-TRANSFER/);
     if (m) {
       const [d, mo, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5]];
       if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
