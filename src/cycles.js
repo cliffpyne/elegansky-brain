@@ -6,18 +6,13 @@ import { sortTabByDate } from './sheets.js';
 // cycle could have appended to. Fire-and-forget; failures only log — the
 // cycle report itself isn't held up. Each bank can list multiple targets
 // because the iPhone channel writes to a separate sheet/tab.
-const AUTO_SORT_BY_BANK = {
-  NMB: [
-    { sheet_id: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
-    // NMB iPhone transactions land on the shared IPHONE BANK sheet.
-    { sheet_id: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
-  ],
-  CRDB: [
-    { sheet_id: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED' },
-    // CRDB iPhone transactions also land on the shared IPHONE BANK sheet.
-    { sheet_id: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
-  ],
-};
+// EMERGENCY DISABLE 2026-05-31: the read-clear-write pattern in sortTabByDate
+// is racing with the processor's appends — when a sort starts while another
+// cycle's append is in flight, the sort wipes the newly-appended rows.
+// Confirmed by Frank: 261 NMB rows (4.3M TZS) lost today during the window
+// autosort was running. Stays disabled until sortTabByDate is reworked to be
+// append-safe (single-writer mutex OR insert-in-place instead of clear+write).
+const AUTO_SORT_BY_BANK = {};
 
 async function autoSortAfterCycle(bank, status) {
   if (status !== 'ok') return;
