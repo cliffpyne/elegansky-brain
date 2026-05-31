@@ -140,9 +140,11 @@ export function mountCyclesApi(app) {
   });
 
   // ── POST /api/cycles/fire — dashboard "fire NMB / fire CRDB" button ──────
-  // Auth: Supabase JWT (operator only). Calls Render's Jobs API to spawn a
-  // one-off invocation of the standalone runNmbCycle / runCrdbCycle script.
-  // Requires RENDER_API_KEY + RENDER_WORKER_SERVICE_ID env vars on BRAIN.
+  // Writes the requested bank into app_settings.fire_request. The long-
+  // running statement-pull worker polls this between heartbeats; when it
+  // sees a value, it drops its scheduled wait, runs that bank in-process
+  // (on the worker service's Standard plan — NOT on a Render Job which
+  // runs on Starter/512MB and OOMs mid-cycle), and clears the value.
   // Body: { bank: "NMB" | "CRDB" }
   app.post('/api/cycles/fire', requireSupabaseJwt, async (req, res) => {
     try {
@@ -150,31 +152,15 @@ export function mountCyclesApi(app) {
       if (bank !== 'NMB' && bank !== 'CRDB') {
         return res.status(400).json({ error: 'bank must be "NMB" or "CRDB"' });
       }
-      const apiKey = process.env.RENDER_API_KEY;
-      const serviceId = process.env.RENDER_WORKER_SERVICE_ID;
-      if (!apiKey || !serviceId) {
-        return res.status(503).json({
-          error: 'RENDER_API_KEY and RENDER_WORKER_SERVICE_ID env vars not configured on BRAIN',
-        });
-      }
-      const script = bank === 'NMB' ? 'runNmbCycle' : 'runCrdbCycle';
-      const r = await fetch(`https://api.render.com/v1/services/${serviceId}/jobs`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          startCommand: `node dist/statementPull/${script}.js`,
-        }),
-      });
-      const body = await r.text();
-      if (!r.ok) {
-        return res.status(r.status).json({ error: `Render API ${r.status}: ${body.slice(0, 400)}` });
-      }
-      let json;
-      try { json = JSON.parse(body); } catch { json = { raw: body }; }
-      res.json({ ok: true, job: json });
+      await db().query(
+        `INSERT INTO app_settings (key, value, updated_by, updated_at)
+         VALUES ('fire_request', $1, $2, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value,
+                                         updated_by = EXCLUDED.updated_by,
+                                         updated_at = now()`,
+        [bank, 'dashboard:fire'],
+      );
+      res.json({ ok: true, bank, note: 'queued; worker picks up within ~60s' });
     } catch (err) {
       console.error('[POST /api/cycles/fire]', err);
       res.status(500).json({ error: err.message });
