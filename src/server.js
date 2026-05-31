@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail, sortTabByDate } from './sheets.js';
 import { mountCyclesApi } from './cycles.js';
 import { mountSettingsApi } from './settings.js';
+import { mountAdminSmsApi } from './admin-sms.js';
 import { mountPaymentBatchesApi } from './payment-batches.js';
 import { db } from './db/pool.js';
 
@@ -211,6 +212,7 @@ app.use(express.json({ limit: '50mb' }));
 mountCyclesApi(app);
 // /api/settings* — runtime toggles (loop kill switch).
 mountSettingsApi(app);
+mountAdminSmsApi(app);
 // /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
 mountPaymentBatchesApi(app, { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensureQbConnected });
 

@@ -1,5 +1,6 @@
 import {
   Activity,
+  Bell,
   CircleHelp,
   FileSpreadsheet,
   Landmark,
@@ -45,6 +46,7 @@ export const MENU_SIDEBAR: MenuConfig = [
   { title: 'Reports', icon: LineChart, path: '/coming-soon', disabled: true },
   { title: 'Activity', icon: ScrollText, path: '/coming-soon', disabled: true },
   { heading: 'System' },
+  { title: 'Admin notifications', icon: Bell, path: '/admin-sms' },
   { title: 'Webhooks', icon: Webhook, path: '/coming-soon', disabled: true },
   { title: 'Access control', icon: Shield, path: '/coming-soon', disabled: true },
   { title: 'Settings', icon: Settings, path: '/coming-soon', disabled: true },
