@@ -139,6 +139,37 @@ export function mountCyclesApi(app) {
     }
   });
 
+  // ── GET /api/cycles/fire-request — worker poll (shared secret) ──────────
+  // The worker hits this between heartbeats to check for an on-demand cycle.
+  // Auth: shared secret (the worker doesn't have a Supabase JWT). Returns
+  // the bank ('NMB' / 'CRDB') or empty string.
+  app.get('/api/cycles/fire-request', requireReportSecret, async (_req, res) => {
+    try {
+      const r = await db().query(`SELECT value FROM app_settings WHERE key = 'fire_request'`);
+      res.json({ value: r.rows[0]?.value ?? '' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/cycles/fire-request — worker clears the queued request after pickup.
+  app.post('/api/cycles/fire-request', requireReportSecret, async (req, res) => {
+    try {
+      const value = String(req.body?.value ?? '');
+      await db().query(
+        `INSERT INTO app_settings (key, value, updated_by, updated_at)
+         VALUES ('fire_request', $1, 'worker:pickup', now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value,
+                                         updated_by = EXCLUDED.updated_by,
+                                         updated_at = now()`,
+        [value],
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── POST /api/cycles/fire — dashboard "fire NMB / fire CRDB" button ──────
   // Writes the requested bank into app_settings.fire_request. The long-
   // running statement-pull worker polls this between heartbeats; when it
