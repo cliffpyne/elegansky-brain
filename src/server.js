@@ -413,8 +413,17 @@ app.get('/arrears', async (req, res) => {
  * /api/qb/activity — list QB Payments and CreditMemos in a time window.
  *
  * Used by the SaasAnt-vs-BRAIN comparison harness (tools/qb-activity.mjs) to
- * see exactly what each upload path created. ?kind=payment|credit_memo|all
- * defaults to all. ?since= and ?until= are TxnDate filters (YYYY-MM-DD).
+ * see exactly what each upload path created.
+ *
+ * ?kind=payment|credit_memo|all          (default all)
+ *
+ * Two filter axes (use one — sinceCreated is what you usually want):
+ *   ?since=YYYY-MM-DD&until=YYYY-MM-DD   — Txn date window (what the operator
+ *                                          claims the payment was made on)
+ *   ?sinceCreated=ISO[&untilCreated=ISO] — when QB actually recorded the row
+ *                                          (Metadata.CreateTime). This is the
+ *                                          right filter for "what did SaasAnt
+ *                                          add to QB since I ran the baseline"
  *
  * Returns Linked-Invoice info too so we can match each Payment to the
  * Invoice(s) it knocked down.
@@ -423,13 +432,25 @@ app.get('/api/qb/activity', async (req, res) => {
   try {
     const since = (req.query.since || '').toString();
     const until = (req.query.until || '').toString();
+    const sinceCreated = (req.query.sinceCreated || '').toString();
+    const untilCreated = (req.query.untilCreated || '').toString();
     const kind = (req.query.kind || 'all').toString().toLowerCase();
-    if (!since) return res.status(400).json({ error: 'since=YYYY-MM-DD required' });
+    if (!since && !sinceCreated) {
+      return res.status(400).json({ error: 'since=YYYY-MM-DD or sinceCreated=ISO required' });
+    }
 
-    const dateClause =
-      `WHERE TxnDate >= '${since}'` + (until ? ` AND TxnDate <= '${until}'` : '');
+    const clauses = [];
+    if (since) clauses.push(`TxnDate >= '${since}'`);
+    if (until) clauses.push(`TxnDate <= '${until}'`);
+    if (sinceCreated) clauses.push(`Metadata.CreateTime >= '${sinceCreated}'`);
+    if (untilCreated) clauses.push(`Metadata.CreateTime <= '${untilCreated}'`);
+    const dateClause = `WHERE ${clauses.join(' AND ')}`;
 
-    const out = { since, until: until || null, payments: [], creditMemos: [] };
+    const out = {
+      since: since || null, until: until || null,
+      sinceCreated: sinceCreated || null, untilCreated: untilCreated || null,
+      payments: [], creditMemos: [],
+    };
 
     if (kind === 'all' || kind === 'payment') {
       const r = await qbQuery(
@@ -439,6 +460,7 @@ app.get('/api/qb/activity', async (req, res) => {
       out.payments = items.map((p) => ({
         qbId: p.Id,
         txnDate: p.TxnDate,
+        createTime: p.MetaData?.CreateTime,
         customer: { id: p.CustomerRef?.value, name: p.CustomerRef?.name },
         totalAmt: Number(p.TotalAmt ?? 0),
         privateNote: p.PrivateNote || '',
@@ -459,6 +481,7 @@ app.get('/api/qb/activity', async (req, res) => {
       out.creditMemos = items.map((cm) => ({
         qbId: cm.Id,
         txnDate: cm.TxnDate,
+        createTime: cm.MetaData?.CreateTime,
         customer: { id: cm.CustomerRef?.value, name: cm.CustomerRef?.name },
         totalAmt: Number(cm.TotalAmt ?? 0),
         privateNote: cm.PrivateNote || '',

@@ -1,26 +1,41 @@
 #!/usr/bin/env node
 // List QB Payments + CreditMemos in a time window — audit trail for an upload.
 //
-// Usage:
-//   node tools/qb-activity.mjs --since=2026-05-31
-//   node tools/qb-activity.mjs --since=2026-05-31 --until=2026-05-31
-//   node tools/qb-activity.mjs --since=2026-05-31 --kind=payment
-//   node tools/qb-activity.mjs --since=2026-05-31 --json
+// Usage (PREFERRED: filter by when QB recorded the row — captures what the
+// upload actually CREATED regardless of back-dated TxnDate):
+//   node tools/qb-activity.mjs --sinceCreated=2026-05-31T11:00:00Z
+//   node tools/qb-activity.mjs --sinceCreated=NOW                  (last 5 min)
 //
-// Use it BEFORE and AFTER an upload to see exactly what got created. Default
-// `kind=all` returns both Payments and CreditMemos.
+// Usage (filter by claimed TxnDate — older API, surfaces ALL payments dated
+// on/after the date even if they were entered last year):
+//   node tools/qb-activity.mjs --since=2026-05-31
+//
+// Other flags:
+//   --until=YYYY-MM-DD       upper bound on TxnDate
+//   --untilCreated=ISO       upper bound on Metadata.CreateTime
+//   --kind=payment|credit_memo|all   default all
+//   --json                   raw JSON output
 
 import { brainGet, parseArgs, fmtMoney } from './_common.mjs';
 
 const args = parseArgs(process.argv);
-const since = args.since;
-if (!since) {
-  console.error('usage: node tools/qb-activity.mjs --since=YYYY-MM-DD [--until=YYYY-MM-DD] [--kind=payment|credit_memo|all] [--json]');
+if (!args.since && !args.sinceCreated) {
+  console.error('usage: node tools/qb-activity.mjs --sinceCreated=ISO [...] | --since=YYYY-MM-DD');
+  console.error('       --sinceCreated is recommended for upload audit (filters by when QB recorded the row).');
   process.exit(2);
 }
 
+// Sugar: --sinceCreated=NOW → 5 minutes ago, suitable as "right-before-upload" baseline.
+let sinceCreated = args.sinceCreated;
+if (sinceCreated === 'NOW' || sinceCreated === 'now') {
+  sinceCreated = new Date(Date.now() - 5 * 60_000).toISOString();
+  console.log(`[qb-activity] --sinceCreated=NOW → ${sinceCreated}`);
+}
+
 const data = await brainGet('/api/qb/activity', {
-  since, until: args.until, kind: args.kind || 'all',
+  since: args.since, until: args.until,
+  sinceCreated, untilCreated: args.untilCreated,
+  kind: args.kind || 'all',
 });
 
 if (args.json) {
@@ -29,7 +44,10 @@ if (args.json) {
 }
 
 console.log('');
-console.log(`╔══ QB ACTIVITY ${data.since} → ${data.until || 'today'} ═══════════════╗`);
+const window = data.sinceCreated
+  ? `created ≥ ${data.sinceCreated}` + (data.untilCreated ? ` ≤ ${data.untilCreated}` : '')
+  : `TxnDate ${data.since} → ${data.until || 'today'}`;
+console.log(`╔══ QB ACTIVITY (${window}) ══════════════════════════╗`);
 console.log(`║ Payments:    ${data.summary.payments.count.toString().padStart(4)}  ${fmtMoney(data.summary.payments.total).padStart(15)} TZS`);
 console.log(`║ CreditMemos: ${data.summary.creditMemos.count.toString().padStart(4)}  ${fmtMoney(data.summary.creditMemos.total).padStart(15)} TZS`);
 console.log(`╚════════════════════════════════════════════════════════════╝`);
