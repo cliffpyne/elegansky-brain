@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from './sheets.js';
+import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail, sortTabByDate } from './sheets.js';
 import { mountCyclesApi } from './cycles.js';
 import { mountSettingsApi } from './settings.js';
 import { mountPaymentBatchesApi } from './payment-batches.js';
@@ -591,6 +591,35 @@ app.get('/sheets/:id', async (req, res) => {
   try {
     res.json(await readSheet(req.params.id, req.query.range));
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/admin/sort-sheet-by-date — one-time housekeeping after the
+ * NMB CSV row-order incident. Sorts one tab by date col B with a backup
+ * tab created first. Requires shared secret. Use ?dryRun=1 to inspect
+ * without writing.
+ *
+ * Body: { sheet_id: "...", tab: "PASSED", date_col: 1 (optional) }
+ */
+app.post('/api/admin/sort-sheet-by-date', async (req, res) => {
+  // Reuse the shared secret used by the worker / harness tools.
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { sheet_id, tab, date_col } = req.body ?? {};
+    if (!sheet_id || !tab) return res.status(400).json({ error: 'sheet_id and tab required' });
+    const out = await sortTabByDate(sheet_id, tab, {
+      dryRun: req.query.dryRun === '1',
+      dateColIndex: date_col != null ? Number(date_col) : 1,
+    });
+    if (out.error) return res.status(500).json(out);
+    res.json(out);
+  } catch (err) {
+    console.error('[POST /api/admin/sort-sheet-by-date]', err);
     res.status(500).json({ error: err.message });
   }
 });
