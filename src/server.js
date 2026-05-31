@@ -166,7 +166,7 @@ async function qbVoid({ kind, qbId }) {
 const app = express();
 app.set('trust proxy', true); // ngrok / Cloudflare / any reverse proxy
 // Worker reports + screenshots can be a few hundred KB. Default 100kb won't fit.
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // /api/cycles* — statement-pull dashboard data plane.
 mountCyclesApi(app);
