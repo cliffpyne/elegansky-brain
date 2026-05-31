@@ -177,20 +177,23 @@ CREATE INDEX IF NOT EXISTS idx_consumed_transactions_batch_id
 -- Stored as JSON so the admin dashboard can edit them later without a
 -- migration. Each allowlist entry carries the tab + amount column index
 -- so BRAIN can verify the sheet_total independently.
+-- idCol = 7 (REFNUMBER), not 0 (row counter). Confirmed in
+-- invoice-payment-app: `id: row[7] || channel-${i+1}`. Memo column on the
+-- output CSVs carries row[7].
 INSERT INTO app_settings (key, value, updated_by) VALUES
   ('sheet_allowlist', $json$
 {
   "1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o": {
     "channel": "bank", "label": "BANK (CRDB)", "tab": "PASSED",
-    "idCol": 0, "amountCol": 4
+    "idCol": 7, "amountCol": 4
   },
   "1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ": {
     "channel": "iphone_bank", "label": "IPHONE BANK (CRDB)", "tab": "BANK_PASSED",
-    "idCol": 0, "amountCol": 4
+    "idCol": 7, "amountCol": 4
   },
   "1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek": {
     "channel": "nmbnew", "label": "NMB NEW (NMB)", "tab": "PASSED",
-    "idCol": 0, "amountCol": 4
+    "idCol": 7, "amountCol": 4
   }
 }
   $json$, 'migration:initial-seed'),

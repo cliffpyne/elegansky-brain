@@ -145,6 +145,7 @@ export function mountPaymentBatchesApi(app, deps) {
         tab: body.sheet_tab,
         cfg: sheetCfg.config,
         wantedRefs: refsSet,
+        channel: body.channel,
       });
     } catch (err) {
       return res.status(500).json({ error: 'sheet sum failed: ' + err.message });
@@ -481,31 +482,49 @@ async function getSheetConfig(sheetId) {
   return { allowed: true, config: allowlist[sheetId] };
 }
 
-async function sumSheetForRefs({ sheetId, tab, cfg, wantedRefs }) {
-  const range = `${tab}!A:Z`; // generous — we slice cols ourselves
+// Mirror of invoice-payment-app's per-channel ref suffix. The CSVs emitted by
+// invoice-payment-app carry `${sheet_REFNUMBER}${suffix}` so that the bank_ref
+// is globally unique across channels; the raw sheet only has the REFNUMBER.
+// We strip the suffix before matching against the sheet, but keep the full
+// suffixed ref in consumed_transactions / payment_uploads (canonical id).
+const CHANNEL_SUFFIX = {
+  lipa: 'L', boda: 'T', iphone: 'G',
+  bank: 'B', iphone_bank: 'P', nmbnew: 'N',
+};
+
+async function sumSheetForRefs({ sheetId, tab, cfg, wantedRefs, channel }) {
+  // Read a generous row window; sheets currently top out ~120k rows.
+  const range = `${tab}!A1:Z200000`;
   const data = await readSheet(sheetId, range);
   const rows = data.values || data.data || data;
   const idCol = Number(cfg.idCol ?? 0);
   const amountCol = Number(cfg.amountCol ?? 4);
+  const suffix = CHANNEL_SUFFIX[channel] || '';
   // The sheets start with a header row — assume row 0 is the header.
-  const want = new Set(wantedRefs.map(String));
-  const found = new Map();
-  let total = 0;
+  // Index sheet rows by their raw REFNUMBER; lookups compare the
+  // suffix-stripped wanted ref.
+  const sheetIndex = new Map();
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i] || [];
     const id = String(row[idCol] ?? '').trim();
-    if (!id || !want.has(id)) continue;
+    if (!id) continue;
     const amt = Number(String(row[amountCol] ?? '0').replace(/,/g, '')) || 0;
-    if (!found.has(id)) {
-      found.set(id, amt);
-      total += amt;
-    } else {
-      // Duplicate id in sheet — sum or warn? Sum for now, we'll spot anomalies in the diff.
-      found.set(id, found.get(id) + amt);
+    if (!sheetIndex.has(id)) sheetIndex.set(id, amt);
+    else sheetIndex.set(id, sheetIndex.get(id) + amt);
+  }
+  const found = new Map();
+  let total = 0;
+  for (const wantedRef of wantedRefs) {
+    const naked = suffix && String(wantedRef).endsWith(suffix)
+      ? String(wantedRef).slice(0, -suffix.length)
+      : String(wantedRef);
+    if (sheetIndex.has(naked)) {
+      const amt = sheetIndex.get(naked);
+      found.set(wantedRef, amt);
       total += amt;
     }
   }
-  const missingRefs = [...want].filter((r) => !found.has(r));
+  const missingRefs = [...wantedRefs].filter((r) => !found.has(r));
   return { total, missingRefs, foundCount: found.size };
 }
 
