@@ -240,9 +240,11 @@ export function mountPaymentBatchesApi(app, deps) {
         });
         uploaded.push(upload);
       }
-      // Credit memos for the unused side.
+      // Credit memos for the unused side. Skip rows with no customer_id —
+      // they're tracked in consumed_transactions but not pushed to QB.
       for (let i = 0; i < body.unused.length; i++) {
         const row = body.unused[i];
+        if (!row.customer_id) continue;
         const qb = await qbCreateCreditMemo({
           customerId: row.customer_id,
           amount: Number(row.amount),
@@ -496,9 +498,13 @@ function validateBatchBody(b) {
   }
   for (let i = 0; i < b.unused.length; i++) {
     const r = b.unused[i];
-    if (!r.bank_ref || !r.customer_id || r.amount == null) {
-      return { error: `unused[${i}] missing bank_ref/customer_id/amount` };
+    if (!r.bank_ref || r.amount == null) {
+      return { error: `unused[${i}] missing bank_ref/amount` };
     }
+    // customer_id is OPTIONAL on unused — rows where the invoice-payment-app
+    // couldn't match the bank txn to a QB customer still need to be tracked
+    // in consumed_transactions (so they're not re-uploaded), but they get NO
+    // QB CreditMemo (we'd have nowhere to attach it).
   }
   return { error: null };
 }
