@@ -74,6 +74,23 @@ export async function listCycles(params: {
   return r.json();
 }
 
+export interface Heartbeat {
+  worker_id: string;
+  bank: 'NMB' | 'CRDB';
+  cycle_started_at: string;
+  step_num: number;
+  current_step: string | null;
+  last_seen: string;
+  running_seconds: number;
+  silent_seconds: number;
+}
+
+export async function listHeartbeats(): Promise<{ heartbeats: Heartbeat[] }> {
+  const r = await authed(`/api/cycles/heartbeats`);
+  if (!r.ok) throw new Error(`heartbeats ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
 export async function fireCycle(bank: 'NMB' | 'CRDB'): Promise<{ ok: boolean; job: unknown }> {
   const r = await authed(`/api/cycles/fire`, {
     method: 'POST',

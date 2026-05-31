@@ -21,6 +21,7 @@ import { RefreshCw, AlertCircle, CheckCircle2, ChevronRight, ChevronLeft, Power,
 import {
   listCycles,
   getSummary,
+  listHeartbeats,
   relativeTime,
   formatDuration,
   getSetting,
@@ -29,8 +30,9 @@ import {
   type CycleSummaryRow,
   type SummaryResp,
   type Setting,
+  type Heartbeat,
 } from '@/lib/brain-api';
-import { Play } from 'lucide-react';
+import { Play, Activity as ActivityIcon } from 'lucide-react';
 
 const REFRESH_MS = 30_000;
 const PAGE_SIZE = 50;
@@ -42,6 +44,7 @@ export function StatementCyclesPage() {
     offset: 0, total: 0, has_more: false,
   });
   const [loopSetting, setLoopSetting] = useState<Setting | null>(null);
+  const [heartbeats, setHeartbeats] = useState<Heartbeat[]>([]);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,13 +53,15 @@ export function StatementCyclesPage() {
   const refresh = useCallback(async (nextOffset?: number) => {
     const off = nextOffset ?? pageInfo.offset;
     try {
-      const [s, l, ls] = await Promise.all([
+      const [s, l, ls, hb] = await Promise.all([
         getSummary(),
         listCycles({ limit: PAGE_SIZE, offset: off }),
         getSetting('statement_pull_enabled').catch(() => null),
+        listHeartbeats().catch(() => ({ heartbeats: [] })),
       ]);
       setSummary(s);
       setCycles(l.cycles);
+      setHeartbeats(hb.heartbeats);
       if (l.page) {
         setPageInfo({ offset: l.page.offset, total: l.page.total, has_more: l.page.has_more });
       }
@@ -115,6 +120,19 @@ export function StatementCyclesPage() {
     const t = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // Tighter polling for live heartbeats so a running cycle's current step
+  // updates in near-real-time (every 2.5s). Doesn't re-pull the whole page.
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const hb = await listHeartbeats();
+        setHeartbeats(hb.heartbeats);
+      } catch { /* swallow */ }
+    };
+    const t = setInterval(tick, 2500);
+    return () => clearInterval(t);
+  }, []);
 
   const last = useMemo(() => {
     const map: Record<'NMB' | 'CRDB', SummaryResp['last'][number] | null> = {
@@ -189,6 +207,38 @@ export function StatementCyclesPage() {
             </Button>
           </ToolbarActions>
         </Toolbar>
+
+        {/* LIVE PANEL — one card per running cycle, shows current step + how
+            long it's been running. Polls every 2.5s. Disappears once the
+            cycle reports its final status to BRAIN (which also deletes the
+            heartbeat row). */}
+        {heartbeats.length > 0 && (
+          <div className="mb-4 grid gap-3 md:grid-cols-2">
+            {heartbeats.map((h) => (
+              <Card key={h.worker_id} className="border-emerald-500/30 bg-emerald-500/5">
+                <CardContent className="flex items-start gap-3 py-4">
+                  <ActivityIcon className="size-5 shrink-0 mt-0.5 text-emerald-600 animate-pulse" />
+                  <div className="flex-1">
+                    <div className="font-medium text-emerald-700">
+                      {h.bank} running — {Math.floor(h.running_seconds / 60)}m {h.running_seconds % 60}s in
+                    </div>
+                    <div className="text-sm text-muted-foreground mt-1">
+                      <span className="font-mono">Step {h.step_num}</span>
+                      {h.current_step && (
+                        <>: <span className="text-foreground">{h.current_step}</span></>
+                      )}
+                    </div>
+                    {h.silent_seconds > 60 && (
+                      <div className="text-xs text-amber-700 mt-1">
+                        ⚠ silent for {h.silent_seconds}s — worker may be stuck
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )}
 
         {/* Auto-disabled banner — explains why the loop is off so admin knows
             what to investigate before flipping it back on. */}

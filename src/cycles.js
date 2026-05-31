@@ -114,11 +114,62 @@ export function mountCyclesApi(app) {
       );
       res.status(201).json({ ok: true, id: r.rows[0].id, reported_at: r.rows[0].reported_at });
 
+      // Clear the heartbeat row for this worker — the cycle has officially
+      // ended (success or fail). The dashboard's live panel then drops it
+      // from the running list.
+      db().query(`DELETE FROM cycle_heartbeats WHERE worker_id = $1`, [String(body.worker_id ?? 'unknown')])
+        .catch((e) => console.warn('[cycles] heartbeat cleanup failed:', e.message));
+
       // Fire-and-forget post-write sort. Do NOT await — the worker should
       // get its 201 immediately; the sort runs in the background.
       autoSortAfterCycle(String(body.bank).toUpperCase(), String(body.status).toLowerCase());
     } catch (err) {
       console.error('[POST /api/cycles] ', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── POST /api/cycles/heartbeat — worker emits its current step ───────────
+  // Auth: shared secret. Upsert by (bank, worker_id) — one live row per
+  // running cycle. The next step replaces the previous; when the cycle ends
+  // /api/cycles inserts the final row and the heartbeat is deleted.
+  // Body: { bank, worker_id, step_num, current_step }
+  app.post('/api/cycles/heartbeat', requireReportSecret, async (req, res) => {
+    try {
+      const { bank, worker_id, step_num, current_step } = req.body ?? {};
+      if (!bank || !worker_id) return res.status(400).json({ error: 'bank + worker_id required' });
+      await db().query(
+        `INSERT INTO cycle_heartbeats (worker_id, bank, step_num, current_step, last_seen)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (worker_id) DO UPDATE
+           SET bank = EXCLUDED.bank,
+               step_num = EXCLUDED.step_num,
+               current_step = EXCLUDED.current_step,
+               last_seen = now()`,
+        [worker_id, String(bank).toUpperCase(), Number(step_num) || 0, String(current_step || '').slice(0, 200)],
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[POST /api/cycles/heartbeat]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/cycles/heartbeats — dashboard polls for active running cycles.
+  // Filters out anything stale (>10 min since last_seen) since the worker
+  // should ping at least every step; >10 min silence = the cycle died.
+  app.get('/api/cycles/heartbeats', requireSupabaseJwt, async (_req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT worker_id, bank, cycle_started_at, step_num, current_step, last_seen,
+                EXTRACT(EPOCH FROM (now() - cycle_started_at))::int AS running_seconds,
+                EXTRACT(EPOCH FROM (now() - last_seen))::int AS silent_seconds
+           FROM cycle_heartbeats
+          WHERE last_seen > now() - interval '10 minutes'
+          ORDER BY cycle_started_at DESC`,
+      );
+      res.json({ heartbeats: r.rows });
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
