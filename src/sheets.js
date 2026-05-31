@@ -94,7 +94,7 @@ export function serviceAccountEmail() {
  *
  * Returns a summary object the endpoint can shove straight at the operator.
  */
-export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, dateColIndex = 1 } = {}) {
+export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, dateColIndex = 1, messageColIndex = 3 } = {}) {
   const sheets = await sheetsClient();
 
   const read = await sheets.spreadsheets.values.get({
@@ -107,30 +107,28 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
   const data = all.slice(1).filter((r) => r && r.some((c) => String(c).trim().length));
 
   const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-  // PASSED tab carries rows from multiple channels with different date conventions:
-  //   NMB native:  "DD.MM.YYYY HH:MM:SS"
-  //   Some CRDB / other:  "MM.DD.YYYY HH:MM:SS"  (yes, month-first)
-  //   Legacy:      "DD Mon YYYY"
-  // Strategy: try DD.MM first. If the month component is >12 (impossible
-  // under DD.MM) OR the resulting date is more than a day in the future
-  // (also a tell), retry as MM.DD. Bail to null otherwise.
   const NOW = Date.now();
   const SLOP_MS = 24 * 60 * 60 * 1000;
+
+  // Parse a date string. Returns { ts, normalized } or null.
+  // Handles three formats:
+  //   "DD.MM.YYYY HH:MM:SS"   (current NMB)
+  //   "MM.DD.YYYY HH:MM:SS"   (month-first variant on some channels)
+  //   "DD Mon YYYY"           (legacy, no time → midnight)
+  // Normalizes to "DD.MM.YYYY HH:MM:SS" (zero-padded) on parse success.
   const parseDate = (s) => {
     const txt = String(s || '').trim();
     if (!txt) return null;
     let m = txt.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})/);
     if (m) {
       const [a, b, y, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]];
-      // Attempt 1: DD.MM
       if (b >= 1 && b <= 12 && a >= 1 && a <= 31) {
         const t = Date.UTC(y, b - 1, a, hh, mm, ss);
-        if (t <= NOW + SLOP_MS) return t;
+        if (t <= NOW + SLOP_MS) return { ts: t, normalized: fmtDate(a, b, y, hh, mm, ss) };
       }
-      // Attempt 2: MM.DD (month-first)
       if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
         const t = Date.UTC(y, a - 1, b, hh, mm, ss);
-        if (t <= NOW + SLOP_MS) return t;
+        if (t <= NOW + SLOP_MS) return { ts: t, normalized: fmtDate(b, a, y, hh, mm, ss) };
       }
       return null;
     }
@@ -138,12 +136,64 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
     if (m) {
       const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
       if (mo == null) return null;
-      return Date.UTC(+m[3], mo, +m[1]);
+      const t = Date.UTC(+m[3], mo, +m[1]);
+      return { ts: t, normalized: fmtDate(+m[1], mo + 1, +m[3], 0, 0, 0) };
     }
     return null;
   };
 
-  const enriched = data.map((row, originalIdx) => ({ row, ts: parseDate(row[dateColIndex]), originalIdx }));
+  const pad2 = (n) => String(n).padStart(2, '0');
+  function fmtDate(d, mo, y, h, mi, s) {
+    return `${pad2(d)}.${pad2(mo)}.${y} ${pad2(h)}:${pad2(mi)}:${pad2(s)}`;
+  }
+
+  // Extract a date out of the MESSAGE field for rows whose date column is
+  // missing or junk. Two NMB MESSAGE patterns hit:
+  //   TIPS Payments:    "...Received payment from ... on DD.MM.YYYY HH MM SS!!..."
+  //   Agency banking:   "...Agency banking - DDMM HH MM SS agency..." (no year →
+  //                      year is inferred from the today/current year so March
+  //                      2026 rows land as 2026).
+  const extractFromMessage = (msg, fallbackYear = new Date().getUTCFullYear()) => {
+    const t = String(msg || '');
+    if (!t) return null;
+    // Pattern 1: "on DD.MM.YYYY HH MM SS"
+    let m = t.match(/\bon (\d{2})\.(\d{2})\.(\d{4})\s+(\d{2})\s+(\d{2})\s+(\d{2})\b/);
+    if (m) {
+      const [d, mo, y, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]];
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        const ts = Date.UTC(y, mo - 1, d, hh, mm, ss);
+        if (ts <= NOW + SLOP_MS) return { ts, normalized: fmtDate(d, mo, y, hh, mm, ss) };
+      }
+    }
+    // Pattern 2: "Agency banking - DDMM HH MM SS agency"  (no year)
+    m = t.match(/Agency banking\s*-\s*(\d{2})(\d{2})\s+(\d{2})\s+(\d{2})\s+(\d{2})\s+agency/);
+    if (m) {
+      const [d, mo, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5]];
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        const ts = Date.UTC(fallbackYear, mo - 1, d, hh, mm, ss);
+        if (ts <= NOW + SLOP_MS) return { ts, normalized: fmtDate(d, mo, fallbackYear, hh, mm, ss) };
+      }
+    }
+    return null;
+  };
+
+  // First pass: try to parse the date column directly.
+  // Second pass for misses: extract date from MESSAGE and OVERWRITE the
+  // date cell with the normalized value so the row sorts into its real
+  // chronological position (and so future readers see a real date).
+  let dateFilledFromMsg = 0;
+  const enriched = data.map((row, originalIdx) => {
+    const fromCol = parseDate(row[dateColIndex]);
+    if (fromCol) return { row, ts: fromCol.ts, originalIdx, source: 'col' };
+    const fromMsg = extractFromMessage(row[messageColIndex]);
+    if (fromMsg) {
+      const fixedRow = row.slice();
+      fixedRow[dateColIndex] = fromMsg.normalized;
+      dateFilledFromMsg++;
+      return { row: fixedRow, ts: fromMsg.ts, originalIdx, source: 'msg' };
+    }
+    return { row, ts: null, originalIdx, source: 'none' };
+  });
   const parsed = enriched.filter((e) => e.ts != null);
   const unparsed = enriched.filter((e) => e.ts == null);
   parsed.sort((a, b) => a.ts - b.ts || a.originalIdx - b.originalIdx);
@@ -152,9 +202,10 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
   const summary = {
     rows_in: data.length,
     rows_parsed: parsed.length,
+    rows_filled_from_message: dateFilledFromMsg,
     rows_unparsed: unparsed.length,
     rows_out: sortedRows.length,
-    unparsed_samples: unparsed.slice(0, 5).map((e) => e.row[dateColIndex]),
+    unparsed_samples: unparsed.slice(0, 5).map((e) => ({ date: e.row[dateColIndex], msg: String(e.row[messageColIndex] || '').slice(0, 120) })),
     before_first3: data.slice(0, 3).map((r) => ({ date: r[dateColIndex], ref: r[7] })),
     before_last3: data.slice(-3).map((r) => ({ date: r[dateColIndex], ref: r[7] })),
     after_first3: sortedRows.slice(0, 3).map((r) => ({ date: r[dateColIndex], ref: r[7] })),
