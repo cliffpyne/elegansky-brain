@@ -55,12 +55,17 @@ async function authed(path: string): Promise<Response> {
 
 export async function listCycles(params: {
   limit?: number;
+  offset?: number;
   bank?: 'NMB' | 'CRDB' | 'all';
   status?: 'ok' | 'fail' | 'all';
   since?: string;
-} = {}): Promise<{ cycles: CycleSummaryRow[] }> {
+} = {}): Promise<{
+  cycles: CycleSummaryRow[];
+  page?: { limit: number; offset: number; total: number; has_more: boolean };
+}> {
   const q = new URLSearchParams();
   if (params.limit) q.set('limit', String(params.limit));
+  if (params.offset) q.set('offset', String(params.offset));
   if (params.bank && params.bank !== 'all') q.set('bank', params.bank);
   if (params.status && params.status !== 'all') q.set('status', params.status);
   if (params.since) q.set('since', params.since);

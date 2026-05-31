@@ -91,7 +91,7 @@ export function mountCyclesApi(app) {
 
       // Cap screenshots so a runaway worker can't OOM the table.
       const screenshots = Array.isArray(body.screenshots)
-        ? body.screenshots.slice(0, 6).map((s) => String(s).slice(0, 400_000))
+        ? body.screenshots.slice(0, 10).map((s) => String(s).slice(0, 400_000))
         : null;
 
       const r = await db().query(
@@ -124,12 +124,18 @@ export function mountCyclesApi(app) {
   });
 
   // ── GET /api/cycles — dashboard list ─────────────────────────────────────
-  // Query params: limit (default 50, max 200), bank (NMB|CRDB|all),
-  // status (ok|fail|all), since (ISO8601 lower bound on reported_at).
+  // Query params:
+  //   limit  (default 50, max 200)     — page size
+  //   offset (default 0)                — for cursor pagination
+  //   bank   (NMB|CRDB|all)
+  //   status (ok|fail|all)
+  //   since  (ISO8601 lower bound on reported_at)
   // Screenshots are NOT returned in list view to keep payload small.
+  // Response includes `total` so the dashboard can paginate.
   app.get('/api/cycles', requireSupabaseJwt, async (req, res) => {
     try {
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit ?? '50', 10) || 50));
+      const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0);
       const bank = String(req.query.bank ?? 'all').toUpperCase();
       const status = String(req.query.status ?? 'all').toLowerCase();
       const since = req.query.since ? new Date(String(req.query.since)) : null;
@@ -140,17 +146,30 @@ export function mountCyclesApi(app) {
       if (status === 'ok' || status === 'fail') { where.push(`status = $${args.length + 1}`); args.push(status); }
       if (since && !isNaN(since.getTime())) { where.push(`reported_at >= $${args.length + 1}`); args.push(since); }
 
-      const sql = `
+      const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+      const listSql = `
         SELECT id, reported_at, started_at, finished_at, duration_ms,
                worker_id, bank, status, stats, processor_response, error_text,
                coalesce(array_length(screenshots, 1), 0) AS screenshot_count
         FROM statement_cycles
-        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ${whereSql}
         ORDER BY reported_at DESC
-        LIMIT ${limit}
+        LIMIT ${limit} OFFSET ${offset}
       `;
-      const r = await db().query(sql, args);
-      res.json({ cycles: r.rows });
+      const countSql = `SELECT count(*)::int AS total FROM statement_cycles ${whereSql}`;
+      const [listR, countR] = await Promise.all([
+        db().query(listSql, args),
+        db().query(countSql, args),
+      ]);
+      res.json({
+        cycles: listR.rows,
+        page: {
+          limit,
+          offset,
+          total: countR.rows[0].total,
+          has_more: offset + listR.rows.length < countR.rows[0].total,
+        },
+      });
     } catch (err) {
       console.error('[GET /api/cycles] ', err);
       res.status(500).json({ error: err.message });

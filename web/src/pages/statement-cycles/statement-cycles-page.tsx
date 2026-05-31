@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { RefreshCw, AlertCircle, CheckCircle2, ChevronRight, Power, PowerOff } from 'lucide-react';
+import { RefreshCw, AlertCircle, CheckCircle2, ChevronRight, ChevronLeft, Power, PowerOff } from 'lucide-react';
 import {
   listCycles,
   getSummary,
@@ -31,25 +31,33 @@ import {
 } from '@/lib/brain-api';
 
 const REFRESH_MS = 30_000;
+const PAGE_SIZE = 50;
 
 export function StatementCyclesPage() {
   const [summary, setSummary] = useState<SummaryResp | null>(null);
   const [cycles, setCycles] = useState<CycleSummaryRow[]>([]);
+  const [pageInfo, setPageInfo] = useState<{ offset: number; total: number; has_more: boolean }>({
+    offset: 0, total: 0, has_more: false,
+  });
   const [loopSetting, setLoopSetting] = useState<Setting | null>(null);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (nextOffset?: number) => {
+    const off = nextOffset ?? pageInfo.offset;
     try {
       const [s, l, ls] = await Promise.all([
         getSummary(),
-        listCycles({ limit: 50 }),
+        listCycles({ limit: PAGE_SIZE, offset: off }),
         getSetting('statement_pull_enabled').catch(() => null),
       ]);
       setSummary(s);
       setCycles(l.cycles);
+      if (l.page) {
+        setPageInfo({ offset: l.page.offset, total: l.page.total, has_more: l.page.has_more });
+      }
       if (ls) setLoopSetting(ls);
       setError(null);
       setLastFetched(new Date());
@@ -58,7 +66,15 @@ export function StatementCyclesPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [pageInfo.offset]);
+
+  const goPage = useCallback(
+    (delta: number) => {
+      const next = Math.max(0, pageInfo.offset + delta * PAGE_SIZE);
+      void refresh(next);
+    },
+    [pageInfo.offset, refresh],
+  );
 
   const toggleLoop = useCallback(async () => {
     if (!loopSetting) return;
@@ -266,6 +282,33 @@ export function StatementCyclesPage() {
                 ))}
               </TableBody>
             </Table>
+            {pageInfo.total > PAGE_SIZE && (
+              <div className="flex items-center justify-between border-t px-4 py-3 text-sm text-muted-foreground">
+                <span>
+                  Showing {pageInfo.offset + 1}–{Math.min(pageInfo.offset + cycles.length, pageInfo.total)} of {pageInfo.total.toLocaleString()}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => goPage(-1)}
+                    disabled={pageInfo.offset === 0 || loading}
+                  >
+                    <ChevronLeft className="size-4" />
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => goPage(1)}
+                    disabled={!pageInfo.has_more || loading}
+                  >
+                    Next
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       </Container>
