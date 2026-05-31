@@ -377,6 +377,7 @@ app.get('/arrears', async (req, res) => {
       const customerLeaf = parts[parts.length - 1] || customer;
       return {
         qbId: inv.Id,
+        customerId,
         date: inv.TxnDate,
         dueDate: inv.DueDate,
         type: 'Invoice',
