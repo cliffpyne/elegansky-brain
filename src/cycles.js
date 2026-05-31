@@ -2,32 +2,42 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 import { sortTabByDate } from './sheets.js';
 
-// When a successful bank cycle reports here, fire a sort on the appended
-// tab so the operator sees ordered rows within seconds. Fire-and-forget;
-// failures only log — the cycle report itself isn't held up.
+// When a successful bank cycle reports here, fire a sort on the tabs that
+// cycle could have appended to. Fire-and-forget; failures only log — the
+// cycle report itself isn't held up. Each bank can list multiple targets
+// because the iPhone channel writes to a separate sheet/tab.
 const AUTO_SORT_BY_BANK = {
-  NMB: { sheet_id: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
-  // CRDB intentionally not wired yet — its sheet hasn't shown the same
-  // ordering problem and adds another sort cost per cycle. Add when needed.
+  NMB: [
+    { sheet_id: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
+    // NMB iPhone transactions land on the shared IPHONE BANK sheet.
+    { sheet_id: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+  ],
+  CRDB: [
+    { sheet_id: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED' },
+    // CRDB iPhone transactions also land on the shared IPHONE BANK sheet.
+    { sheet_id: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+  ],
 };
 
 async function autoSortAfterCycle(bank, status) {
   if (status !== 'ok') return;
-  const target = AUTO_SORT_BY_BANK[bank];
-  if (!target) return;
-  try {
-    const t0 = Date.now();
-    const r = await sortTabByDate(target.sheet_id, target.tab, { skipBackup: true });
-    if (r.error) {
-      console.warn(`[auto-sort] ${bank} → ${target.tab} skipped: ${r.error}`);
-      return;
+  const targets = AUTO_SORT_BY_BANK[bank];
+  if (!targets || !targets.length) return;
+  for (const target of targets) {
+    try {
+      const t0 = Date.now();
+      const r = await sortTabByDate(target.sheet_id, target.tab, { skipBackup: true });
+      if (r.error) {
+        console.warn(`[auto-sort] ${bank} → ${target.tab} skipped: ${r.error}`);
+        continue;
+      }
+      console.log(
+        `[auto-sort] ${bank} → ${target.tab} sorted ${r.rows_out} rows in ${Date.now() - t0}ms` +
+          (r.rows_filled_from_message ? ` (${r.rows_filled_from_message} dates filled from MESSAGE)` : ''),
+      );
+    } catch (err) {
+      console.warn(`[auto-sort] ${bank} → ${target.tab} failed: ${err.message}`);
     }
-    console.log(
-      `[auto-sort] ${bank} → ${target.tab} sorted ${r.rows_out} rows in ${Date.now() - t0}ms` +
-        (r.rows_filled_from_message ? ` (${r.rows_filled_from_message} dates filled from MESSAGE)` : ''),
-    );
-  } catch (err) {
-    console.warn(`[auto-sort] ${bank} → ${target.tab} failed: ${err.message}`);
   }
 }
 
