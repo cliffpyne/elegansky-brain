@@ -107,11 +107,33 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
   const data = all.slice(1).filter((r) => r && r.some((c) => String(c).trim().length));
 
   const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  // PASSED tab carries rows from multiple channels with different date conventions:
+  //   NMB native:  "DD.MM.YYYY HH:MM:SS"
+  //   Some CRDB / other:  "MM.DD.YYYY HH:MM:SS"  (yes, month-first)
+  //   Legacy:      "DD Mon YYYY"
+  // Strategy: try DD.MM first. If the month component is >12 (impossible
+  // under DD.MM) OR the resulting date is more than a day in the future
+  // (also a tell), retry as MM.DD. Bail to null otherwise.
+  const NOW = Date.now();
+  const SLOP_MS = 24 * 60 * 60 * 1000;
   const parseDate = (s) => {
     const txt = String(s || '').trim();
     if (!txt) return null;
-    let m = txt.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
-    if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +m[6]);
+    let m = txt.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+    if (m) {
+      const [a, b, y, hh, mm, ss] = [+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]];
+      // Attempt 1: DD.MM
+      if (b >= 1 && b <= 12 && a >= 1 && a <= 31) {
+        const t = Date.UTC(y, b - 1, a, hh, mm, ss);
+        if (t <= NOW + SLOP_MS) return t;
+      }
+      // Attempt 2: MM.DD (month-first)
+      if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
+        const t = Date.UTC(y, a - 1, b, hh, mm, ss);
+        if (t <= NOW + SLOP_MS) return t;
+      }
+      return null;
+    }
     m = txt.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})$/);
     if (m) {
       const mo = MONTHS[m[2].slice(0, 3).toLowerCase()];
