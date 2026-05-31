@@ -94,7 +94,7 @@ export function serviceAccountEmail() {
  *
  * Returns a summary object the endpoint can shove straight at the operator.
  */
-export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, dateColIndex = 1, messageColIndex = 3 } = {}) {
+export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, dateColIndex = 1, messageColIndex = 3, skipBackup = false } = {}) {
   const sheets = await sheetsClient();
 
   const read = await sheets.spreadsheets.values.get({
@@ -253,40 +253,46 @@ export async function sortTabByDate(spreadsheetId, tabName, { dryRun = false, da
     return { ...summary, dry_run: true, written: false };
   }
 
-  // Step 1: backup tab
-  const tsLabel = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-  const backupTab = `${tabName}_backup_${tsLabel}`;
-  const addRes = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [
-        {
-          addSheet: {
-            properties: {
-              title: backupTab,
-              gridProperties: { rowCount: all.length + 10, columnCount: header.length + 2 },
+  // Step 1: backup tab (skipped for auto-runs — would clutter the sheet with
+  // dozens of backup tabs per day; the operator already has a manual backup
+  // from the first sort run, which is the rollback point).
+  let backupTab = null;
+  let backupSheetId = null;
+  if (!skipBackup) {
+    const tsLabel = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    backupTab = `${tabName}_backup_${tsLabel}`;
+    const addRes = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [
+          {
+            addSheet: {
+              properties: {
+                title: backupTab,
+                gridProperties: { rowCount: all.length + 10, columnCount: header.length + 2 },
+              },
             },
           },
-        },
-      ],
-    },
-  });
-  const backupSheetId = addRes.data.replies[0].addSheet.properties.sheetId;
+        ],
+      },
+    });
+    backupSheetId = addRes.data.replies[0].addSheet.properties.sheetId;
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${backupTab}!A1`,
-    valueInputOption: 'RAW',
-    requestBody: { values: all },
-  });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${backupTab}!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: all },
+    });
 
-  const verify = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${backupTab}!A1:Z200000`,
-  });
-  const verifyData = (verify.data.values || []).filter((r) => r && r.some((c) => String(c).trim().length));
-  if (verifyData.length < data.length) {
-    return { ...summary, backup_tab: backupTab, error: `backup verify too low (${verifyData.length} < ${data.length}) — refused to write to source` };
+    const verify = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${backupTab}!A1:Z200000`,
+    });
+    const verifyData = (verify.data.values || []).filter((r) => r && r.some((c) => String(c).trim().length));
+    if (verifyData.length < data.length) {
+      return { ...summary, backup_tab: backupTab, error: `backup verify too low (${verifyData.length} < ${data.length}) — refused to write to source` };
+    }
   }
 
   // Step 2: clear + write

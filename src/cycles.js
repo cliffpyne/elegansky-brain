@@ -1,5 +1,35 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
+import { sortTabByDate } from './sheets.js';
+
+// When a successful bank cycle reports here, fire a sort on the appended
+// tab so the operator sees ordered rows within seconds. Fire-and-forget;
+// failures only log — the cycle report itself isn't held up.
+const AUTO_SORT_BY_BANK = {
+  NMB: { sheet_id: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
+  // CRDB intentionally not wired yet — its sheet hasn't shown the same
+  // ordering problem and adds another sort cost per cycle. Add when needed.
+};
+
+async function autoSortAfterCycle(bank, status) {
+  if (status !== 'ok') return;
+  const target = AUTO_SORT_BY_BANK[bank];
+  if (!target) return;
+  try {
+    const t0 = Date.now();
+    const r = await sortTabByDate(target.sheet_id, target.tab, { skipBackup: true });
+    if (r.error) {
+      console.warn(`[auto-sort] ${bank} → ${target.tab} skipped: ${r.error}`);
+      return;
+    }
+    console.log(
+      `[auto-sort] ${bank} → ${target.tab} sorted ${r.rows_out} rows in ${Date.now() - t0}ms` +
+        (r.rows_filled_from_message ? ` (${r.rows_filled_from_message} dates filled from MESSAGE)` : ''),
+    );
+  } catch (err) {
+    console.warn(`[auto-sort] ${bank} → ${target.tab} failed: ${err.message}`);
+  }
+}
 
 const {
   STATEMENT_REPORT_SECRET,
@@ -73,6 +103,10 @@ export function mountCyclesApi(app) {
         ],
       );
       res.status(201).json({ ok: true, id: r.rows[0].id, reported_at: r.rows[0].reported_at });
+
+      // Fire-and-forget post-write sort. Do NOT await — the worker should
+      // get its 201 immediately; the sort runs in the background.
+      autoSortAfterCycle(String(body.bank).toUpperCase(), String(body.status).toLowerCase());
     } catch (err) {
       console.error('[POST /api/cycles] ', err);
       res.status(500).json({ error: err.message });
