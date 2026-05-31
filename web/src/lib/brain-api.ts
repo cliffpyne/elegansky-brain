@@ -45,12 +45,12 @@ export interface SummaryResp {
 
 const API_BASE = import.meta.env.VITE_BRAIN_API_BASE || '';
 
-async function authed(path: string): Promise<Response> {
+async function authed(path: string, init?: RequestInit): Promise<Response> {
   const session = (await supabase.auth.getSession()).data.session;
   const token = session?.access_token;
-  return fetch(`${API_BASE}${path}`, {
-    headers: token ? { authorization: `Bearer ${token}` } : {},
-  });
+  const headers = new Headers(init?.headers);
+  if (token) headers.set('authorization', `Bearer ${token}`);
+  return fetch(`${API_BASE}${path}`, { ...init, headers });
 }
 
 export async function listCycles(params: {
@@ -71,6 +71,16 @@ export async function listCycles(params: {
   if (params.since) q.set('since', params.since);
   const r = await authed(`/api/cycles?${q.toString()}`);
   if (!r.ok) throw new Error(`listCycles ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function fireCycle(bank: 'NMB' | 'CRDB'): Promise<{ ok: boolean; job: unknown }> {
+  const r = await authed(`/api/cycles/fire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bank }),
+  });
+  if (!r.ok) throw new Error(`fireCycle ${r.status}: ${await r.text()}`);
   return r.json();
 }
 

@@ -123,6 +123,48 @@ export function mountCyclesApi(app) {
     }
   });
 
+  // ── POST /api/cycles/fire — dashboard "fire NMB / fire CRDB" button ──────
+  // Auth: Supabase JWT (operator only). Calls Render's Jobs API to spawn a
+  // one-off invocation of the standalone runNmbCycle / runCrdbCycle script.
+  // Requires RENDER_API_KEY + RENDER_WORKER_SERVICE_ID env vars on BRAIN.
+  // Body: { bank: "NMB" | "CRDB" }
+  app.post('/api/cycles/fire', requireSupabaseJwt, async (req, res) => {
+    try {
+      const bank = String(req.body?.bank ?? '').toUpperCase();
+      if (bank !== 'NMB' && bank !== 'CRDB') {
+        return res.status(400).json({ error: 'bank must be "NMB" or "CRDB"' });
+      }
+      const apiKey = process.env.RENDER_API_KEY;
+      const serviceId = process.env.RENDER_WORKER_SERVICE_ID;
+      if (!apiKey || !serviceId) {
+        return res.status(503).json({
+          error: 'RENDER_API_KEY and RENDER_WORKER_SERVICE_ID env vars not configured on BRAIN',
+        });
+      }
+      const script = bank === 'NMB' ? 'runNmbCycle' : 'runCrdbCycle';
+      const r = await fetch(`https://api.render.com/v1/services/${serviceId}/jobs`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          startCommand: `node dist/statementPull/${script}.js`,
+        }),
+      });
+      const body = await r.text();
+      if (!r.ok) {
+        return res.status(r.status).json({ error: `Render API ${r.status}: ${body.slice(0, 400)}` });
+      }
+      let json;
+      try { json = JSON.parse(body); } catch { json = { raw: body }; }
+      res.json({ ok: true, job: json });
+    } catch (err) {
+      console.error('[POST /api/cycles/fire]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── GET /api/cycles — dashboard list ─────────────────────────────────────
   // Query params:
   //   limit  (default 50, max 200)     — page size

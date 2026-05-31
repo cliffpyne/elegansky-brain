@@ -25,10 +25,12 @@ import {
   formatDuration,
   getSetting,
   setSetting,
+  fireCycle,
   type CycleSummaryRow,
   type SummaryResp,
   type Setting,
 } from '@/lib/brain-api';
+import { Play } from 'lucide-react';
 
 const REFRESH_MS = 30_000;
 const PAGE_SIZE = 50;
@@ -90,6 +92,21 @@ export function StatementCyclesPage() {
     }
   }, [loopSetting]);
 
+  const [firing, setFiring] = useState<null | 'NMB' | 'CRDB'>(null);
+  const fire = useCallback(async (bank: 'NMB' | 'CRDB') => {
+    setFiring(bank);
+    setError(null);
+    try {
+      await fireCycle(bank);
+      // Pull the latest cycles in ~5s so the new attempt shows up.
+      setTimeout(() => { void refresh(); }, 5000);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setFiring(null);
+    }
+  }, [refresh]);
+
   const loopEnabled = loopSetting?.value === 'true';
   const loopAutoDisabled = loopSetting?.updated_by?.startsWith('worker:auto-disable');
 
@@ -128,6 +145,26 @@ export function StatementCyclesPage() {
             description="Live status of NMB + CRDB statement-pull worker on Render. Auto-refresh every 30s."
           />
           <ToolbarActions>
+            <Button
+              variant="outline"
+              onClick={() => fire('NMB')}
+              disabled={firing !== null}
+              className="gap-2"
+              title="Run an NMB cycle now (Render one-off job)"
+            >
+              <Play className="size-4" />
+              {firing === 'NMB' ? 'Firing…' : 'Fire NMB'}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => fire('CRDB')}
+              disabled={firing !== null}
+              className="gap-2"
+              title="Run a CRDB cycle now (Render one-off job)"
+            >
+              <Play className="size-4" />
+              {firing === 'CRDB' ? 'Firing…' : 'Fire CRDB'}
+            </Button>
             {loopSetting && (
               <Button
                 variant={loopEnabled ? 'default' : 'destructive'}
