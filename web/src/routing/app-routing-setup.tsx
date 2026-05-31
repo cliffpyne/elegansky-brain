@@ -7,6 +7,8 @@ import { StatementCyclesPage } from '@/pages/statement-cycles/statement-cycles-p
 import { StatementCycleDetailPage } from '@/pages/statement-cycles/statement-cycle-detail-page';
 import { ArrearsPage } from '@/pages/arrears/arrears-page';
 import { AdminSmsPage } from '@/pages/admin-sms/admin-sms-page';
+import { PaymentBatchesPage } from '@/pages/payment-batches/payment-batches-page';
+import { PaymentBatchDetailPage } from '@/pages/payment-batches/payment-batch-detail-page';
 
 /**
  * BRAIN dashboard routing — slimmed down from Metronic's giant demo router.
@@ -28,6 +30,8 @@ export function AppRoutingSetup() {
           <Route path="/statement-cycles/:id" element={<StatementCycleDetailPage />} />
           <Route path="/arrears" element={<ArrearsPage />} />
           <Route path="/admin-sms" element={<AdminSmsPage />} />
+          <Route path="/payment-batches" element={<PaymentBatchesPage />} />
+          <Route path="/payment-batches/:id" element={<PaymentBatchDetailPage />} />
         </Route>
       </Route>
       <Route path="error/*" element={<ErrorRouting />} />

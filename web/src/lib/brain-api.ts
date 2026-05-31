@@ -91,6 +91,69 @@ export async function listHeartbeats(): Promise<{ heartbeats: Heartbeat[] }> {
   return r.json();
 }
 
+export interface PaymentBatchRow {
+  id: string;
+  created_at: string;
+  finalized_at: string | null;
+  recalled_at: string | null;
+  rolled_back_at: string | null;
+  status: 'pending' | 'finalized' | 'recalled' | 'rolled_back';
+  sheet_id: string;
+  sheet_tab: string;
+  channel: string;
+  paid_total: number | string;
+  unused_total: number | string;
+  sheet_total: number | string;
+  paid_count: number;
+  unused_count: number;
+  created_by: string | null;
+  recalled_by: string | null;
+  failure_reason: string | null;
+}
+
+export interface PaymentUploadRow {
+  id: string;
+  batch_id: string;
+  kind: 'payment' | 'credit_memo';
+  bank_ref: string;
+  customer_id: string;
+  customer_name: string | null;
+  invoice_qb_id: string | null;
+  invoice_no: string | null;
+  amount: number | string;
+  memo: string | null;
+  qb_id: string | null;
+  status: 'created' | 'voided' | 'failed';
+  failure_reason: string | null;
+  created_at: string;
+  voided_at: string | null;
+}
+
+export async function listBatches(params: { limit?: number; status?: string } = {}): Promise<{ batches: PaymentBatchRow[] }> {
+  const q = new URLSearchParams();
+  if (params.limit) q.set('limit', String(params.limit));
+  if (params.status && params.status !== 'all') q.set('status', params.status);
+  const r = await authed(`/api/payment-batches?${q.toString()}`);
+  if (!r.ok) throw new Error(`listBatches ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function getBatch(id: string): Promise<{ batch: PaymentBatchRow; uploads: PaymentUploadRow[] }> {
+  const r = await authed(`/api/payment-batches/${id}`);
+  if (!r.ok) throw new Error(`getBatch ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function recallBatch(id: string, reason?: string): Promise<unknown> {
+  const r = await authed(`/api/payment-batches/${id}/recall`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: reason || 'admin recall from dashboard' }),
+  });
+  if (!r.ok) throw new Error(`recallBatch ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
 export async function fireCycle(bank: 'NMB' | 'CRDB'): Promise<{ ok: boolean; job: unknown }> {
   const r = await authed(`/api/cycles/fire`, {
     method: 'POST',
