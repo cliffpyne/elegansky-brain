@@ -53,6 +53,20 @@ VALUES ('statement_pull_enabled', 'true', 'migration:initial-seed')
 ON CONFLICT (key) DO NOTHING;
 
 -- ─────────────────────────────────────────────────────────────────────────
+-- BRAIN: OAuth tokens (currently QuickBooks only).
+--
+-- Previously persisted to tokens.json on the worker filesystem, but Render's
+-- filesystem is wiped on every deploy → connection broke every push. Single
+-- row keyed by provider (only 'quickbooks' for now). Upserted on each
+-- refresh; ensureFreshToken() reads here on every QB API call.
+CREATE TABLE IF NOT EXISTS app_oauth_tokens (
+  provider     text          PRIMARY KEY,        -- 'quickbooks'
+  realm_id     text,
+  token_json   jsonb         NOT NULL,
+  updated_at   timestamptz   NOT NULL DEFAULT now()
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
 -- BRAIN: Payment batches — the upload→QB bridge that replaces SaasAnt.
 --
 -- Flow per call from invoice-payment-app:

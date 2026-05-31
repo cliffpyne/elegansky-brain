@@ -9,6 +9,7 @@ import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from 
 import { mountCyclesApi } from './cycles.js';
 import { mountSettingsApi } from './settings.js';
 import { mountPaymentBatchesApi } from './payment-batches.js';
+import { db } from './db/pool.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,33 +34,71 @@ const oauthClient = new OAuthClient({
   timeout: 90000,
 });
 
-const TOKENS_FILE = 'tokens.json';
 const API_BASE = QB_ENVIRONMENT === 'production'
   ? 'https://quickbooks.api.intuit.com'
   : 'https://sandbox-quickbooks.api.intuit.com';
 
-function loadTokens() {
-  if (!existsSync(TOKENS_FILE)) return null;
-  const raw = readFileSync(TOKENS_FILE, 'utf-8').trim();
-  if (!raw) return null;
-  return JSON.parse(raw);
+// QB OAuth tokens live in Postgres (app_oauth_tokens) so they survive Render
+// deploys, which wipe the filesystem. One row keyed by provider='quickbooks'.
+// A legacy tokens.json is migrated once on startup if it's still on disk.
+const TOKEN_PROVIDER = 'quickbooks';
+const LEGACY_TOKENS_FILE = 'tokens.json';
+
+async function loadTokens() {
+  const r = await db().query(
+    `SELECT token_json, realm_id FROM app_oauth_tokens WHERE provider = $1`,
+    [TOKEN_PROVIDER],
+  );
+  if (!r.rows.length) return null;
+  const t = r.rows[0].token_json;
+  // realm_id was hoisted to its own column for indexability but it's still in
+  // token_json too — keep the call sites happy.
+  if (!t.realmId && r.rows[0].realm_id) t.realmId = r.rows[0].realm_id;
+  return t;
 }
 
-function saveTokens(token) {
-  writeFileSync(TOKENS_FILE, JSON.stringify(token, null, 2));
+async function saveTokens(token) {
+  await db().query(
+    `INSERT INTO app_oauth_tokens (provider, realm_id, token_json, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (provider) DO UPDATE
+       SET realm_id = EXCLUDED.realm_id,
+           token_json = EXCLUDED.token_json,
+           updated_at = now()`,
+    [TOKEN_PROVIDER, token.realmId ?? null, JSON.stringify(token)],
+  );
 }
 
-const saved = loadTokens();
-if (saved) {
-  oauthClient.setToken(saved);
-  console.log(`Loaded saved tokens for realm ${saved.realmId}`);
-}
+// One-time eager bootstrap: pull existing tokens into the oauth client, and
+// migrate the legacy tokens.json if it's still on disk (will only ever hit
+// once per server install; after that the file is gone).
+(async () => {
+  try {
+    let saved = await loadTokens();
+    if (!saved && existsSync(LEGACY_TOKENS_FILE)) {
+      const raw = readFileSync(LEGACY_TOKENS_FILE, 'utf-8').trim();
+      if (raw) {
+        saved = JSON.parse(raw);
+        await saveTokens(saved);
+        console.log(`Migrated tokens.json → app_oauth_tokens for realm ${saved.realmId}`);
+      }
+    }
+    if (saved) {
+      oauthClient.setToken(saved);
+      console.log(`Loaded saved tokens for realm ${saved.realmId}`);
+    } else {
+      console.log('No saved QB tokens — admin must visit /connect.');
+    }
+  } catch (err) {
+    console.error('[bootstrap] failed to load tokens:', err.message);
+  }
+})();
 
 // CSRF state for OAuth — stored in-memory; for production-scale use Redis or signed cookies.
 const pendingStates = new Set();
 
 async function ensureFreshToken() {
-  const tokens = loadTokens();
+  const tokens = await loadTokens();
   if (!tokens) throw new Error('Not connected. Visit /connect first.');
   oauthClient.setToken(tokens);
   if (!oauthClient.isAccessTokenValid()) {
@@ -67,7 +106,7 @@ async function ensureFreshToken() {
     const next = refreshed.getJson();
     next.realmId = tokens.realmId;
     next.acquiredAt = Date.now();
-    saveTokens(next);
+    await saveTokens(next);
     oauthClient.setToken(next);
   }
   return oauthClient.getToken();
@@ -111,7 +150,7 @@ async function qbPost(resourcePath, body) {
 }
 
 async function ensureQbConnected() {
-  const tokens = loadTokens();
+  const tokens = await loadTokens();
   if (!tokens) throw new Error('Not connected. Visit /connect first.');
   await ensureFreshToken();
 }
@@ -178,9 +217,13 @@ mountPaymentBatchesApi(app, { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensur
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
 // for the dashboard to consume in a follow-up.)
-app.get('/api/qb/status', (_req, res) => {
-  const tokens = loadTokens();
-  res.json({ connected: !!tokens, realmId: tokens?.realmId ?? null });
+app.get('/api/qb/status', async (_req, res) => {
+  try {
+    const tokens = await loadTokens();
+    res.json({ connected: !!tokens, realmId: tokens?.realmId ?? null });
+  } catch (err) {
+    res.status(500).json({ connected: false, error: err.message });
+  }
 });
 
 app.get('/connect', (req, res) => {
@@ -221,7 +264,7 @@ app.get('/callback', async (req, res) => {
     const token = authResponse.getJson();
     token.realmId = realmId;
     token.acquiredAt = Date.now();
-    saveTokens(token);
+    await saveTokens(token);
     console.log('✅ Tokens saved for realm', realmId);
     res.send(`<h1>✅ Connected</h1><p>Realm: <code>${realmId}</code></p><p><a href="/">Home</a></p>`);
   } catch (err) {
@@ -232,7 +275,8 @@ app.get('/callback', async (req, res) => {
 
 app.get('/disconnect', async (req, res) => {
   try { await oauthClient.revoke(); } catch (e) { /* token may already be invalid */ }
-  if (existsSync(TOKENS_FILE)) unlinkSync(TOKENS_FILE);
+  await db().query(`DELETE FROM app_oauth_tokens WHERE provider = $1`, [TOKEN_PROVIDER]);
+  if (existsSync(LEGACY_TOKENS_FILE)) unlinkSync(LEGACY_TOKENS_FILE);
   res.send(`<h1>Disconnected</h1><p><a href="/">Home</a></p>`);
 });
 
