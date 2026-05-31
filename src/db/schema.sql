@@ -51,3 +51,149 @@ CREATE TABLE IF NOT EXISTS app_settings (
 INSERT INTO app_settings (key, value, updated_by)
 VALUES ('statement_pull_enabled', 'true', 'migration:initial-seed')
 ON CONFLICT (key) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- BRAIN: Payment batches — the upload→QB bridge that replaces SaasAnt.
+--
+-- Flow per call from invoice-payment-app:
+--
+--   1. arrears_snapshots   — store the /arrears state at batch-creation time.
+--                            One snapshot is shared by ALL batches in one run
+--                            (one arrears pull → many sheet/tab batches).
+--
+--   2. payment_batches     — one batch = one (sheet_id, tab, set-of-bank-refs).
+--                            Atomic unit of recall.  Status transitions:
+--                              pending → finalized   (all QB calls succeeded)
+--                              pending → rolled_back (QB error mid-flight,
+--                                                     everything voided + refs
+--                                                     released)
+--                              finalized → recalled  (admin click)
+--
+--   3. payment_uploads     — one row per QB resource created (Payment OR
+--                            CreditMemo).  Carries qb_id + raw responses for
+--                            audit + recall.
+--
+--   4. consumed_transactions — the FORBIDDEN-FOR-REUSE gate.  Bank ref
+--                            shows up here while it's in an active batch;
+--                            recall releases it.
+--
+-- Source-of-truth principle: the arrears_snapshot for a batch is the data
+-- the batch was REALLY built against.  On recall+rerun we go back to THAT
+-- snapshot, not today's /arrears, so we never replay against drifted state.
+
+CREATE TABLE IF NOT EXISTS arrears_snapshots (
+  id           uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at   timestamptz   NOT NULL DEFAULT now(),
+  as_of        date          NOT NULL,
+  -- The full /arrears list at snapshot time (array of ArrearRow shapes).
+  data         jsonb         NOT NULL,
+  row_count    integer       NOT NULL,
+  total_balance numeric      NOT NULL,
+  created_by   text,
+  notes        text
+);
+
+CREATE INDEX IF NOT EXISTS idx_arrears_snapshots_created_at
+  ON arrears_snapshots (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS payment_batches (
+  id                    uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Client-provided dedupe key. Second POST with the same key returns the
+  -- first batch's result instead of running QB twice. Critical safety net.
+  idempotency_key       text          UNIQUE NOT NULL,
+  created_at            timestamptz   NOT NULL DEFAULT now(),
+  finalized_at          timestamptz,
+  recalled_at           timestamptz,
+  rolled_back_at        timestamptz,
+  status                text          NOT NULL CHECK (status IN
+    ('pending', 'finalized', 'recalled', 'rolled_back')),
+  arrears_snapshot_id   uuid          NOT NULL REFERENCES arrears_snapshots(id),
+  -- Identifies the source sheet+tab+row scope of this batch.
+  sheet_id              text          NOT NULL,
+  sheet_tab             text          NOT NULL,
+  channel               text          NOT NULL, -- 'bank' | 'iphone_bank' | 'nmbnew'
+  -- The bank refs that make up this batch (from the sheet's column 0).
+  bank_refs             text[]        NOT NULL,
+  -- Tally fields, all derived from the request body + sheet verification.
+  sheet_total           numeric       NOT NULL, -- sum from sheet (BRAIN's own check)
+  paid_total            numeric       NOT NULL, -- sum(paid[].amount) from request
+  unused_total          numeric       NOT NULL, -- sum(unused[].amount) from request
+  -- Counts for the dashboard.
+  paid_count            integer       NOT NULL,
+  unused_count          integer       NOT NULL,
+  -- Whoever told us to create this; "invoice-payment-app@<hostname>" etc.
+  created_by            text,
+  recalled_by           text,
+  failure_reason        text          -- populated on rolled_back
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_batches_created_at
+  ON payment_batches (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_payment_batches_status
+  ON payment_batches (status);
+CREATE INDEX IF NOT EXISTS idx_payment_batches_sheet
+  ON payment_batches (sheet_id, sheet_tab);
+
+CREATE TABLE IF NOT EXISTS payment_uploads (
+  id               uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  batch_id         uuid          NOT NULL REFERENCES payment_batches(id) ON DELETE CASCADE,
+  -- 'payment' (paid → QB Payment) | 'credit_memo' (unused → QB CreditMemo)
+  kind             text          NOT NULL CHECK (kind IN ('payment', 'credit_memo')),
+  bank_ref         text          NOT NULL, -- source bank txn id (with payment-method suffix)
+  customer_id      text          NOT NULL, -- QB CustomerRef.value
+  customer_name    text,                    -- display only
+  invoice_qb_id    text,                    -- only for payments
+  invoice_no       text,                    -- only for payments (DocNumber)
+  amount           numeric       NOT NULL,
+  memo             text,
+  qb_id            text,                    -- created QB id on success
+  qb_response      jsonb,                   -- raw QB POST response
+  status           text          NOT NULL CHECK (status IN ('created', 'voided', 'failed')),
+  failure_reason   text,
+  created_at       timestamptz   NOT NULL DEFAULT now(),
+  voided_at        timestamptz,
+  qb_void_response jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_uploads_batch_id
+  ON payment_uploads (batch_id);
+CREATE INDEX IF NOT EXISTS idx_payment_uploads_bank_ref
+  ON payment_uploads (bank_ref);
+CREATE INDEX IF NOT EXISTS idx_payment_uploads_status
+  ON payment_uploads (status);
+
+-- The gate. While a bank_ref is in this table, it CANNOT be in another
+-- active batch. Recall deletes its rows; rerun re-inserts them.
+CREATE TABLE IF NOT EXISTS consumed_transactions (
+  bank_ref      text          PRIMARY KEY,
+  batch_id      uuid          NOT NULL REFERENCES payment_batches(id) ON DELETE CASCADE,
+  consumed_at   timestamptz   NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_consumed_transactions_batch_id
+  ON consumed_transactions (batch_id);
+
+-- Seeds for sheet allow/deny — invoice-payment-app's hardcoded mapping.
+-- Stored as JSON so the admin dashboard can edit them later without a
+-- migration. Each allowlist entry carries the tab + amount column index
+-- so BRAIN can verify the sheet_total independently.
+INSERT INTO app_settings (key, value, updated_by) VALUES
+  ('sheet_allowlist', $json$
+{
+  "1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o": {
+    "channel": "bank", "label": "BANK (CRDB)", "tab": "PASSED",
+    "idCol": 0, "amountCol": 4
+  },
+  "1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ": {
+    "channel": "iphone_bank", "label": "IPHONE BANK (CRDB)", "tab": "BANK_PASSED",
+    "idCol": 0, "amountCol": 4
+  },
+  "1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek": {
+    "channel": "nmbnew", "label": "NMB NEW (NMB)", "tab": "PASSED",
+    "idCol": 0, "amountCol": 4
+  }
+}
+  $json$, 'migration:initial-seed'),
+  ('sheet_denylist', '["1N3ZxahtaFBX0iK3cijDraDmyZM8573PVVf8D-WVqicE"]',
+    'migration:initial-seed')
+ON CONFLICT (key) DO NOTHING;

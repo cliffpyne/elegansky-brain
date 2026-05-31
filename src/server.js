@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { listSharedSheets, sheetMetadata, readSheet, serviceAccountEmail } from './sheets.js';
 import { mountCyclesApi } from './cycles.js';
 import { mountSettingsApi } from './settings.js';
+import { mountPaymentBatchesApi } from './payment-batches.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -83,6 +84,85 @@ async function qbQuery(sql) {
   return response.json;
 }
 
+/**
+ * POST a body to a QB Online endpoint and return the parsed JSON.
+ * Throws on any non-2xx with a message that includes intuit_tid for tracing.
+ */
+async function qbPost(resourcePath, body) {
+  await ensureFreshToken();
+  const realmId = oauthClient.getToken().realmId;
+  const url = `${API_BASE}/v3/company/${realmId}/${resourcePath}?minorversion=73`;
+  const response = await oauthClient.makeApiCall({
+    url,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (response.statusCode && response.statusCode >= 400) {
+    const tid = response.headers?.intuit_tid || response.intuit_tid;
+    const msg = `QB ${resourcePath} HTTP ${response.statusCode}` +
+      (tid ? ` (intuit_tid=${tid})` : '') +
+      `: ${typeof response.body === 'string' ? response.body.slice(0, 400) : ''}`;
+    const err = new Error(msg);
+    err.intuit_tid = tid;
+    throw err;
+  }
+  return response.json;
+}
+
+async function ensureQbConnected() {
+  const tokens = loadTokens();
+  if (!tokens) throw new Error('Not connected. Visit /connect first.');
+  await ensureFreshToken();
+}
+
+/** Create a QB Payment for one bank-txn line against one invoice. */
+async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
+  const body = {
+    CustomerRef: { value: String(customerId) },
+    TotalAmt: Number(amount),
+    PrivateNote: memo || undefined,
+    Line: [{
+      Amount: Number(amount),
+      LinkedTxn: [{ TxnId: String(invoiceQbId), TxnType: 'Invoice' }],
+    }],
+  };
+  const json = await qbPost('payment', body);
+  return { id: json.Payment?.Id, response: json };
+}
+
+/** Create a QB Credit Memo (the "unused" side) for one bank-txn line. */
+async function qbCreateCreditMemo({ customerId, amount, memo }) {
+  const body = {
+    CustomerRef: { value: String(customerId) },
+    PrivateNote: memo || undefined,
+    Line: [{
+      DetailType: 'SalesItemLineDetail',
+      Amount: Number(amount),
+      SalesItemLineDetail: {},
+      Description: memo || 'Unused — credit memo',
+    }],
+  };
+  const json = await qbPost('creditmemo', body);
+  return { id: json.CreditMemo?.Id, response: json };
+}
+
+/**
+ * Void a QB Payment or CreditMemo. QB requires we re-POST the full
+ * resource with operation=void, but in practice just providing { Id,
+ * SyncToken } works since we don't need to mutate other fields.
+ */
+async function qbVoid({ kind, qbId }) {
+  // QB needs SyncToken — fetch it first.
+  const entityName = kind === 'payment' ? 'Payment' : 'CreditMemo';
+  const q = await qbQuery(`SELECT * FROM ${entityName} WHERE Id = '${qbId}'`);
+  const entity = q.QueryResponse?.[entityName]?.[0];
+  if (!entity) throw new Error(`${entityName} ${qbId} not found`);
+  const body = { Id: entity.Id, SyncToken: entity.SyncToken };
+  const path = kind === 'payment' ? 'payment?operation=void' : 'creditmemo?operation=void';
+  return await qbPost(path, body);
+}
+
 const app = express();
 app.set('trust proxy', true); // ngrok / Cloudflare / any reverse proxy
 // Worker reports + screenshots can be a few hundred KB. Default 100kb won't fit.
@@ -92,6 +172,8 @@ app.use(express.json({ limit: '4mb' }));
 mountCyclesApi(app);
 // /api/settings* — runtime toggles (loop kill switch).
 mountSettingsApi(app);
+// /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
+mountPaymentBatchesApi(app, { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensureQbConnected });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
