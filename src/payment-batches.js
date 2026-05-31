@@ -300,7 +300,13 @@ export function mountPaymentBatchesApi(app, deps) {
   });
 
   // ── POST /api/payment-batches/:id/recall ─────────────────────────────────
-  app.post('/api/payment-batches/:id/recall', requireSupabaseJwt, async (req, res) => {
+  // Either Supabase JWT (operator clicking dashboard button) or shared secret
+  // (CLI / service-to-service) is accepted.
+  app.post('/api/payment-batches/:id/recall', (req, res, next) => {
+    const expected = process.env.STATEMENT_REPORT_SECRET;
+    if (expected && req.header('X-Report-Secret') === expected) return next();
+    return requireSupabaseJwt(req, res, next);
+  }, async (req, res) => {
     try {
       const batchId = req.params.id;
       const reason = String(req.body?.reason ?? 'admin recall');
