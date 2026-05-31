@@ -1,40 +1,14 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { sortTabByDate } from './sheets.js';
 
-// When a successful bank cycle reports here, fire a sort on the tabs that
-// cycle could have appended to. Fire-and-forget; failures only log — the
-// cycle report itself isn't held up. Each bank can list multiple targets
-// because the iPhone channel writes to a separate sheet/tab.
-// EMERGENCY DISABLE 2026-05-31: the read-clear-write pattern in sortTabByDate
-// is racing with the processor's appends — when a sort starts while another
-// cycle's append is in flight, the sort wipes the newly-appended rows.
-// Confirmed by Frank: 261 NMB rows (4.3M TZS) lost today during the window
-// autosort was running. Stays disabled until sortTabByDate is reworked to be
-// append-safe (single-writer mutex OR insert-in-place instead of clear+write).
-const AUTO_SORT_BY_BANK = {};
-
-async function autoSortAfterCycle(bank, status) {
-  if (status !== 'ok') return;
-  const targets = AUTO_SORT_BY_BANK[bank];
-  if (!targets || !targets.length) return;
-  for (const target of targets) {
-    try {
-      const t0 = Date.now();
-      const r = await sortTabByDate(target.sheet_id, target.tab, { skipBackup: true });
-      if (r.error) {
-        console.warn(`[auto-sort] ${bank} → ${target.tab} skipped: ${r.error}`);
-        continue;
-      }
-      console.log(
-        `[auto-sort] ${bank} → ${target.tab} sorted ${r.rows_out} rows in ${Date.now() - t0}ms` +
-          (r.rows_filled_from_message ? ` (${r.rows_filled_from_message} dates filled from MESSAGE)` : ''),
-      );
-    } catch (err) {
-      console.warn(`[auto-sort] ${bank} → ${target.tab} failed: ${err.message}`);
-    }
-  }
-}
+// AUTOSORT REMOVED 2026-05-31. The post-cycle read-clear-write pattern was
+// racing with the processor's appends and silently wiping newly-appended
+// rows. The replacement (per Frank's directive) is sort-before-upload: the
+// NMB worker now sorts the CSV's data rows by date BEFORE handing the file
+// to the processor, so the processor appends rows already in chronological
+// order and no sheet-level sort is ever needed. See eleganskyCrdb commit
+// for the worker-side sort. The admin one-shot sort endpoint is still
+// available at /api/admin/sort-sheet-by-date for emergency manual use.
 
 const {
   STATEMENT_REPORT_SECRET,
@@ -114,10 +88,6 @@ export function mountCyclesApi(app) {
       // from the running list.
       db().query(`DELETE FROM cycle_heartbeats WHERE worker_id = $1`, [String(body.worker_id ?? 'unknown')])
         .catch((e) => console.warn('[cycles] heartbeat cleanup failed:', e.message));
-
-      // Fire-and-forget post-write sort. Do NOT await — the worker should
-      // get its 201 immediately; the sort runs in the background.
-      autoSortAfterCycle(String(body.bank).toUpperCase(), String(body.status).toLowerCase());
     } catch (err) {
       console.error('[POST /api/cycles] ', err);
       res.status(500).json({ error: err.message });
