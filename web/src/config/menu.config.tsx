@@ -35,9 +35,9 @@ export const MENU_SIDEBAR: MenuConfig = [
     title: 'QuickBooks',
     icon: FileSpreadsheet,
     children: [
+      { title: 'Arrears', path: '/arrears' },
       { title: 'Invoices', path: '/coming-soon', disabled: true },
       { title: 'Payments', path: '/coming-soon', disabled: true },
-      { title: 'Arrears', path: '/coming-soon', disabled: true },
       { title: 'Credit memos', path: '/coming-soon', disabled: true },
     ],
   },

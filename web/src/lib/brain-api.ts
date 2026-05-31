@@ -95,6 +95,73 @@ export function formatDuration(ms: number): string {
   return `${(ms / 60_000).toFixed(1)}m`;
 }
 
+// ── Arrears (overdue invoices, replaces ARREAR.xls) ────────────────────
+export interface ArrearRow {
+  qbId: string;
+  date: string;          // TxnDate YYYY-MM-DD
+  dueDate: string;       // DueDate YYYY-MM-DD
+  type: 'Invoice';
+  no: string;            // DocNumber
+  customer: string;      // BRANCH:LEADER:GROUP:CUSTOMER
+  branch: string;        // first segment
+  customerLeaf: string;  // last segment
+  memo: string;
+  balance: number;
+  amount: number;
+  status: 'overdue';
+}
+
+export interface ArrearsListResp {
+  asOf: string;
+  page: { start: number; pageSize: number; returned: number; nextStart: number | null };
+  invoices: ArrearRow[];
+}
+
+export interface ArrearsSummaryResp {
+  asOf: string;
+  count: number;
+  totalBalance: number;
+  branches: Record<string, number>;
+}
+
+async function unauthed(path: string): Promise<Response> {
+  // /arrears is currently on BRAIN's legacy path, not /api — same backend,
+  // no auth wrapper. Once we move it under /api/* we'll switch to authed().
+  return fetch(`${API_BASE}${path}`);
+}
+
+export async function listArrears(params: {
+  pageSize?: number;
+  start?: number;
+  branch?: string;
+  q?: string;
+  asOf?: string;
+} = {}): Promise<ArrearsListResp> {
+  const qs = new URLSearchParams();
+  if (params.pageSize) qs.set('pageSize', String(params.pageSize));
+  if (params.start) qs.set('start', String(params.start));
+  if (params.branch) qs.set('branch', params.branch);
+  if (params.q) qs.set('q', params.q);
+  if (params.asOf) qs.set('asOf', params.asOf);
+  const r = await unauthed(`/arrears?${qs.toString()}`);
+  if (!r.ok) throw new Error(`listArrears ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function getArrearsSummary(params: { asOf?: string; branch?: string } = {}): Promise<ArrearsSummaryResp> {
+  const qs = new URLSearchParams({ summary: '1' });
+  if (params.asOf) qs.set('asOf', params.asOf);
+  if (params.branch) qs.set('branch', params.branch);
+  const r = await unauthed(`/arrears?${qs.toString()}`);
+  if (!r.ok) throw new Error(`getArrearsSummary ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export function formatTzs(n: number): string {
+  if (!isFinite(n)) return '—';
+  return n.toLocaleString('en-US', { maximumFractionDigits: 0 }) + ' TZS';
+}
+
 // ── Settings (loop kill switch) ────────────────────────────────────────
 export interface Setting {
   key: string;

@@ -5,6 +5,7 @@ import { ErrorRouting } from '@/errors/error-routing';
 import { Demo1Layout } from '@/layouts/demo1/layout';
 import { StatementCyclesPage } from '@/pages/statement-cycles/statement-cycles-page';
 import { StatementCycleDetailPage } from '@/pages/statement-cycles/statement-cycle-detail-page';
+import { ArrearsPage } from '@/pages/arrears/arrears-page';
 
 /**
  * BRAIN dashboard routing — slimmed down from Metronic's giant demo router.
@@ -24,6 +25,7 @@ export function AppRoutingSetup() {
           <Route index element={<Navigate to="/statement-cycles" replace />} />
           <Route path="/statement-cycles" element={<StatementCyclesPage />} />
           <Route path="/statement-cycles/:id" element={<StatementCycleDetailPage />} />
+          <Route path="/arrears" element={<ArrearsPage />} />
         </Route>
       </Route>
       <Route path="error/*" element={<ErrorRouting />} />
