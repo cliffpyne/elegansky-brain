@@ -248,7 +248,9 @@ export function StatementCyclesPage() {
                       {c.stats?.skipped ?? '—'}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {(c.stats?.failed ?? 0) + (c.stats?.failed_nmb ?? 0) || '—'}
+                      {c.stats
+                        ? (c.stats.failed ?? 0) + (c.stats.failed_nmb ?? 0)
+                        : '—'}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {formatDuration(c.duration_ms)}
@@ -367,13 +369,18 @@ function Stat({
   );
 }
 
-function sumPassed(s: CycleSummaryRow['stats']): number {
-  return (
-    (s?.passed ?? 0) +
-    (s?.passed_sav ?? 0) +
-    (s?.passed_sav_nmb ?? 0) +
-    (s?.iphone_passed ?? 0)
-  );
+// Returns the summed passed count, or '—' if there are no stats at all.
+// We don't want failed cycles (which carry stats=null because the processor
+// never returned) to render as "0 passed" — that's indistinguishable from
+// "the processor ran and 0 rows passed" and confuses the operator.
+function sumPassed(s: CycleSummaryRow['stats']): number | string {
+  if (!s) return '—';
+  const total =
+    (s.passed ?? 0) +
+    (s.passed_sav ?? 0) +
+    (s.passed_sav_nmb ?? 0) +
+    (s.iphone_passed ?? 0);
+  return total;
 }
 
 export default StatementCyclesPage;
