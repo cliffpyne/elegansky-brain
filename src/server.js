@@ -409,6 +409,75 @@ app.get('/arrears', async (req, res) => {
   }
 });
 
+/**
+ * /api/qb/activity — list QB Payments and CreditMemos in a time window.
+ *
+ * Used by the SaasAnt-vs-BRAIN comparison harness (tools/qb-activity.mjs) to
+ * see exactly what each upload path created. ?kind=payment|credit_memo|all
+ * defaults to all. ?since= and ?until= are TxnDate filters (YYYY-MM-DD).
+ *
+ * Returns Linked-Invoice info too so we can match each Payment to the
+ * Invoice(s) it knocked down.
+ */
+app.get('/api/qb/activity', async (req, res) => {
+  try {
+    const since = (req.query.since || '').toString();
+    const until = (req.query.until || '').toString();
+    const kind = (req.query.kind || 'all').toString().toLowerCase();
+    if (!since) return res.status(400).json({ error: 'since=YYYY-MM-DD required' });
+
+    const dateClause =
+      `WHERE TxnDate >= '${since}'` + (until ? ` AND TxnDate <= '${until}'` : '');
+
+    const out = { since, until: until || null, payments: [], creditMemos: [] };
+
+    if (kind === 'all' || kind === 'payment') {
+      const r = await qbQuery(
+        `SELECT * FROM Payment ${dateClause} ORDERBY TxnDate STARTPOSITION 1 MAXRESULTS 1000`,
+      );
+      const items = r.QueryResponse?.Payment ?? [];
+      out.payments = items.map((p) => ({
+        qbId: p.Id,
+        txnDate: p.TxnDate,
+        customer: { id: p.CustomerRef?.value, name: p.CustomerRef?.name },
+        totalAmt: Number(p.TotalAmt ?? 0),
+        privateNote: p.PrivateNote || '',
+        depositTo: p.DepositToAccountRef?.name || '',
+        linkedInvoices: (p.Line ?? []).flatMap((l) =>
+          (l.LinkedTxn ?? [])
+            .filter((t) => t.TxnType === 'Invoice')
+            .map((t) => ({ invoiceId: t.TxnId, amount: Number(l.Amount ?? 0) })),
+        ),
+      }));
+    }
+
+    if (kind === 'all' || kind === 'credit_memo') {
+      const r = await qbQuery(
+        `SELECT * FROM CreditMemo ${dateClause} ORDERBY TxnDate STARTPOSITION 1 MAXRESULTS 1000`,
+      );
+      const items = r.QueryResponse?.CreditMemo ?? [];
+      out.creditMemos = items.map((cm) => ({
+        qbId: cm.Id,
+        txnDate: cm.TxnDate,
+        customer: { id: cm.CustomerRef?.value, name: cm.CustomerRef?.name },
+        totalAmt: Number(cm.TotalAmt ?? 0),
+        privateNote: cm.PrivateNote || '',
+        remaining: Number(cm.RemainingCredit ?? cm.TotalAmt ?? 0),
+      }));
+    }
+
+    out.summary = {
+      payments: { count: out.payments.length, total: out.payments.reduce((s, p) => s + p.totalAmt, 0) },
+      creditMemos: { count: out.creditMemos.length, total: out.creditMemos.reduce((s, c) => s + c.totalAmt, 0) },
+    };
+
+    res.json(out);
+  } catch (err) {
+    console.error('[GET /api/qb/activity]', err);
+    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
 app.get('/summary', async (req, res) => {
   try {
     const [inv, cust, pay, bill] = await Promise.all([

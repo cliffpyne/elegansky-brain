@@ -387,6 +387,40 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // ── GET /api/arrears-snapshots/:id ───────────────────────────────────────
+  // Read back a stored snapshot. Used by the SaasAnt-vs-BRAIN comparison
+  // harness (tools/diff.mjs). Uses the shared secret so the tools can run
+  // without juggling Supabase JWTs.
+  app.get('/api/arrears-snapshots/:id', requireSharedSecret, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT id, created_at, as_of, row_count, total_balance, created_by, notes, data
+           FROM arrears_snapshots WHERE id = $1`,
+        [req.params.id],
+      );
+      if (!r.rows.length) return res.status(404).json({ error: 'snapshot not found' });
+      res.json({ snapshot: r.rows[0] });
+    } catch (err) {
+      console.error('[GET /api/arrears-snapshots/:id]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── GET /api/arrears-snapshots (list) ────────────────────────────────────
+  app.get('/api/arrears-snapshots', requireSharedSecret, async (req, res) => {
+    try {
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+      const r = await db().query(
+        `SELECT id, created_at, as_of, row_count, total_balance, created_by, notes
+           FROM arrears_snapshots ORDER BY created_at DESC LIMIT $1`,
+        [limit],
+      );
+      res.json({ snapshots: r.rows });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── GET /api/payment-batches (list) ──────────────────────────────────────
   app.get('/api/payment-batches', requireSupabaseJwt, async (req, res) => {
     try {
