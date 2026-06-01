@@ -171,7 +171,10 @@ async function qbQuery(sql) {
 async function qbPost(resourcePath, body) {
   return qbCallWithRetry(async () => {
     const realmId = oauthClient.getToken().realmId;
-    const url = `${API_BASE}/v3/company/${realmId}/${resourcePath}?minorversion=73`;
+    // If resourcePath already has a query string (e.g. "payment?operation=delete")
+    // append minorversion with `&`, not `?` — the double-? broke void/delete.
+    const sep = resourcePath.includes('?') ? '&' : '?';
+    const url = `${API_BASE}/v3/company/${realmId}/${resourcePath}${sep}minorversion=73`;
     const response = await oauthClient.makeApiCall({
       url,
       method: 'POST',

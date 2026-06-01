@@ -934,14 +934,48 @@ function suffixOf(c) { return { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[c] ||
 function appendSuf(t, c) { if (!t) return ''; const s = suffixOf(c); return s ? t + s : t; }
 function extractPhone(s) { const m = (s || '').match(/\d{10,}/); return m ? m[0] : null; }
 
-// Strict DD.MM.YYYY — returns null for invalid month/day so caller can
-// decide whether to include the row anyway (permissive mode).
-function parseTsStrict(s) {
-  const m = String(s || '').trim().match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
-  if (!m) return null;
-  const d = +m[1], mo = +m[2];
-  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-  return new Date(`${m[3]}-${m[2]}-${m[1]}T${m[4]}:${m[5]}:${m[6]}Z`);
+const MONTH_NAMES = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+
+// Accept every format invoice-payment-app accepts. Returns Date or null.
+// Returning null = "real garbage, can't tell when this happened" → caller
+// MUST skip these (safety: we won't include them in any window).
+function parseTsAny(s) {
+  const str = String(s || '').trim();
+  if (!str) return null;
+
+  // Format 1: DD.MM.YYYY HH:MM:SS — today's CRDB/iPhone/NMB rows
+  let m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (m) {
+    const d = +m[1], mo = +m[2];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return new Date(`${m[3]}-${m[2]}-${m[1]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    }
+    return null;
+  }
+
+  // Format 2: DD MMM YYYY, HH:MM  (or DD MMM YYYY without time) — legacy NMB
+  m = str.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?:\s*(am|pm))?)?(?:\s*\(EAT\))?$/i);
+  if (m) {
+    const d = m[1].padStart(2, '0');
+    const monIdx = MONTH_NAMES.indexOf(m[2].toLowerCase());
+    if (monIdx < 0) return null;
+    const mo = String(monIdx + 1).padStart(2, '0');
+    let h = m[4] ? +m[4] : 0;
+    const mins = m[5] || '00';
+    if (m[6] && m[6].toLowerCase() === 'pm' && h < 12) h += 12;
+    if (m[6] && m[6].toLowerCase() === 'am' && h === 12) h = 0;
+    return new Date(`${m[3]}-${mo}-${d}T${String(h).padStart(2,'0')}:${mins}:00+03:00`);
+  }
+
+  // Format 3: MM/DD/YYYY — original BODA/IPHONE/LIPA sheets
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const mo = +m[1], d = +m[2];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return new Date(`${m[3]}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00+03:00`);
+    }
+  }
+  return null;
 }
 
 // Verbatim invoice-payment-app algorithm. Keep in sync with run3_upload.mjs.
@@ -1041,19 +1075,29 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
   const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
   const sheet = sheetData.values || sheetData.data || [];
   const txns = [];
+  let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0;
   for (let i = 1; i < sheet.length; i++) {
     const dCell = String(sheet[i][1] || '').trim();
-    if (!dCell) continue; // operator's skip flag
-    const ts = parseTsStrict(dCell);
-    if (ts && (ts < winStart || ts >= winEnd)) continue;
+    if (!dCell) { skippedNoDate++; continue; }
+    const ts = parseTsAny(dCell);
+    if (!ts) { skippedBadFormat++; continue; }
+    if (ts < winStart || ts >= winEnd) { skippedOutOfWindow++; continue; }
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
       amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
-      receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7] || null,
+      receivedTimestamp: ts.getTime(), transactionId: sheet[i][7] || null,
     });
   }
-  if (txns.length === 0) return { skipped: true, reason: 'no rows in window' };
+  if (txns.length === 0) {
+    return {
+      skipped: true,
+      reason: 'no rows in window',
+      skipped_no_date: skippedNoDate,
+      skipped_bad_format: skippedBadFormat,
+      skipped_out_of_window: skippedOutOfWindow,
+    };
+  }
 
   // 2. Filter out already-consumed refs.
   const allRefs = txns.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
