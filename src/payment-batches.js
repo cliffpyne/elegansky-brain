@@ -1001,7 +1001,39 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
 
-  // 1. Arrears + snapshot
+  // 1. Sheet rows FIRST (cheap) — bail early if window is empty before we
+  //    burn a /arrears pull (which is multi-second on a 14k row DB).
+  //    Permissive — rows with unparseable dates included for officer review.
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
+  const sheet = sheetData.values || sheetData.data || [];
+  const txns = [];
+  for (let i = 1; i < sheet.length; i++) {
+    const ts = parseTsStrict(sheet[i][1]);
+    if (ts) {
+      if (ts < winStart || ts >= winEnd) continue;
+    }
+    txns.push({
+      id: sheet[i][0] || `tx-${i + 1}`, channel,
+      customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
+      amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
+      receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7] || null,
+    });
+  }
+  if (txns.length === 0) return { skipped: true, reason: 'no rows in window' };
+
+  // 2. Filter out already-consumed refs.
+  const allRefs = txns.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
+  const forbidden = new Set();
+  const CH = 5000;
+  for (let i = 0; i < allRefs.length; i += CH) {
+    const chunk = allRefs.slice(i, i + CH);
+    const ec = await db().query(`SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1)`, [chunk]);
+    ec.rows.forEach((r) => forbidden.add(r.bank_ref));
+  }
+  const txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
+  if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
+
+  // 3. Arrears + snapshot (only after we know there's work to do).
   const arrears = await fetchAllArrears();
   const invoices = arrears.map((inv, i) => ({
     id: i + 1, customerName: inv.customerLeaf, invoiceNumber: inv.no,
@@ -1019,36 +1051,6 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
     ],
   );
   const snapshotId = snapInsert.rows[0].id;
-
-  // 2. Sheet rows (permissive — include bad-date rows for officer review)
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
-  const sheet = sheetData.values || sheetData.data || [];
-  const txns = [];
-  for (let i = 1; i < sheet.length; i++) {
-    const ts = parseTsStrict(sheet[i][1]);
-    if (ts) {
-      if (ts < winStart || ts >= winEnd) continue;
-    }
-    txns.push({
-      id: sheet[i][0] || `tx-${i + 1}`, channel,
-      customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
-      amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
-      receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7] || null,
-    });
-  }
-
-  // 3. Filter out already-consumed refs
-  const allRefs = txns.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
-  if (!allRefs.length) return { skipped: true, reason: 'no rows in window' };
-  const forbidden = new Set();
-  const CH = 5000;
-  for (let i = 0; i < allRefs.length; i += CH) {
-    const chunk = allRefs.slice(i, i + CH);
-    const ec = await db().query(`SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1)`, [chunk]);
-    ec.rows.forEach((r) => forbidden.add(r.bank_ref));
-  }
-  const txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
-  if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
 
   // 4. Algorithm
   const result = processInvoicePayments(invoices, txnsClean);
