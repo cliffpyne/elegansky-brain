@@ -234,13 +234,21 @@ async function qbCreateCreditMemo({ customerId, amount, memo }) {
  * SyncToken } works since we don't need to mutate other fields.
  */
 async function qbVoid({ kind, qbId }) {
-  // QB needs SyncToken — fetch it first.
+  // Despite the name, the operation is delete for both Payments and CreditMemos:
+  //   - 'void' on a Payment returns 'Unsupported Operation' from QB Online.
+  //     For payments, delete removes the record AND restores the linked
+  //     invoices' balances, which is exactly what recall wants.
+  //   - Same for CreditMemos.
+  // QB needs the SyncToken so we fetch the current entity first.
   const entityName = kind === 'payment' ? 'Payment' : 'CreditMemo';
   const q = await qbQuery(`SELECT * FROM ${entityName} WHERE Id = '${qbId}'`);
   const entity = q.QueryResponse?.[entityName]?.[0];
-  if (!entity) throw new Error(`${entityName} ${qbId} not found`);
+  if (!entity) {
+    // Already gone — treat as successfully voided.
+    return { alreadyGone: true, qbId };
+  }
   const body = { Id: entity.Id, SyncToken: entity.SyncToken };
-  const path = kind === 'payment' ? 'payment?operation=void' : 'creditmemo?operation=void';
+  const path = kind === 'payment' ? 'payment?operation=delete' : 'creditmemo?operation=delete';
   return await qbPost(path, body);
 }
 
