@@ -98,30 +98,70 @@ async function saveTokens(token) {
 // CSRF state for OAuth — stored in-memory; for production-scale use Redis or signed cookies.
 const pendingStates = new Set();
 
+// Pre-emptive refresh: if the access token is within REFRESH_BUFFER_MS of
+// expiry, refresh now even if isAccessTokenValid() still says yes. Intuit's
+// access tokens last 1h; we refresh at 50min to leave headroom for long
+// loops (like recalls voiding 1000+ payments back-to-back).
+const REFRESH_BUFFER_MS = 10 * 60 * 1000;
+
+function accessTokenExpiringSoon(tokens) {
+  if (!tokens) return true;
+  const acquiredAt = Number(tokens.acquiredAt) || 0;
+  const expiresInMs = Number(tokens.expires_in || 0) * 1000;
+  if (!acquiredAt || !expiresInMs) return true;
+  return Date.now() >= acquiredAt + expiresInMs - REFRESH_BUFFER_MS;
+}
+
+async function refreshNow(prevTokens) {
+  const refreshed = await oauthClient.refresh();
+  const next = refreshed.getJson();
+  next.realmId = prevTokens.realmId;
+  next.acquiredAt = Date.now();
+  await saveTokens(next);
+  oauthClient.setToken(next);
+  return next;
+}
+
 async function ensureFreshToken() {
   const tokens = await loadTokens();
   if (!tokens) throw new Error('Not connected. Visit /connect first.');
   oauthClient.setToken(tokens);
-  if (!oauthClient.isAccessTokenValid()) {
-    const refreshed = await oauthClient.refresh();
-    const next = refreshed.getJson();
-    next.realmId = tokens.realmId;
-    next.acquiredAt = Date.now();
-    await saveTokens(next);
-    oauthClient.setToken(next);
+  if (!oauthClient.isAccessTokenValid() || accessTokenExpiringSoon(tokens)) {
+    await refreshNow(tokens);
   }
   return oauthClient.getToken();
 }
 
-async function qbQuery(sql) {
+// If a QB call returns 401 despite our pre-emptive refresh (token was
+// invalidated server-side, refresh-token rotated, clock skew, etc.), do one
+// forced refresh + retry. After that, fail loudly.
+async function qbCallWithRetry(makeCall) {
   await ensureFreshToken();
-  const realmId = oauthClient.getToken().realmId;
-  const url = `${API_BASE}/v3/company/${realmId}/query?query=${encodeURIComponent(sql)}&minorversion=73`;
-  const response = await oauthClient.makeApiCall({
-    url,
-    headers: { Accept: 'application/json' },
+  try {
+    return await makeCall();
+  } catch (err) {
+    const status = err?.intuit_tid ? null : (err?.authResponse?.response?.status ?? err?.response?.status);
+    const message = String(err?.message || '');
+    const looks401 = status === 401 || /401/.test(message) || /HTTP Error/.test(message);
+    if (!looks401) throw err;
+    console.warn('[qb] 401 after token-check — forcing refresh and retrying once');
+    const tokens = await loadTokens();
+    if (!tokens) throw err;
+    await refreshNow(tokens);
+    return await makeCall();
+  }
+}
+
+async function qbQuery(sql) {
+  return qbCallWithRetry(async () => {
+    const realmId = oauthClient.getToken().realmId;
+    const url = `${API_BASE}/v3/company/${realmId}/query?query=${encodeURIComponent(sql)}&minorversion=73`;
+    const response = await oauthClient.makeApiCall({
+      url,
+      headers: { Accept: 'application/json' },
+    });
+    return response.json;
   });
-  return response.json;
 }
 
 /**
@@ -129,25 +169,26 @@ async function qbQuery(sql) {
  * Throws on any non-2xx with a message that includes intuit_tid for tracing.
  */
 async function qbPost(resourcePath, body) {
-  await ensureFreshToken();
-  const realmId = oauthClient.getToken().realmId;
-  const url = `${API_BASE}/v3/company/${realmId}/${resourcePath}?minorversion=73`;
-  const response = await oauthClient.makeApiCall({
-    url,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(body),
+  return qbCallWithRetry(async () => {
+    const realmId = oauthClient.getToken().realmId;
+    const url = `${API_BASE}/v3/company/${realmId}/${resourcePath}?minorversion=73`;
+    const response = await oauthClient.makeApiCall({
+      url,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (response.statusCode && response.statusCode >= 400) {
+      const tid = response.headers?.intuit_tid || response.intuit_tid;
+      const msg = `QB ${resourcePath} HTTP ${response.statusCode}` +
+        (tid ? ` (intuit_tid=${tid})` : '') +
+        `: ${typeof response.body === 'string' ? response.body.slice(0, 400) : ''}`;
+      const err = new Error(msg);
+      err.intuit_tid = tid;
+      throw err;
+    }
+    return response.json;
   });
-  if (response.statusCode && response.statusCode >= 400) {
-    const tid = response.headers?.intuit_tid || response.intuit_tid;
-    const msg = `QB ${resourcePath} HTTP ${response.statusCode}` +
-      (tid ? ` (intuit_tid=${tid})` : '') +
-      `: ${typeof response.body === 'string' ? response.body.slice(0, 400) : ''}`;
-    const err = new Error(msg);
-    err.intuit_tid = tid;
-    throw err;
-  }
-  return response.json;
 }
 
 async function ensureQbConnected() {
