@@ -37,6 +37,29 @@ const SUPABASE_JWKS = SUPABASE_URL
 export function mountPaymentBatchesApi(app, deps) {
   const { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensureQbConnected } = deps;
 
+  // Startup check: log any pending batches older than 1 hour. Surfaces stuck
+  // batches from a previous crash so the operator can investigate. Doesn't
+  // auto-rollback — that's deliberate, money has already moved.
+  setTimeout(async () => {
+    try {
+      const r = await db().query(
+        `SELECT id, channel, created_at, paid_count
+           FROM payment_batches
+          WHERE status='pending' AND created_at < now() - interval '1 hour'
+          ORDER BY created_at`,
+      );
+      if (r.rows.length) {
+        console.warn(`[startup] ⚠ ${r.rows.length} pending batches stuck > 1h:`);
+        for (const row of r.rows) {
+          console.warn(`  - ${row.id} (${row.channel}, ${row.paid_count} paid, since ${row.created_at.toISOString()})`);
+        }
+      }
+    } catch (err) {
+      console.error('[startup] pending-batches check failed:', err.message);
+    }
+  }, 5000);
+
+
   // ── POST /api/arrears-snapshots ──────────────────────────────────────────
   // One snapshot per run; subsequent batches in the same run share it via id.
   app.post('/api/arrears-snapshots', requireSharedSecret, async (req, res) => {
@@ -306,6 +329,157 @@ export function mountPaymentBatchesApi(app, deps) {
     });
   });
 
+  // ── POST /api/payment-batches/auto-upload/:channel ───────────────────────
+  // The hourly cycle's "match-and-post" step. The worker calls this after
+  // each statement pull; we run the verbatim invoice-payment-app algorithm
+  // against current /arrears + the channel's sheet, then create QB Payments
+  // for every match (concurrent + retry) and record unmatched rows for
+  // officer review. Returns immediately with the batch id; processing
+  // continues in the background so the worker can move on.
+  //
+  // Body (optional):
+  //   { since_iso?: ISO8601, until_iso?: ISO8601 }   — defaults: last 24h
+  app.post('/api/payment-batches/auto-upload/:channel', requireSharedSecret, async (req, res) => {
+    const channel = req.params.channel;
+    if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
+      return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
+    }
+    const dryRun = req.body?.dry_run === true || process.env.AUTO_UPLOAD_DRY_RUN === 'true';
+    const maxPaid = Number(process.env.AUTO_UPLOAD_MAX_PAID || 200);
+
+    // Safety net 1: advisory lock per channel — concurrent runs are rejected.
+    const lockKey = `auto-upload-${channel}`;
+    const lockRes = await db().query(`SELECT pg_try_advisory_lock(hashtext($1)) AS got`, [lockKey]);
+    if (!lockRes.rows[0].got) {
+      return res.status(409).json({
+        error: 'another auto-upload for this channel is already running',
+        channel,
+      });
+    }
+    let lockHeldForBackground = false;
+    const releaseLock = async () => {
+      if (lockHeldForBackground) return;
+      await db().query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => {});
+    };
+
+    try {
+      // Safety net 2: default window = since last finalized batch (- 5min
+      // overlap) to now. Belt-and-suspenders — consumed_transactions catches
+      // duplicates anyway, but this avoids re-running heavy algorithm over
+      // already-processed rows.
+      let sinceIso = req.body?.since_iso;
+      if (!sinceIso) {
+        const last = await db().query(
+          `SELECT finalized_at FROM payment_batches
+            WHERE channel=$1 AND status='finalized' AND finalized_at IS NOT NULL
+            ORDER BY finalized_at DESC LIMIT 1`,
+          [channel],
+        );
+        sinceIso = last.rows.length
+          ? new Date(new Date(last.rows[0].finalized_at).getTime() - 5 * 60_000).toISOString()
+          : new Date(Date.now() - 24 * 3600_000).toISOString();
+      }
+      const untilIso = req.body?.until_iso || new Date(Date.now() + 60_000).toISOString();
+
+      const result = await prepareAutoUpload({ channel, sinceIso, untilIso });
+      if (result.skipped) {
+        await releaseLock();
+        return res.json({ skipped: true, reason: result.reason, since_iso: sinceIso, until_iso: untilIso });
+      }
+
+      // Safety net 3: row cap to protect BRAIN's Starter plan memory.
+      if (result.paid.length > maxPaid) {
+        const c = await db().connect();
+        try {
+          await c.query('BEGIN');
+          await c.query(`DELETE FROM consumed_transactions WHERE batch_id=$1`, [result.batchId]);
+          await c.query(`DELETE FROM payment_batches WHERE id=$1`, [result.batchId]);
+          await c.query('COMMIT');
+        } catch (e) {
+          await c.query('ROLLBACK').catch(() => {});
+        } finally { c.release(); }
+        await releaseLock();
+        return res.status(413).json({
+          error: 'too many paid records for one auto-upload',
+          paid_planned: result.paid.length,
+          max: maxPaid,
+          hint: 'narrow since_iso/until_iso window or raise AUTO_UPLOAD_MAX_PAID',
+        });
+      }
+
+      // Safety net 4: dry-run — records the plan but doesn't touch QB.
+      if (dryRun) {
+        await db().query(
+          `UPDATE payment_batches SET status='finalized', finalized_at=now(),
+             failure_reason='dry_run — no QB calls' WHERE id=$1`,
+          [result.batchId],
+        );
+        for (const p of result.paid) {
+          await db().query(
+            `INSERT INTO payment_uploads (
+               batch_id, kind, bank_ref, customer_id, customer_name,
+               invoice_qb_id, invoice_no, amount, memo, status
+             ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'dry_run')`,
+            [result.batchId, p.memoWithSuffix, p.customerId, p.customerName,
+             p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix],
+          );
+        }
+        for (const u of result.unused) {
+          await db().query(
+            `INSERT INTO payment_uploads (
+               batch_id, kind, bank_ref, customer_id, customer_name,
+               amount, memo, status
+             ) VALUES ($1,'credit_memo',$2,NULL,$3,$4,$5,'dry_run')`,
+            [result.batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix],
+          );
+        }
+        await releaseLock();
+        return res.status(202).json({
+          dry_run: true,
+          batch_id: result.batchId,
+          paid_planned: result.paid.length,
+          unused_planned: result.unused.length,
+          sheet_sum: result.sheetSum,
+          since_iso: sinceIso,
+          until_iso: untilIso,
+        });
+      }
+
+      // Real run: hand off to background. Lock stays held; the background
+      // task releases it when QB calls finish.
+      lockHeldForBackground = true;
+      setImmediate(() => {
+        runAutoUploadBackground({
+          batchId: result.batchId,
+          paid: result.paid,
+          unused: result.unused,
+          qbCreatePayment,
+          qbCreateCreditMemo,
+        })
+          .catch((err) => {
+            console.error('[auto-upload background]', result.batchId, err);
+          })
+          .finally(async () => {
+            await db().query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => {});
+          });
+      });
+
+      res.status(202).json({
+        batch_id: result.batchId,
+        paid_planned: result.paid.length,
+        unused_planned: result.unused.length,
+        sheet_sum: result.sheetSum,
+        since_iso: sinceIso,
+        until_iso: untilIso,
+        message: 'background processing started; poll /api/payment-batches/:id for progress',
+      });
+    } catch (err) {
+      console.error('[POST /api/payment-batches/auto-upload]', err);
+      await releaseLock();
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── POST /api/payment-batches/:id/recall ─────────────────────────────────
   // Either Supabase JWT (operator clicking dashboard button) or shared secret
   // (CLI / service-to-service) is accepted.
@@ -482,6 +656,33 @@ export function mountPaymentBatchesApi(app, deps) {
       res.json({ batch, uploads: u.rows, snapshot: sn.rows[0] || null });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── GET /api/arrears-snapshots/:id/export.csv ────────────────────────────
+  // No-auth (so the dashboard's <a download> works) — snapshots aren't secret.
+  app.get('/api/arrears-snapshots/:id/export.csv', async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT id, as_of, data, row_count, total_balance FROM arrears_snapshots WHERE id=$1`,
+        [req.params.id],
+      );
+      if (!r.rows.length) return res.status(404).type('text/plain').send('not found');
+      const s = r.rows[0];
+      const rows = Array.isArray(s.data) ? s.data : [];
+      const header = ['no','customerId','customerLeaf','customer','date','dueDate','amount','balance','status','qbId'];
+      const esc = (v) => {
+        if (v == null) return '';
+        const str = String(v);
+        return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+      };
+      const lines = [header.join(',')];
+      for (const inv of rows) {
+        lines.push(header.map((h) => esc(inv[h])).join(','));
+      }
+      res.type('text/csv').attachment(`arrears-snapshot-${s.as_of}-${s.id.slice(0,8)}.csv`).send(lines.join('\n'));
+    } catch (err) {
+      res.status(500).type('text/plain').send('error: ' + err.message);
     }
   });
 
@@ -694,4 +895,286 @@ async function requireSupabaseJwt(req, res, next) {
 function requireSecretOrJwt(req, res, next) {
   if (req.get('x-report-secret')) return requireSharedSecret(req, res, next);
   return requireSupabaseJwt(req, res, next);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auto-upload — invoke from /api/payment-batches/auto-upload/:channel.
+
+const CHANNEL_SHEETS = {
+  nmbnew:      { sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
+  bank:        { sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED' },
+  iphone_bank: { sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+};
+
+function suffixOf(c) { return { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[c] || ''; }
+function appendSuf(t, c) { if (!t) return ''; const s = suffixOf(c); return s ? t + s : t; }
+function extractPhone(s) { const m = (s || '').match(/\d{10,}/); return m ? m[0] : null; }
+
+// Strict DD.MM.YYYY — returns null for invalid month/day so caller can
+// decide whether to include the row anyway (permissive mode).
+function parseTsStrict(s) {
+  const m = String(s || '').trim().match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const d = +m[1], mo = +m[2];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  return new Date(`${m[3]}-${m[2]}-${m[1]}T${m[4]}:${m[5]}:${m[6]}Z`);
+}
+
+// Verbatim invoice-payment-app algorithm. Keep in sync with run3_upload.mjs.
+function processInvoicePayments(invoices, transactions) {
+  const usedTx = new Set();
+  const invByCust = {};
+  invoices.forEach((inv) => {
+    const key = inv.customerPhone || inv.customerName.toLowerCase().trim();
+    (invByCust[key] ||= []).push(inv);
+  });
+  Object.keys(invByCust).forEach((k) => invByCust[k].sort((a, b) => {
+    const dc = new Date(b.invoiceDate) - new Date(a.invoiceDate);
+    return dc !== 0 ? dc : b.invoiceNumber.localeCompare(a.invoiceNumber);
+  }));
+  const txByCust = {};
+  const seen = new Set();
+  transactions.forEach((t) => {
+    if (!t.amount) return;
+    const uid = `${t.transactionId || t.id}_${t.receivedTimestamp}_${t.amount}`;
+    if (seen.has(uid)) return;
+    const keys = [t.customerPhone, t.contractName?.toLowerCase().trim(), t.customerName?.toLowerCase().trim()].filter(Boolean);
+    const k = keys.find((key) => invByCust[key]);
+    if (k) { (txByCust[k] ||= []).push(t); seen.add(uid); }
+  });
+  Object.keys(txByCust).forEach((k) => txByCust[k].sort((a, b) => (a.receivedTimestamp || 0) - (b.receivedTimestamp || 0)));
+  const out = [];
+  Object.keys(invByCust).forEach((ck) => {
+    const ci = invByCust[ck]; const ct = txByCust[ck] || [];
+    if (ct.length === 0) return;
+    const ib = ci.map((inv) => ({ inv, remainingBalance: inv.amount, fullyPaid: false }));
+    let idx = 0;
+    ct.forEach((tx) => {
+      let amt = tx.amount; let used = false; const txp = [];
+      while (amt > 0 && idx < ib.length) {
+        const cur = ib[idx];
+        if (cur.fullyPaid) { idx++; continue; }
+        const pay = Math.min(amt, cur.remainingBalance);
+        const rec = {
+          customerName: cur.inv.customerName, invoiceNo: cur.inv.invoiceNumber,
+          amount: pay, memo: tx.transactionId, memoWithSuffix: appendSuf(tx.transactionId, tx.channel),
+          channel: tx.channel, customerId: cur.inv.customerId, qbId: cur.inv.qbId,
+        };
+        out.push(rec); txp.push(rec);
+        cur.remainingBalance -= pay; amt -= pay; used = true;
+        if (cur.remainingBalance <= 1) { cur.fullyPaid = true; cur.remainingBalance = 0; idx++; }
+      }
+      if (used) usedTx.add(tx.transactionId || tx.id);
+      if (amt > 0 && txp.length > 0) txp[0].amount += amt;
+    });
+  });
+  const unused = transactions.filter((t) => !usedTx.has(t.transactionId || t.id));
+  unused.forEach((t) => out.push({
+    customerName: t.customerName || t.contractName || 'UNKNOWN',
+    invoiceNo: 'UNUSED', amount: t.amount, transactionAmount: t.amount,
+    memo: t.transactionId, memoWithSuffix: appendSuf(t.transactionId, t.channel),
+    isUnused: true, channel: t.channel,
+  }));
+  return out;
+}
+
+async function fetchAllArrears() {
+  const { default: fetchImpl } = { default: globalThis.fetch };
+  const base = process.env.SELF_URL || 'http://127.0.0.1:' + (process.env.PORT || 3000);
+  const arrears = [];
+  let start = 1;
+  while (true) {
+    const r = await fetchImpl(`${base}/arrears?pageSize=1000&start=${start}`);
+    if (!r.ok) throw new Error(`arrears ${r.status}: ${await r.text()}`);
+    const j = await r.json();
+    const invs = j.invoices || [];
+    if (!invs.length) break;
+    arrears.push(...invs);
+    if (!j.page?.nextStart) break;
+    start = j.page.nextStart;
+  }
+  return arrears;
+}
+
+async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
+  const cfg = CHANNEL_SHEETS[channel];
+  const winStart = new Date(sinceIso);
+  const winEnd = new Date(untilIso);
+
+  // 1. Arrears + snapshot
+  const arrears = await fetchAllArrears();
+  const invoices = arrears.map((inv, i) => ({
+    id: i + 1, customerName: inv.customerLeaf, invoiceNumber: inv.no,
+    amount: Number(inv.balance) || 0, invoiceDate: inv.date,
+    customerPhone: extractPhone(inv.customer || ''),
+    customerId: inv.customerId, qbId: inv.qbId,
+  }));
+  const snapInsert = await db().query(
+    `INSERT INTO arrears_snapshots (as_of, data, row_count, total_balance, created_by, notes)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [
+      new Date().toISOString().slice(0, 10), JSON.stringify(arrears), arrears.length,
+      arrears.reduce((s, r) => s + (Number(r.balance) || 0), 0),
+      `auto-upload-${channel}`, `auto cycle since=${sinceIso}`,
+    ],
+  );
+  const snapshotId = snapInsert.rows[0].id;
+
+  // 2. Sheet rows (permissive — include bad-date rows for officer review)
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
+  const sheet = sheetData.values || sheetData.data || [];
+  const txns = [];
+  for (let i = 1; i < sheet.length; i++) {
+    const ts = parseTsStrict(sheet[i][1]);
+    if (ts) {
+      if (ts < winStart || ts >= winEnd) continue;
+    }
+    txns.push({
+      id: sheet[i][0] || `tx-${i + 1}`, channel,
+      customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
+      amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
+      receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7] || null,
+    });
+  }
+
+  // 3. Filter out already-consumed refs
+  const allRefs = txns.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
+  if (!allRefs.length) return { skipped: true, reason: 'no rows in window' };
+  const forbidden = new Set();
+  const CH = 5000;
+  for (let i = 0; i < allRefs.length; i += CH) {
+    const chunk = allRefs.slice(i, i + CH);
+    const ec = await db().query(`SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1)`, [chunk]);
+    ec.rows.forEach((r) => forbidden.add(r.bank_ref));
+  }
+  const txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
+  if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
+
+  // 4. Algorithm
+  const result = processInvoicePayments(invoices, txnsClean);
+  const paid = result.filter((p) => !p.isUnused && p.amount > 0);
+  const unused = result.filter((p) => p.isUnused);
+  const sumPaid = paid.reduce((s, p) => s + p.amount, 0);
+  const sumUnused = unused.reduce((s, p) => s + (p.transactionAmount || 0), 0);
+  const sheetSum = txnsClean.reduce((s, t) => s + (t.amount || 0), 0);
+
+  // 5. Batch row + lock refs
+  const bankRefs = [...new Set(txnsClean.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean))];
+  const idem = `auto-${channel}-${Date.now()}-` + Math.random().toString(36).slice(2, 8);
+  const client = await db().connect();
+  let batchId;
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO payment_batches (
+         idempotency_key, status, arrears_snapshot_id,
+         sheet_id, sheet_tab, channel, bank_refs,
+         sheet_total, paid_total, unused_total,
+         paid_count, unused_count, created_by
+       ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [idem, snapshotId, cfg.sheetId, cfg.tab, channel, bankRefs,
+       round2(sheetSum), round2(sumPaid), round2(sumUnused),
+       paid.length, unused.length, `auto-upload`],
+    );
+    batchId = ins.rows[0].id;
+    const tuples = bankRefs.map((_, i) => `($${i * 2 + 1},$${i * 2 + 2})`).join(',');
+    const vals = []; bankRefs.forEach((r) => { vals.push(r, batchId); });
+    await client.query(`INSERT INTO consumed_transactions (bank_ref, batch_id) VALUES ${tuples}`, vals);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    client.release();
+    throw e;
+  }
+  client.release();
+
+  return { skipped: false, batchId, paid, unused, sheetSum };
+}
+
+async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment, qbCreateCreditMemo }) {
+  const CONCURRENCY = 5;
+  let cursor = 0; let failed = 0;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= paid.length) return;
+      const p = paid[i];
+      try {
+        const qb = await qbCreatePayment({
+          customerId: p.customerId, invoiceQbId: p.qbId,
+          amount: Number(p.amount), memo: p.memoWithSuffix || '',
+        });
+        await db().query(
+          `INSERT INTO payment_uploads (
+             batch_id, kind, bank_ref, customer_id, customer_name,
+             invoice_qb_id, invoice_no, amount, memo, qb_id, qb_response, status
+           ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,$9,$10,'created')`,
+          [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+           p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+           qb.id, JSON.stringify(qb.response)],
+        );
+      } catch (err) {
+        failed++;
+        await db().query(
+          `INSERT INTO payment_uploads (
+             batch_id, kind, bank_ref, customer_id, customer_name,
+             invoice_qb_id, invoice_no, amount, memo, status, failure_reason
+           ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'failed',$9)`,
+          [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+           p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+           String(err.message || err).slice(0, 500)],
+        );
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+
+  // Matched CreditMemos (if any unused has a customer_id from algorithm — none today)
+  for (const u of unused) {
+    if (!u.customerId) {
+      await db().query(
+        `INSERT INTO payment_uploads (
+           batch_id, kind, bank_ref, customer_id, customer_name,
+           amount, memo, status
+         ) VALUES ($1,'credit_memo',$2,NULL,$3,$4,$5,'unmatched')`,
+        [batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix],
+      );
+      continue;
+    }
+    try {
+      const qb = await qbCreateCreditMemo({
+        customerId: u.customerId, amount: Number(u.transactionAmount), memo: u.memoWithSuffix || '',
+      });
+      await db().query(
+        `INSERT INTO payment_uploads (
+           batch_id, kind, bank_ref, customer_id, customer_name,
+           amount, memo, qb_id, qb_response, status
+         ) VALUES ($1,'credit_memo',$2,$3,$4,$5,$6,$7,$8,'created')`,
+        [batchId, u.memoWithSuffix, u.customerId, u.customerName,
+         round2(u.transactionAmount), u.memoWithSuffix, qb.id, JSON.stringify(qb.response)],
+      );
+    } catch (err) {
+      failed++;
+      await db().query(
+        `INSERT INTO payment_uploads (
+           batch_id, kind, bank_ref, customer_id, customer_name,
+           amount, memo, status, failure_reason
+         ) VALUES ($1,'credit_memo',$2,$3,$4,$5,$6,'failed',$7)`,
+        [batchId, u.memoWithSuffix, u.customerId, u.customerName,
+         round2(u.transactionAmount), u.memoWithSuffix,
+         String(err.message || err).slice(0, 500)],
+      );
+    }
+  }
+
+  if (failed === 0) {
+    await db().query(`UPDATE payment_batches SET status='finalized', finalized_at=now() WHERE id=$1`, [batchId]);
+    console.log(`[auto-upload] batch ${batchId} finalized.`);
+  } else {
+    await db().query(
+      `UPDATE payment_batches SET failure_reason=$2 WHERE id=$1`,
+      [batchId, `${failed} per-row failures — see payment_uploads.failure_reason`],
+    );
+    console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures.`);
+  }
 }

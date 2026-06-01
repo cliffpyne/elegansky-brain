@@ -174,13 +174,23 @@ export function PaymentBatchDetailPage() {
         {snapshot && (
           <Card className="mb-4">
             <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Database className="size-4" />
-                Arrears snapshot used by this batch
-              </CardTitle>
-              <CardDescription>
-                The frozen list of overdue invoices the payment algorithm matched against. Same snapshot is reused on rerun.
-              </CardDescription>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    <Database className="size-4" />
+                    Arrears snapshot used by this batch
+                  </CardTitle>
+                  <CardDescription>
+                    The frozen list of overdue invoices the payment algorithm matched against. Same snapshot is reused on rerun.
+                  </CardDescription>
+                </div>
+                <Button variant="outline" asChild>
+                  <a href={`/api/arrears-snapshots/${snapshot.id}/export.csv`} download>
+                    <Download className="size-4" />
+                    Export CSV
+                  </a>
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
@@ -195,8 +205,21 @@ export function PaymentBatchDetailPage() {
 
         <Card className="mb-4">
           <CardHeader>
-            <CardTitle>Paid invoices ({paid.length})</CardTitle>
-            <CardDescription>Each row is one QB Payment that was applied to an overdue invoice. Voided rows are recalled Payments.</CardDescription>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle>Paid invoices ({paid.length})</CardTitle>
+                <CardDescription>Each row is one QB Payment that was applied to an overdue invoice. Voided rows are recalled Payments.</CardDescription>
+              </div>
+              {paid.length > 0 && (
+                <Button
+                  variant="outline"
+                  onClick={() => downloadCsv(`paid-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, paid)}
+                >
+                  <Download className="size-4" />
+                  Export CSV
+                </Button>
+              )}
+            </div>
           </CardHeader>
           <CardContent>
             <Table>
@@ -233,10 +256,23 @@ export function PaymentBatchDetailPage() {
 
         <Card className="mb-4">
           <CardHeader>
-            <CardTitle>Credit memos created ({creditsMatched.length})</CardTitle>
-            <CardDescription>
-              Unused bank transactions whose customer was resolvable. Each row is a QB CreditMemo posted to that customer's account — credit applies to future invoices.
-            </CardDescription>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle>Credit memos created ({creditsMatched.length})</CardTitle>
+                <CardDescription>
+                  Unused bank transactions whose customer was resolvable. Each row is a QB CreditMemo posted to that customer's account — credit applies to future invoices.
+                </CardDescription>
+              </div>
+              {creditsMatched.length > 0 && (
+                <Button
+                  variant="outline"
+                  onClick={() => downloadCsv(`credit-memos-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, creditsMatched)}
+                >
+                  <Download className="size-4" />
+                  Export CSV
+                </Button>
+              )}
+            </div>
           </CardHeader>
           <CardContent>
             <Table>

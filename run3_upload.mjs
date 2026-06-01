@@ -35,9 +35,8 @@ function suffixOf(c) { return { bank:'B', iphone_bank:'P', nmbnew:'N' }[c] || ''
 function appendSuf(t, c) { if (!t) return ''; const s = suffixOf(c); return s ? t+s : t; }
 function extractPhone(s) { const m = (s||'').match(/\d{10,}/); return m ? m[0] : null; }
 
-// Strict DD.MM.YYYY parser — rejects month > 12 / day > 31 to keep garbage rows
-// out (iPhone Bank sheet has e.g. "20.26.2026" rows that JS Date would silently
-// roll over into next year).
+// Strict DD.MM.YYYY parser. Returns null for invalid month/day — caller
+// decides whether to include those rows anyway (permissive mode).
 function parseTs(s) {
   const m = String(s||'').trim().match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
   if (!m) return null;
@@ -199,20 +198,29 @@ console.log(`   snapshot.id=${snapshot.id}`);
 console.log('3. Pulling sheet + running algorithm…');
 const sheetResp = await (await fetch(`${BASE}/sheets/${SHEET_ID}?range=${SHEET_TAB}!A1:H80000`)).json();
 const sheet = sheetResp.values || [];
+// Permissive mode (matches invoice-payment-app): rows whose date doesn't
+// parse get included with receivedTimestamp=null. They'll be processed by
+// the next upload that runs (locked in consumed_transactions after) so
+// they never get processed twice.
 const txns = [];
-let garbageRows = 0;
+let badDateIncluded = 0;
 for (let i=1;i<sheet.length;i++) {
   const dCell = String(sheet[i][1]||'').trim();
-  if (!dCell) continue;
   const ts = parseTs(dCell);
-  if (!ts) { garbageRows++; continue; }
-  if (ts < WIN_START || ts >= WIN_END) continue;
+  if (ts) {
+    if (ts < WIN_START || ts >= WIN_END) continue;
+  } else {
+    badDateIncluded++;
+  }
   txns.push({
     id: sheet[i][0]||`tx-${i+1}`, channel: CHANNEL,
     customerPhone: sheet[i][5]||null, customerName: sheet[i][6]||null, contractName: sheet[i][6]||null,
     amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g,'')) : null,
-    receivedTimestamp: ts.getTime(), transactionId: sheet[i][7]||null,
+    receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7]||null,
   });
+}
+if (badDateIncluded > 0) {
+  console.log(`   permissive mode: included ${badDateIncluded} rows with unparseable dates (will be locked after processing).`);
 }
 const invoices = filtered.map((inv, i) => ({
   id: i+1, customerName: inv.customerLeaf, invoiceNumber: inv.no,
@@ -229,7 +237,7 @@ if (allRefs.length) {
   ec.rows.forEach(r => forbidden.add(r.bank_ref));
 }
 const txnsClean = txns.filter(t => !forbidden.has(appendSuf(t.transactionId, CHANNEL)));
-console.log(`   txns: ${txns.length} | already consumed: ${forbidden.size} | clean: ${txnsClean.length} | garbage rows skipped (whole sheet): ${garbageRows}`);
+console.log(`   txns: ${txns.length} | already consumed: ${forbidden.size} | clean: ${txnsClean.length}`);
 
 const result = processInvoicePayments(invoices, txnsClean);
 const paid = result.filter(p => !p.isUnused && p.amount > 0);
