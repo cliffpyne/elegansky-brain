@@ -215,12 +215,30 @@ async function ensureQbConnected() {
   await ensureFreshToken();
 }
 
+/**
+ * 16:16 EAT cutoff rule (operator-set):
+ *   - Before 16:16 EAT today → Payment dated TODAY (EAT)
+ *   - From 16:16 EAT today until 16:15 EAT tomorrow → Payment dated TOMORROW (EAT)
+ * Rationale: Payments made after the cutoff land in TOMORROW's arrears
+ * report, so we date them tomorrow to keep QB books in sync with the
+ * operator's daily settlement window.
+ */
+function paymentTxnDate() {
+  const eat = new Date(Date.now() + 3 * 3600_000);
+  const h = eat.getUTCHours();
+  const m = eat.getUTCMinutes();
+  const pastCutoff = h > 16 || (h === 16 && m >= 16);
+  if (pastCutoff) eat.setUTCDate(eat.getUTCDate() + 1);
+  return eat.toISOString().slice(0, 10);
+}
+
 /** Create a QB Payment for one bank-txn line against one invoice. */
 async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
   const body = {
     CustomerRef: { value: String(customerId) },
     TotalAmt: Number(amount),
     PrivateNote: memo || undefined,
+    TxnDate: paymentTxnDate(),
     Line: [{
       Amount: Number(amount),
       LinkedTxn: [{ TxnId: String(invoiceQbId), TxnType: 'Invoice' }],
@@ -235,6 +253,7 @@ async function qbCreateCreditMemo({ customerId, amount, memo }) {
   const body = {
     CustomerRef: { value: String(customerId) },
     PrivateNote: memo || undefined,
+    TxnDate: paymentTxnDate(),
     Line: [{
       DetailType: 'SalesItemLineDetail',
       Amount: Number(amount),
