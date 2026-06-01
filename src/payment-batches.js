@@ -1252,14 +1252,67 @@ async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment,
     }
   }
 
+  // ─── Self-healing sweep: hammer any 'failed' rows up to 3 more times
+  // before giving up. Catches Stale Object Errors that slipped past the
+  // per-call retry budget (e.g. operator was editing the same invoice in
+  // QB UI), plus any other transient blips. Only finalize when failed=0.
+  for (let sweep = 1; sweep <= 3 && failed > 0; sweep++) {
+    const { rows: stillFailed } = await db().query(
+      `SELECT id, kind, customer_id, invoice_qb_id, invoice_no, amount, memo,
+              bank_ref, customer_name
+         FROM payment_uploads
+        WHERE batch_id=$1 AND status='failed'
+        ORDER BY id`,
+      [batchId],
+    );
+    if (stillFailed.length === 0) { failed = 0; break; }
+    console.log(`[auto-upload] sweep ${sweep}/3: retrying ${stillFailed.length} failed rows`);
+    let sweepCursor = 0;
+    const sweeper = async () => {
+      while (true) {
+        const idx = sweepCursor++;
+        if (idx >= stillFailed.length) return;
+        const u = stillFailed[idx];
+        try {
+          let qb;
+          if (u.kind === 'payment') {
+            qb = await qbCreatePayment({
+              customerId: u.customer_id, invoiceQbId: u.invoice_qb_id,
+              amount: Number(u.amount), memo: u.memo || '',
+            });
+          } else {
+            qb = await qbCreateCreditMemo({
+              customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
+            });
+          }
+          await db().query(
+            `UPDATE payment_uploads
+                SET status='created', qb_id=$2, qb_response=$3, failure_reason=NULL
+              WHERE id=$1`,
+            [u.id, qb.id, JSON.stringify(qb.response)],
+          );
+          failed--;
+        } catch (err) {
+          await db().query(
+            `UPDATE payment_uploads SET failure_reason=$2 WHERE id=$1`,
+            [u.id, String(err.message || err).slice(0, 500)],
+          );
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => sweeper()));
+    // Small pause between sweeps so any in-flight operator edits commit.
+    if (failed > 0 && sweep < 3) await new Promise((r) => setTimeout(r, 1500));
+  }
+
   if (failed === 0) {
     await db().query(`UPDATE payment_batches SET status='finalized', finalized_at=now() WHERE id=$1`, [batchId]);
     console.log(`[auto-upload] batch ${batchId} finalized.`);
   } else {
     await db().query(
       `UPDATE payment_batches SET failure_reason=$2 WHERE id=$1`,
-      [batchId, `${failed} per-row failures — see payment_uploads.failure_reason`],
+      [batchId, `${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason`],
     );
-    console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures.`);
+    console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after 3 sweeps.`);
   }
 }

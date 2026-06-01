@@ -137,8 +137,10 @@ async function ensureFreshToken() {
 // forced refresh + retry. After that, fail loudly.
 async function qbCallWithRetry(makeCall) {
   await ensureFreshToken();
-  // Retry sequence: 401 → token refresh (once); 429/503 → exponential
-  // backoff (up to 5 tries, ~22s total). Other errors throw immediately.
+  // Retry sequence: 401 → token refresh (once); 429/500/502/503/Stale Object/
+  // network blips → exponential backoff (up to 5 tries, ~22s total).
+  // Stale Object Error: linked-entity SyncToken changed mid-write (e.g.
+  // operator editing the invoice in the QB UI). Retry resolves it.
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       return await makeCall();
@@ -147,7 +149,9 @@ async function qbCallWithRetry(makeCall) {
       const status = err?.intuit_tid ? null : (err?.authResponse?.response?.status ?? err?.response?.status);
       const looks401 = status === 401 || /\b401\b/.test(message) || /HTTP Error/.test(message);
       const looks429 = status === 429 || /\b429\b/.test(message) || /Rate limit/i.test(message);
-      const looks503 = status === 503 || /\b503\b/.test(message);
+      const looks5xx = status === 500 || status === 502 || status === 503 || /\b(500|502|503)\b/.test(message);
+      const looksStale = /Stale Object Error/i.test(message);
+      const looksNet = /ECONNRESET|ETIMEDOUT|UND_ERR|EAI_AGAIN|socket hang up/i.test(message);
       if (looks401 && attempt === 1) {
         console.warn('[qb] 401 — forcing refresh and retrying once');
         const tokens = await loadTokens();
@@ -155,9 +159,10 @@ async function qbCallWithRetry(makeCall) {
         await refreshNow(tokens);
         continue;
       }
-      if ((looks429 || looks503) && attempt < 5) {
+      if ((looks429 || looks5xx || looksStale || looksNet) && attempt < 5) {
+        const reason = looks429 ? '429' : looks5xx ? '5xx' : looksStale ? 'stale' : 'net';
         const backoffMs = 1000 * Math.pow(2, attempt - 1) + Math.random() * 500;
-        console.warn(`[qb] ${looks429 ? '429' : '503'} — backing off ${Math.round(backoffMs)}ms (attempt ${attempt})`);
+        console.warn(`[qb] ${reason} — backing off ${Math.round(backoffMs)}ms (attempt ${attempt})`);
         await new Promise((r) => setTimeout(r, backoffMs));
         continue;
       }
