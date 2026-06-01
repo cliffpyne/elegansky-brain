@@ -347,19 +347,40 @@ export function mountPaymentBatchesApi(app, deps) {
     const dryRun = req.body?.dry_run === true || process.env.AUTO_UPLOAD_DRY_RUN === 'true';
     const maxPaid = Number(process.env.AUTO_UPLOAD_MAX_PAID || 200);
 
-    // Safety net 1: advisory lock per channel — concurrent runs are rejected.
-    const lockKey = `auto-upload-${channel}`;
-    const lockRes = await db().query(`SELECT pg_try_advisory_lock(hashtext($1)) AS got`, [lockKey]);
-    if (!lockRes.rows[0].got) {
+    // Safety net 1: DB row-based lock per channel. Postgres advisory locks
+    // don't survive pgBouncer's transaction pooler (different sessions per
+    // query), so we use a sentinel row instead. Stale locks (>30 min old)
+    // get reclaimed by the next caller so a crashed worker doesn't block
+    // forever.
+    const lockHolder = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    const lockResult = await db().query(
+      `INSERT INTO auto_upload_locks (channel, locked_at, holder)
+       VALUES ($1, now(), $2)
+       ON CONFLICT (channel) DO UPDATE
+         SET locked_at = now(), holder = EXCLUDED.holder
+         WHERE auto_upload_locks.locked_at < now() - interval '30 minutes'
+       RETURNING holder`,
+      [channel, lockHolder],
+    );
+    if (!lockResult.rows.length) {
+      const held = await db().query(
+        `SELECT holder, locked_at FROM auto_upload_locks WHERE channel=$1`,
+        [channel],
+      );
       return res.status(409).json({
         error: 'another auto-upload for this channel is already running',
         channel,
+        held_by: held.rows[0]?.holder,
+        since: held.rows[0]?.locked_at,
       });
     }
     let lockHeldForBackground = false;
     const releaseLock = async () => {
       if (lockHeldForBackground) return;
-      await db().query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => {});
+      await db().query(
+        `DELETE FROM auto_upload_locks WHERE channel=$1 AND holder=$2`,
+        [channel, lockHolder],
+      ).catch(() => {});
     };
 
     try {
@@ -460,7 +481,10 @@ export function mountPaymentBatchesApi(app, deps) {
             console.error('[auto-upload background]', result.batchId, err);
           })
           .finally(async () => {
-            await db().query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => {});
+            await db().query(
+              `DELETE FROM auto_upload_locks WHERE channel=$1 AND holder=$2`,
+              [channel, lockHolder],
+            ).catch(() => {});
           });
       });
 
