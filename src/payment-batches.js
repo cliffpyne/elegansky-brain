@@ -1172,7 +1172,9 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
 }
 
 async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment, qbCreateCreditMemo }) {
-  const CONCURRENCY = 5;
+  // Intuit rate limit ~500 requests/min. With qbCallWithRetry handling
+  // 429 backoff individually, concurrency 2 keeps us comfortably under.
+  const CONCURRENCY = 2;
   let cursor = 0; let failed = 0;
   const worker = async () => {
     while (true) {
