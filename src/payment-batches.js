@@ -1027,15 +1027,25 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
 
   // 1. Sheet rows FIRST (cheap) — bail early if window is empty before we
   //    burn a /arrears pull (which is multi-second on a 14k row DB).
-  //    Permissive — rows with unparseable dates included for officer review.
+  //
+  //    Two date-shape categories matter, and they get DIFFERENT treatment:
+  //      a. EMPTY date cell → operator's "skip me" flag (Frank uses this to
+  //         hide multi-plate / auto-suggest rows). Always SKIP, never
+  //         auto-process, never lock.
+  //      b. PRESENT-but-unparseable date (e.g. "20.26.2026" OCR error) →
+  //         permissive: include with receivedTimestamp=null so the next
+  //         auto-upload picks them up. consumed_transactions locks them
+  //         after processing so they never run twice.
+  //
+  //    Window filter only applies to rows with a real parseable timestamp.
   const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
   const sheet = sheetData.values || sheetData.data || [];
   const txns = [];
   for (let i = 1; i < sheet.length; i++) {
-    const ts = parseTsStrict(sheet[i][1]);
-    if (ts) {
-      if (ts < winStart || ts >= winEnd) continue;
-    }
+    const dCell = String(sheet[i][1] || '').trim();
+    if (!dCell) continue; // operator's skip flag
+    const ts = parseTsStrict(dCell);
+    if (ts && (ts < winStart || ts >= winEnd)) continue;
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
