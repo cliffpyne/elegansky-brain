@@ -216,18 +216,20 @@ async function ensureQbConnected() {
 }
 
 /**
- * 16:16 EAT cutoff rule (operator-set):
- *   - Before 16:16 EAT today → Payment dated TODAY (EAT)
- *   - From 16:16 EAT today until 16:15 EAT tomorrow → Payment dated TOMORROW (EAT)
- * Rationale: Payments made after the cutoff land in TOMORROW's arrears
- * report, so we date them tomorrow to keep QB books in sync with the
- * operator's daily settlement window.
+ * EAT cutoff rule (operator-set):
+ *   - Before cutoff today → Payment dated TODAY (EAT)
+ *   - From cutoff today until cutoff tomorrow → Payment dated TOMORROW (EAT)
+ *
+ * Defaults to 16:16 EAT but can be overridden via env vars (e.g. PAYMENT_CUTOFF_HOUR=17,
+ * PAYMENT_CUTOFF_MINUTE=30 for a 17:30 cutoff on exception days).
  */
 function paymentTxnDate() {
+  const cutoffHour = Number(process.env.PAYMENT_CUTOFF_HOUR ?? 16);
+  const cutoffMinute = Number(process.env.PAYMENT_CUTOFF_MINUTE ?? 16);
   const eat = new Date(Date.now() + 3 * 3600_000);
   const h = eat.getUTCHours();
   const m = eat.getUTCMinutes();
-  const pastCutoff = h > 16 || (h === 16 && m >= 16);
+  const pastCutoff = h > cutoffHour || (h === cutoffHour && m >= cutoffMinute);
   if (pastCutoff) eat.setUTCDate(eat.getUTCDate() + 1);
   return eat.toISOString().slice(0, 10);
 }
