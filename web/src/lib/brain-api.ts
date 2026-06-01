@@ -116,17 +116,25 @@ export interface PaymentUploadRow {
   batch_id: string;
   kind: 'payment' | 'credit_memo';
   bank_ref: string;
-  customer_id: string;
+  customer_id: string | null;
   customer_name: string | null;
   invoice_qb_id: string | null;
   invoice_no: string | null;
   amount: number | string;
   memo: string | null;
   qb_id: string | null;
-  status: 'created' | 'voided' | 'failed';
+  status: 'created' | 'voided' | 'failed' | 'unmatched';
   failure_reason: string | null;
   created_at: string;
   voided_at: string | null;
+}
+
+export interface ArrearsSnapshotSummary {
+  id: string;
+  as_of: string;
+  row_count: number;
+  total_balance: number | string;
+  created_at: string;
 }
 
 export async function listBatches(params: { limit?: number; status?: string } = {}): Promise<{ batches: PaymentBatchRow[] }> {
@@ -138,7 +146,11 @@ export async function listBatches(params: { limit?: number; status?: string } = 
   return r.json();
 }
 
-export async function getBatch(id: string): Promise<{ batch: PaymentBatchRow; uploads: PaymentUploadRow[] }> {
+export async function getBatch(id: string): Promise<{
+  batch: PaymentBatchRow;
+  uploads: PaymentUploadRow[];
+  snapshot: ArrearsSnapshotSummary | null;
+}> {
   const r = await authed(`/api/payment-batches/${id}`);
   if (!r.ok) throw new Error(`getBatch ${r.status}: ${await r.text()}`);
   return r.json();

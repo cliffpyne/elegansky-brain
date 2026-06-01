@@ -240,11 +240,18 @@ export function mountPaymentBatchesApi(app, deps) {
         });
         uploaded.push(upload);
       }
-      // Credit memos for the unused side. Skip rows with no customer_id —
-      // they're tracked in consumed_transactions but not pushed to QB.
+      // Credit memos for the unused side. Rows without customer_id can't be
+      // written to QB (no CustomerRef) — we still record them with
+      // status='unmatched' so officers can review and resolve manually.
       for (let i = 0; i < body.unused.length; i++) {
         const row = body.unused[i];
-        if (!row.customer_id) continue;
+        if (!row.customer_id) {
+          await recordUpload({
+            batchId: batch.id, kind: 'credit_memo', row, qbId: null,
+            qbResponse: null, status: 'unmatched',
+          });
+          continue;
+        }
         const qb = await qbCreateCreditMemo({
           customerId: row.customer_id,
           amount: Number(row.amount),
@@ -459,11 +466,20 @@ export function mountPaymentBatchesApi(app, deps) {
     try {
       const r = await db().query(`SELECT * FROM payment_batches WHERE id=$1`, [req.params.id]);
       if (!r.rows.length) return res.status(404).json({ error: 'not found' });
+      const batch = r.rows[0];
       const u = await db().query(
         `SELECT * FROM payment_uploads WHERE batch_id=$1 ORDER BY kind, created_at`,
         [req.params.id],
       );
-      res.json({ batch: r.rows[0], uploads: u.rows });
+      // Snapshot summary (row_count + total_balance + as_of). Heavy data is
+      // omitted by default; client can pass ?include_snapshot=full to get it.
+      const sn = await db().query(
+        `SELECT id, as_of, row_count, total_balance, created_at,
+                ${req.query.include_snapshot === 'full' ? 'data' : 'NULL::jsonb as data'}
+           FROM arrears_snapshots WHERE id=$1`,
+        [batch.arrears_snapshot_id],
+      );
+      res.json({ batch, uploads: u.rows, snapshot: sn.rows[0] || null });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -591,28 +607,57 @@ async function recordUpload({ batchId, kind, row, qbId, qbResponse, status }) {
   return r.rows[0];
 }
 
+// Parallel best-effort void with retry-on-Stale-Object + 429/500/502/503.
+// Replaces the old sequential path that timed out on big batches and
+// silently left Payments in QB when one of them got a Stale Object Error.
 async function voidUploadsBestEffort(uploads, qbVoid) {
   const out = [];
-  for (const u of uploads) {
-    if (!u.qb_id) {
-      out.push({ upload_id: u.id, ok: false, reason: 'no qb_id (already failed)' });
-      continue;
-    }
-    try {
-      const v = await qbVoid({ kind: u.kind, qbId: u.qb_id });
-      await db().query(
-        `UPDATE payment_uploads SET status='voided', voided_at=now(), qb_void_response=$2 WHERE id=$1`,
-        [u.id, JSON.stringify(v)],
-      );
-      out.push({ upload_id: u.id, ok: true, qb_id: u.qb_id });
-    } catch (err) {
-      await db().query(
-        `UPDATE payment_uploads SET failure_reason=$2 WHERE id=$1`,
-        [u.id, String(err.message || err).slice(0, 1000)],
-      );
-      out.push({ upload_id: u.id, ok: false, qb_id: u.qb_id, reason: err.message });
+  const CONCURRENCY = 5;
+  const MAX_ATTEMPTS = 5;
+  let cursor = 0;
+
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= uploads.length) return;
+      const u = uploads[i];
+      if (!u.qb_id) {
+        out.push({ upload_id: u.id, ok: false, reason: 'no qb_id (already failed)' });
+        continue;
+      }
+      let lastErr = null;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const v = await qbVoid({ kind: u.kind, qbId: u.qb_id });
+          await db().query(
+            `UPDATE payment_uploads SET status='voided', voided_at=now(), qb_void_response=$2, failure_reason=NULL WHERE id=$1`,
+            [u.id, JSON.stringify(v)],
+          );
+          out.push({ upload_id: u.id, ok: true, qb_id: u.qb_id, attempts: attempt });
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = String(err.message || err);
+          // Retry-worthy: rate limit, server error, or stale syncToken.
+          const isRetryable =
+            /\b(429|500|502|503)\b/.test(msg) ||
+            /Stale Object Error/i.test(msg) ||
+            /ECONNRESET|ETIMEDOUT|UND_ERR/i.test(msg);
+          if (!isRetryable || attempt === MAX_ATTEMPTS) break;
+          await new Promise((r) => setTimeout(r, 750 * Math.pow(2, attempt - 1) + Math.random() * 250));
+        }
+      }
+      if (lastErr) {
+        await db().query(
+          `UPDATE payment_uploads SET failure_reason=$2 WHERE id=$1`,
+          [u.id, String(lastErr.message || lastErr).slice(0, 1000)],
+        );
+        out.push({ upload_id: u.id, ok: false, qb_id: u.qb_id, reason: lastErr.message });
+      }
     }
   }
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
   return out;
 }
 

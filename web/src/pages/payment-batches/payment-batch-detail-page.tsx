@@ -6,8 +6,14 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Undo2, RefreshCw, AlertCircle } from 'lucide-react';
-import { getBatch, recallBatch, type PaymentBatchRow, type PaymentUploadRow } from '@/lib/brain-api';
+import { Undo2, RefreshCw, AlertCircle, Download, Database } from 'lucide-react';
+import {
+  getBatch,
+  recallBatch,
+  type PaymentBatchRow,
+  type PaymentUploadRow,
+  type ArrearsSnapshotSummary,
+} from '@/lib/brain-api';
 
 function fmt(n: number | string | null | undefined): string {
   if (n == null) return '-';
@@ -24,14 +30,36 @@ function statusVariant(s: string): 'default' | 'secondary' | 'destructive' | 'ou
     case 'created': return 'default';
     case 'voided': return 'outline';
     case 'failed': return 'destructive';
+    case 'unmatched': return 'secondary';
     default: return 'outline';
   }
+}
+
+function downloadCsv(filename: string, rows: PaymentUploadRow[]) {
+  const header = ['bank_ref', 'customer_name', 'customer_id', 'invoice_no', 'amount', 'memo', 'status'];
+  const escape = (v: string | number | null | undefined) => {
+    if (v == null) return '';
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    lines.push([
+      r.bank_ref, r.customer_name, r.customer_id, r.invoice_no, r.amount, r.memo, r.status,
+    ].map(escape).join(','));
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
 }
 
 export function PaymentBatchDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [batch, setBatch] = useState<PaymentBatchRow | null>(null);
   const [uploads, setUploads] = useState<PaymentUploadRow[]>([]);
+  const [snapshot, setSnapshot] = useState<ArrearsSnapshotSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [recalling, setRecalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,6 +70,7 @@ export function PaymentBatchDetailPage() {
       const r = await getBatch(id);
       setBatch(r.batch);
       setUploads(r.uploads);
+      setSnapshot(r.snapshot);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -76,8 +105,9 @@ export function PaymentBatchDetailPage() {
     }
   }, [id, batch, refresh]);
 
-  const paid = uploads.filter((u) => u.kind === 'payment');
-  const credits = uploads.filter((u) => u.kind === 'credit_memo');
+  const paid = uploads.filter((u) => u.kind === 'payment' && u.status !== 'unmatched');
+  const creditsMatched = uploads.filter((u) => u.kind === 'credit_memo' && u.status !== 'unmatched');
+  const unmatched = uploads.filter((u) => u.status === 'unmatched');
 
   return (
     <Fragment>
@@ -141,6 +171,28 @@ export function PaymentBatchDetailPage() {
           </Card>
         )}
 
+        {snapshot && (
+          <Card className="mb-4">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Database className="size-4" />
+                Arrears snapshot used by this batch
+              </CardTitle>
+              <CardDescription>
+                The frozen list of overdue invoices the payment algorithm matched against. Same snapshot is reused on rerun.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div><div className="text-muted-foreground">Snapshot id</div><div className="font-mono text-xs">{snapshot.id.slice(0, 8)}</div></div>
+                <div><div className="text-muted-foreground">As of</div><div className="font-medium">{snapshot.as_of}</div></div>
+                <div><div className="text-muted-foreground">Invoices</div><div className="font-medium tabular-nums">{fmt(snapshot.row_count)}</div></div>
+                <div><div className="text-muted-foreground">Total balance</div><div className="font-medium tabular-nums">{fmt(snapshot.total_balance)} TZS</div></div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         <Card className="mb-4">
           <CardHeader>
             <CardTitle>Paid invoices ({paid.length})</CardTitle>
@@ -179,10 +231,12 @@ export function PaymentBatchDetailPage() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="mb-4">
           <CardHeader>
-            <CardTitle>Unused / credit memos ({credits.length})</CardTitle>
-            <CardDescription>Bank transactions that didn't match a customer's overdue invoice. Tracked in consumed_transactions but only written to QB if a customer_id was resolvable.</CardDescription>
+            <CardTitle>Credit memos created ({creditsMatched.length})</CardTitle>
+            <CardDescription>
+              Unused bank transactions whose customer was resolvable. Each row is a QB CreditMemo posted to that customer's account — credit applies to future invoices.
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <Table>
@@ -191,19 +245,19 @@ export function PaymentBatchDetailPage() {
                   <TableHead>Bank ref</TableHead>
                   <TableHead>Customer</TableHead>
                   <TableHead className="text-right">Amount</TableHead>
-                  <TableHead>QB id</TableHead>
+                  <TableHead>QB CreditMemo id</TableHead>
                   <TableHead>Status</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {credits.length === 0 && (
+                {creditsMatched.length === 0 && (
                   <TableRow>
                     <TableCell colSpan={5} className="text-center text-muted-foreground">
-                      No credit memos in this batch.
+                      No CreditMemos in this batch.
                     </TableCell>
                   </TableRow>
                 )}
-                {credits.slice(0, 500).map((u) => (
+                {creditsMatched.slice(0, 500).map((u) => (
                   <TableRow key={u.id}>
                     <TableCell className="font-mono text-xs">{u.bank_ref}</TableCell>
                     <TableCell className="max-w-xs truncate">{u.customer_name || u.customer_id || '—'}</TableCell>
@@ -214,6 +268,58 @@ export function PaymentBatchDetailPage() {
                 ))}
               </TableBody>
             </Table>
+          </CardContent>
+        </Card>
+
+        <Card className="border-amber-500/40">
+          <CardHeader>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle className="text-amber-700 dark:text-amber-300">Unmatched — needs officer review ({unmatched.length})</CardTitle>
+                <CardDescription>
+                  Bank transactions where the algorithm could not resolve a QB customer (plate auto-suggest, garbled name, customer not in QB, etc.). Nothing was written to QB. Export below, identify the right customer manually, then apply the credit yourself.
+                </CardDescription>
+              </div>
+              {unmatched.length > 0 && (
+                <Button
+                  variant="outline"
+                  onClick={() => downloadCsv(`unmatched-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, unmatched)}
+                >
+                  <Download className="size-4" />
+                  Export CSV
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Bank ref</TableHead>
+                  <TableHead>Name on transaction</TableHead>
+                  <TableHead className="text-right">Amount</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {unmatched.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={3} className="text-center text-muted-foreground">
+                      Nothing here — every bank ref matched a QB customer.
+                    </TableCell>
+                  </TableRow>
+                )}
+                {unmatched.slice(0, 500).map((u) => (
+                  <TableRow key={u.id}>
+                    <TableCell className="font-mono text-xs">{u.bank_ref}</TableCell>
+                    <TableCell className="max-w-xs truncate">{u.customer_name || '—'}</TableCell>
+                    <TableCell className="text-right tabular-nums">{fmt(u.amount)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {unmatched.length > 500 && (
+              <div className="text-sm text-muted-foreground mt-2">Showing first 500 of {unmatched.length}. Use Export CSV for the full list.</div>
+            )}
           </CardContent>
         </Card>
       </Container>
