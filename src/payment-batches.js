@@ -954,6 +954,9 @@ function parseTsAny(s) {
   }
 
   // Format 2: DD MMM YYYY, HH:MM  (or DD MMM YYYY without time) — legacy NMB
+  // Use the same "literal-as-UTC" interpretation as format 1 so windows
+  // compare apples-to-apples; otherwise a "01 Jun 2026" row would land at
+  // 21:00 UTC May 31 and silently miss any window starting at June 1 UTC.
   m = str.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?:\s*(am|pm))?)?(?:\s*\(EAT\))?$/i);
   if (m) {
     const d = m[1].padStart(2, '0');
@@ -964,7 +967,7 @@ function parseTsAny(s) {
     const mins = m[5] || '00';
     if (m[6] && m[6].toLowerCase() === 'pm' && h < 12) h += 12;
     if (m[6] && m[6].toLowerCase() === 'am' && h === 12) h = 0;
-    return new Date(`${m[3]}-${mo}-${d}T${String(h).padStart(2,'0')}:${mins}:00+03:00`);
+    return new Date(`${m[3]}-${mo}-${d}T${String(h).padStart(2,'0')}:${mins}:00Z`);
   }
 
   // Format 3: MM/DD/YYYY — original BODA/IPHONE/LIPA sheets
@@ -972,7 +975,7 @@ function parseTsAny(s) {
   if (m) {
     const mo = +m[1], d = +m[2];
     if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-      return new Date(`${m[3]}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00+03:00`);
+      return new Date(`${m[3]}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00Z`);
     }
   }
   return null;
