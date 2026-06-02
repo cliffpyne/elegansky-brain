@@ -239,6 +239,13 @@ function paymentTxnDate() {
   return eat.toISOString().slice(0, 10);
 }
 
+// Default DepositToAccountRef for Payments. 785 = "Elegansky Collection AC:Kijichi
+// Collection AC" — same account SaasAnt uploads use, so reports group consistently.
+// Without this, QB defaults to "Undeposited Funds" (id 793) and the payments
+// don't appear in operator's "money received on Kijichi" Account QuickReport.
+// Overridable via QB_DEFAULT_DEPOSIT_ACCT_ID for future hierarchy changes.
+const DEFAULT_DEPOSIT_ACCT_ID = process.env.QB_DEFAULT_DEPOSIT_ACCT_ID || '785';
+
 /** Create a QB Payment for one bank-txn line against one invoice. */
 async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
   const body = {
@@ -246,6 +253,7 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
     TotalAmt: Number(amount),
     PrivateNote: memo || undefined,
     TxnDate: paymentTxnDate(),
+    DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
     Line: [{
       Amount: Number(amount),
       LinkedTxn: [{ TxnId: String(invoiceQbId), TxnType: 'Invoice' }],
