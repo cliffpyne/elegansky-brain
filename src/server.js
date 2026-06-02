@@ -457,14 +457,6 @@ app.get('/arrears', async (req, res) => {
     const wantSummary = req.query.summary === '1' || req.query.summary === 'true';
     const branchFilter = (req.query.branch || '').toString().toLowerCase();
     const qFilter = (req.query.q || '').toString().toLowerCase();
-    // includeFuture=1: drop the DueDate <= asOf filter, return ALL open
-    // invoices including future-dated ones. Needed by the payment algorithm
-    // because operators pre-create the full multi-year contract schedule;
-    // a customer paying today can knock down any future-dated invoice.
-    // Arrears statements/dashboards leave this off so they show only
-    // genuinely overdue invoices.
-    const includeFuture = req.query.includeFuture === '1' || req.query.includeFuture === 'true';
-    const dueDateClause = includeFuture ? '' : ` AND DueDate <= '${asOf}'`;
 
     const customerMap = await getCustomerPathMap();
 
@@ -510,7 +502,7 @@ app.get('/arrears', async (req, res) => {
       while (start < 200_000) {
         const sql =
           `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-          `FROM Invoice WHERE Balance > '0'${dueDateClause} ` +
+          `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
           `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
         const r = await qbQuery(sql);
         const invs = r.QueryResponse?.Invoice ?? [];
@@ -540,7 +532,7 @@ app.get('/arrears', async (req, res) => {
     const fetchSize = branchFilter || qFilter ? Math.min(1000, pageSize * 4) : pageSize;
     const sql =
       `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-      `FROM Invoice WHERE Balance > '0'${dueDateClause} ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
       `STARTPOSITION ${start} MAXRESULTS ${fetchSize}`;
     const r = await qbQuery(sql);
     const raw = r.QueryResponse?.Invoice ?? [];
