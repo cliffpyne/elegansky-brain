@@ -68,11 +68,11 @@ lands on the wrong-dated invoices.
 
 **Rule of thumb:** AS_OF = the calendar day inside the bank-txn window. Always.
 
-- **Morning catchup** (e.g. meru0300, window spans midnight):
-  this is TWO logical windows, NOT one. Split at the midnight boundary:
-    1. yesterday 16:15 EAT → today 00:00 EAT: AS_OF=yesterday
-    2. today 00:00 EAT → execution-time:      AS_OF=today
-  If you receive a single span window crossing midnight with one AS_OF,
+- **Morning catchup** (e.g. meru0300): TWO distinct day-bound windows.
+  Neither crosses midnight:
+    1. yesterday 16:15 EAT → yesterday 23:59 EAT  AS_OF=yesterday
+    2. today 00:00 EAT → execution-time           AS_OF=today
+  If you receive a single span window that crosses midnight with one AS_OF,
   REFUSE it — split it yourself or SMS Frank to clarify. Single-AS_OF over
   midnight is the bug Frank caught me on twice.
 - **Morning normal** (window = TODAY 00:00 → now, before 16:15): bank txns happened
