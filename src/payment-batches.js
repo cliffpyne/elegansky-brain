@@ -35,7 +35,7 @@ const SUPABASE_JWKS = SUPABASE_URL
   : null;
 
 export function mountPaymentBatchesApi(app, deps) {
-  const { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensureQbConnected } = deps;
+  const { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected } = deps;
 
   // Startup check: log any pending batches older than 1 hour. Surfaces stuck
   // batches from a previous crash so the operator can investigate. Doesn't
@@ -475,6 +475,7 @@ export function mountPaymentBatchesApi(app, deps) {
           paid: result.paid,
           unused: result.unused,
           qbCreatePayment,
+          qbBatchCreatePayments,
           qbCreateCreditMemo,
         })
           .catch((err) => {
@@ -1174,45 +1175,102 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
   return { skipped: false, batchId, paid, unused, sheetSum };
 }
 
-async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment, qbCreateCreditMemo }) {
-  // Intuit rate limit ~500 requests/min. With qbCallWithRetry handling
-  // 429 backoff individually, concurrency 2 keeps us comfortably under.
-  const CONCURRENCY = 2;
-  let cursor = 0; let failed = 0;
-  const worker = async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= paid.length) return;
-      const p = paid[i];
-      try {
-        const qb = await qbCreatePayment({
+async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo }) {
+  // Use QB Batch API: each batch packs up to 30 ops and counts as 1
+  // throttle hit, so we can run several batches concurrently for ~100/s
+  // effective throughput vs ~5/s with per-record posts. Falls back to
+  // per-record if qbBatchCreatePayments is not wired.
+  const BATCH_SIZE = 30;
+  const PARALLEL_BATCHES = 6;
+  let failed = 0;
+
+  if (qbBatchCreatePayments && paid.length > 0) {
+    const chunks = [];
+    for (let i = 0; i < paid.length; i += BATCH_SIZE) chunks.push(paid.slice(i, i + BATCH_SIZE));
+    let chunkCursor = 0;
+    const worker = async () => {
+      while (true) {
+        const ci = chunkCursor++;
+        if (ci >= chunks.length) return;
+        const chunk = chunks[ci];
+        const items = chunk.map((p) => ({
           customerId: p.customerId, invoiceQbId: p.qbId,
           amount: Number(p.amount), memo: p.memoWithSuffix || '',
-        });
-        await db().query(
-          `INSERT INTO payment_uploads (
-             batch_id, kind, bank_ref, customer_id, customer_name,
-             invoice_qb_id, invoice_no, amount, memo, qb_id, qb_response, status
-           ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,$9,$10,'created')`,
-          [batchId, p.memoWithSuffix, p.customerId, p.customerName,
-           p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
-           qb.id, JSON.stringify(qb.response)],
-        );
-      } catch (err) {
-        failed++;
-        await db().query(
-          `INSERT INTO payment_uploads (
-             batch_id, kind, bank_ref, customer_id, customer_name,
-             invoice_qb_id, invoice_no, amount, memo, status, failure_reason
-           ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'failed',$9)`,
-          [batchId, p.memoWithSuffix, p.customerId, p.customerName,
-           p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
-           String(err.message || err).slice(0, 500)],
-        );
+        }));
+        let results;
+        try {
+          results = await qbBatchCreatePayments(items);
+        } catch (err) {
+          // whole batch hard-failed (after retries) — mark all as failed
+          results = items.map(() => ({ ok: false, id: null, response: null, error: String(err.message || err).slice(0, 500) }));
+        }
+        for (let i = 0; i < chunk.length; i++) {
+          const p = chunk[i]; const r = results[i];
+          if (r.ok) {
+            await db().query(
+              `INSERT INTO payment_uploads (
+                 batch_id, kind, bank_ref, customer_id, customer_name,
+                 invoice_qb_id, invoice_no, amount, memo, qb_id, qb_response, status
+               ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,$9,$10,'created')`,
+              [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+               p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+               r.id, JSON.stringify(r.response)],
+            );
+          } else {
+            failed++;
+            await db().query(
+              `INSERT INTO payment_uploads (
+                 batch_id, kind, bank_ref, customer_id, customer_name,
+                 invoice_qb_id, invoice_no, amount, memo, status, failure_reason
+               ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'failed',$9)`,
+              [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+               p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+               String(r.error || 'unknown').slice(0, 500)],
+            );
+          }
+        }
       }
-    }
-  };
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+    };
+    await Promise.all(Array.from({ length: PARALLEL_BATCHES }, () => worker()));
+  } else {
+    // Per-record fallback for when batch API isn't available (e.g. older
+    // deps, or unit tests). Concurrency 2 — same as the original safe path.
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= paid.length) return;
+        const p = paid[i];
+        try {
+          const qb = await qbCreatePayment({
+            customerId: p.customerId, invoiceQbId: p.qbId,
+            amount: Number(p.amount), memo: p.memoWithSuffix || '',
+          });
+          await db().query(
+            `INSERT INTO payment_uploads (
+               batch_id, kind, bank_ref, customer_id, customer_name,
+               invoice_qb_id, invoice_no, amount, memo, qb_id, qb_response, status
+             ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,$9,$10,'created')`,
+            [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+             p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+             qb.id, JSON.stringify(qb.response)],
+          );
+        } catch (err) {
+          failed++;
+          await db().query(
+            `INSERT INTO payment_uploads (
+               batch_id, kind, bank_ref, customer_id, customer_name,
+               invoice_qb_id, invoice_no, amount, memo, status, failure_reason
+             ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'failed',$9)`,
+            [batchId, p.memoWithSuffix, p.customerId, p.customerName,
+             p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
+             String(err.message || err).slice(0, 500)],
+          );
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: 2 }, () => worker()));
+  }
 
   // Matched CreditMemos (if any unused has a customer_id from algorithm — none today)
   for (const u of unused) {

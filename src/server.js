@@ -263,6 +263,43 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
   return { id: json.Payment?.Id, response: json };
 }
 
+/**
+ * Create many Payments in a single QB Batch API call (up to 30 per batch).
+ * QB throttles each batch as 1 call regardless of size, so this is the fast
+ * path for bulk auto-uploads.
+ *
+ * items: [{ customerId, invoiceQbId, amount, memo }]
+ * returns: aligned array of [{ ok, id, response, error }]
+ */
+async function qbBatchCreatePayments(items) {
+  if (items.length === 0) return [];
+  if (items.length > 30) throw new Error(`qbBatchCreatePayments: ${items.length} > 30 (QB max)`);
+  const body = {
+    BatchItemRequest: items.map((it, ix) => ({
+      bId: `b${ix}`,
+      operation: 'create',
+      Payment: {
+        CustomerRef: { value: String(it.customerId) },
+        TotalAmt: Number(it.amount),
+        PrivateNote: it.memo || undefined,
+        TxnDate: paymentTxnDate(),
+        DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
+        Line: [{ Amount: Number(it.amount), LinkedTxn: [{ TxnId: String(it.invoiceQbId), TxnType: 'Invoice' }] }],
+      },
+    })),
+  };
+  const json = await qbPost('batch', body);
+  const byBId = {};
+  for (const x of json.BatchItemResponse || []) byBId[x.bId] = x;
+  return items.map((_, ix) => {
+    const resp = byBId[`b${ix}`];
+    if (resp?.Payment?.Id) return { ok: true, id: resp.Payment.Id, response: resp.Payment, error: null };
+    const fault = resp?.Fault;
+    const errMsg = fault?.Error?.[0]?.Detail || fault?.Error?.[0]?.Message || (resp ? JSON.stringify(resp).slice(0, 200) : 'no response');
+    return { ok: false, id: null, response: null, error: errMsg };
+  });
+}
+
 /** Create a QB Credit Memo (the "unused" side) for one bank-txn line. */
 async function qbCreateCreditMemo({ customerId, amount, memo }) {
   const body = {
@@ -315,7 +352,7 @@ mountCyclesApi(app);
 mountSettingsApi(app);
 mountAdminSmsApi(app);
 // /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
-mountPaymentBatchesApi(app, { qbCreatePayment, qbCreateCreditMemo, qbVoid, ensureQbConnected });
+mountPaymentBatchesApi(app, { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
