@@ -10,7 +10,9 @@ import { mountCyclesApi } from './cycles.js';
 import { mountSettingsApi } from './settings.js';
 import { mountAdminSmsApi } from './admin-sms.js';
 import { mountPaymentBatchesApi } from './payment-batches.js';
+import { mountNotificationsApi, notifyAdmin } from './notifications.js';
 import { db } from './db/pool.js';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -353,6 +355,41 @@ mountSettingsApi(app);
 mountAdminSmsApi(app);
 // /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
 mountPaymentBatchesApi(app, { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected });
+
+// ── Notifications + SMS gateway ──────────────────────────────────────────
+// The phone APK polls /api/notifications/pending using PHONE_API_KEY and
+// forwards each row as an SMS to the recipient list in app_settings.
+const PHONE_API_KEY = process.env.PHONE_API_KEY || '';
+const STATEMENT_REPORT_SECRET = process.env.STATEMENT_REPORT_SECRET || '';
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_JWKS = SUPABASE_URL
+  ? createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`))
+  : null;
+
+function requireSharedSecret(req, res, next) {
+  if (!STATEMENT_REPORT_SECRET) return res.status(503).json({ error: 'STATEMENT_REPORT_SECRET not configured' });
+  if (req.get('x-report-secret') !== STATEMENT_REPORT_SECRET) return res.status(401).json({ error: 'bad secret' });
+  next();
+}
+async function requireSupabaseJwt(req, res, next) {
+  if (!SUPABASE_JWKS) return res.status(503).json({ error: 'SUPABASE_URL not configured' });
+  const auth = req.get('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'missing bearer token' });
+  try {
+    const { payload } = await jwtVerify(token, SUPABASE_JWKS, { issuer: `${SUPABASE_URL}/auth/v1` });
+    req.auth = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid token: ' + err.message });
+  }
+}
+function requirePhoneKey(req, res, next) {
+  if (!PHONE_API_KEY) return res.status(503).json({ error: 'PHONE_API_KEY not configured' });
+  if (req.get('x-phone-key') !== PHONE_API_KEY) return res.status(401).json({ error: 'bad phone key' });
+  next();
+}
+mountNotificationsApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status

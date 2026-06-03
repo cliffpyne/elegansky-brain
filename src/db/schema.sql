@@ -214,3 +214,37 @@ INSERT INTO app_settings (key, value, updated_by) VALUES
   ('sheet_denylist', '["1N3ZxahtaFBX0iK3cijDraDmyZM8573PVVf8D-WVqicE"]',
     'migration:initial-seed')
 ON CONFLICT (key) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Notifications + SMS gateway.
+-- BRAIN code paths POST here when something needs operator attention.
+-- An Android phone APK polls /api/notifications/pending and forwards each
+-- message as an SMS to the configured admin numbers.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS notifications (
+  id               uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  message          text          NOT NULL,
+  severity         text          NOT NULL CHECK (severity IN ('critical','warning','info')),
+  source           text,
+  status           text          NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending','sending','sent','failed')),
+  retry_count      int           NOT NULL DEFAULT 0,
+  created_at       timestamptz   NOT NULL DEFAULT now(),
+  picked_up_at     timestamptz,
+  sent_at          timestamptz,
+  failed_at        timestamptz,
+  failure_reason   text,
+  sms_to           text[],
+  ack_device_id    text
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_status
+  ON notifications (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_severity
+  ON notifications (severity, created_at DESC);
+
+-- Seed default admin recipient list — empty until operator configures it
+-- from the dashboard. The phone APK fetches this and sends to each number.
+INSERT INTO app_settings (key, value, updated_by) VALUES
+  ('sms_recipients', '[]', 'migration:notifications-seed')
+ON CONFLICT (key) DO NOTHING;
