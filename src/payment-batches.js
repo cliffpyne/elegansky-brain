@@ -402,7 +402,8 @@ export function mountPaymentBatchesApi(app, deps) {
       }
       const untilIso = req.body?.until_iso || new Date(Date.now() + 60_000).toISOString();
 
-      const result = await prepareAutoUpload({ channel, sinceIso, untilIso });
+      const asOf = req.body?.as_of || null;
+      const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf });
       if (result.skipped) {
         await releaseLock();
         return res.json({ skipped: true, reason: result.reason, since_iso: sinceIso, until_iso: untilIso });
@@ -1040,13 +1041,14 @@ function processInvoicePayments(invoices, transactions) {
   return out;
 }
 
-async function fetchAllArrears() {
+async function fetchAllArrears(asOf) {
   const { default: fetchImpl } = { default: globalThis.fetch };
   const base = process.env.SELF_URL || 'http://127.0.0.1:' + (process.env.PORT || 3000);
   const arrears = [];
   let start = 1;
+  const asOfParam = asOf ? `&asOf=${encodeURIComponent(asOf)}` : '';
   while (true) {
-    const r = await fetchImpl(`${base}/arrears?pageSize=1000&start=${start}`);
+    const r = await fetchImpl(`${base}/arrears?pageSize=1000&start=${start}${asOfParam}`);
     if (!r.ok) throw new Error(`arrears ${r.status}: ${await r.text()}`);
     const j = await r.json();
     const invs = j.invoices || [];
@@ -1058,7 +1060,7 @@ async function fetchAllArrears() {
   return arrears;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
@@ -1116,7 +1118,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso }) {
   if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
 
   // 3. Arrears + snapshot (only after we know there's work to do).
-  const arrears = await fetchAllArrears();
+  const arrears = await fetchAllArrears(asOf);
   const invoices = arrears.map((inv, i) => ({
     id: i + 1, customerName: inv.customerLeaf, invoiceNumber: inv.no,
     amount: Number(inv.balance) || 0, invoiceDate: inv.date,

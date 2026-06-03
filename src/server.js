@@ -13,6 +13,9 @@ import { mountPaymentBatchesApi } from './payment-batches.js';
 import { mountNotificationsApi, notifyAdmin } from './notifications.js';
 import { db } from './db/pool.js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { initQbClient } from './qb-client.js';
+import { mountAgentApi } from './agent/api.js';
+import { startScheduler } from './agent/scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -356,6 +359,11 @@ mountAdminSmsApi(app);
 // /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
 mountPaymentBatchesApi(app, { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected });
 
+// Standalone QB client (used by the agent runner). Shares the same DB token
+// store as the intuit-oauth client above but has its own fetch-based code
+// path. Safe because cron sessions run sequentially.
+initQbClient(db());
+
 // ── Notifications + SMS gateway ──────────────────────────────────────────
 // The phone APK polls /api/notifications/pending using PHONE_API_KEY and
 // forwards each row as an SMS to the recipient list in app_settings.
@@ -390,6 +398,7 @@ function requirePhoneKey(req, res, next) {
   next();
 }
 mountNotificationsApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
+mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
@@ -832,4 +841,7 @@ app.listen(PORT, () => {
   } catch (e) {
     console.log(`Google Sheets: not configured (${e.message})`);
   }
+  // Autonomous-Claude scheduler — 7 daily ticks, EAT-aware.
+  // Set AGENT_SCHEDULER_ENABLED=false to disable (for staging / debug).
+  startScheduler();
 });

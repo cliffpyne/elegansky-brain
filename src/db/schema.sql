@@ -248,3 +248,81 @@ CREATE INDEX IF NOT EXISTS idx_notifications_severity
 INSERT INTO app_settings (key, value, updated_by) VALUES
   ('sms_recipients', '[]', 'migration:notifications-seed')
 ON CONFLICT (key) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Autonomous-Claude agent runtime
+--
+-- Each cron fire (or SMS-trigger) spawns one agent_session. The session
+-- has a trigger context, a mode (plan|execute), a stream of messages
+-- (system, user, assistant, tool calls + their results), and at the end a
+-- summary + stats. Future sessions read the last N completed sessions to
+-- maintain institutional memory across cron firings.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id               uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  trigger          text          NOT NULL,         -- 'cron:03:00' | 'sms:ask' | 'manual'
+  trigger_context  jsonb,                          -- {channel, window, as_of, ...}
+  mode             text          NOT NULL CHECK (mode IN ('plan','execute')),
+  model            text          NOT NULL,         -- 'claude-sonnet-4-6'
+  status           text          NOT NULL DEFAULT 'running'
+                                 CHECK (status IN ('running','completed','paused','aborted','errored')),
+  summary          text,
+  stats            jsonb,
+  paused_question  jsonb,                          -- {question, context} if paused
+  parent_session_id uuid REFERENCES agent_sessions(id),  -- for SMS reply continuations
+  input_tokens     bigint        DEFAULT 0,
+  output_tokens    bigint        DEFAULT 0,
+  cache_read_tokens bigint       DEFAULT 0,
+  cache_write_tokens bigint      DEFAULT 0,
+  cost_usd         numeric,
+  started_at       timestamptz   NOT NULL DEFAULT now(),
+  ended_at         timestamptz,
+  updated_at       timestamptz   NOT NULL DEFAULT now(),
+  error_text       text
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_started_at
+  ON agent_sessions (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_status
+  ON agent_sessions (status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_trigger
+  ON agent_sessions (trigger, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_session_messages (
+  id           bigserial     PRIMARY KEY,
+  session_id   uuid          NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  role         text          NOT NULL CHECK (role IN ('system','user','assistant','tool')),
+  kind         text,                              -- tool name, or 'text', 'thinking'
+  payload      jsonb         NOT NULL,
+  created_at   timestamptz   NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_session_messages_session
+  ON agent_session_messages (session_id, id);
+
+-- Inbound SMS thread — when Frank texts the phone APK, it forwards to
+-- BRAIN, which appends here. Agent sessions read recent messages.
+CREATE TABLE IF NOT EXISTS sms_inbox (
+  id              bigserial     PRIMARY KEY,
+  received_at     timestamptz   NOT NULL DEFAULT now(),
+  from_number     text          NOT NULL,
+  message         text          NOT NULL,
+  processed       boolean       NOT NULL DEFAULT false,
+  processed_at    timestamptz,
+  spawned_session_id uuid       REFERENCES agent_sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sms_inbox_unprocessed
+  ON sms_inbox (received_at) WHERE processed = false;
+
+-- Duplicate-customer ledger. Grows over time as Claude (or Frank)
+-- identifies QB customer records that are duplicates of each other.
+-- The matcher in src/runner/match-customers.js consults this table
+-- to redirect a "wrong duplicate" id to the canonical id.
+CREATE TABLE IF NOT EXISTS duplicate_customers (
+  duplicate_id   text          PRIMARY KEY,        -- the wrong QB Customer Id
+  canonical_id   text          NOT NULL,           -- the right QB Customer Id
+  reason         text,                             -- 'plate-suffix-mismatch' etc.
+  noted_by       text,                             -- 'agent:<session>' | 'admin:fmlaki'
+  noted_at       timestamptz   NOT NULL DEFAULT now()
+);
