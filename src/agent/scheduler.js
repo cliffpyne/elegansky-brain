@@ -1,112 +1,128 @@
 // Internal scheduler — fires autonomous-Claude sessions at the right times
 // of day. Lives inside the BRAIN web service (no separate cron infra needed).
 //
-// Schedule (all times EAT = UTC+3):
+// Each scheduled tick has a NAME (mountain-themed) + scheduled EAT time. The
+// name is its identity. When the tick runs (on time or delayed by retries),
+// the resulting QB Payments carry a TxnDate derived from the NAME — not the
+// wall clock at execution time. So if kili1615 retries 5 times and actually
+// fires at 17:00, the txns still get TxnDate=today, because kili1615 IS the
+// "16:15 EAT batch" by identity.
 //
-//   03:00  catchup     NMB + CRDB   window=YESTERDAY 18:00 → YESTERDAY 23:59  as_of=YESTERDAY
-//   07:00  morning     NMB + CRDB   window=TODAY 00:00 → TODAY now              as_of=TODAY
-//   10:00  late-morn   NMB + CRDB                                                as_of=TODAY
-//   13:00  noon        NMB + CRDB + iphone_bank                                  as_of=TODAY
-//   16:15  cutoff      NMB + CRDB + iphone_bank                                  as_of=TODAY
-//   18:00  evening     NMB + CRDB + iphone_bank   (TxnDate flips to TOMORROW)    as_of=TOMORROW
-//   21:00  night       NMB + CRDB + iphone_bank                                  as_of=TOMORROW
+// Two INDEPENDENT date facts per tick:
+//   - as_of    = the calendar day the bank txn happened (in the bank-txn
+//                window). Controls which invoices are in the matching pool.
+//   - txn_date = the date written to QB as the Payment TxnDate. Determined
+//                by the tick's scheduled EAT time vs the 16:15 cutoff:
+//                  scheduled <= 16:15 EAT → txn_date = execution-day
+//                  scheduled  > 16:15 EAT → txn_date = execution-day + 1
 //
-// AS_OF logic: see BRAIN_BRAIN.md. After 16:15 EAT cutoff, fresh deposits are
-// booked with TxnDate=tomorrow, so we want tomorrow's invoices in the matching
-// pool. Before cutoff, today's invoices are correct.
+// Schedule (all times EAT = UTC+3 → cron expressions are UTC):
 //
-// Each tick POSTs to /api/agent/run with a structured triggerContext. The
-// agent then plans + calls run_upload_window once per (channel, window).
+//   meru0300        catchup-yesterday   as_of=yesterday  txn_date=today
+//   hanang0700      today-normal        as_of=today      txn_date=today
+//   loolmalas1000   today-normal        as_of=today      txn_date=today
+//   lengai1300      today-normal        as_of=today      txn_date=today
+//   kili1615        today-cutoff        as_of=today      txn_date=today
+//   mawenzi1800     today-evening       as_of=today      txn_date=tomorrow
+//   kibo2100        today-evening       as_of=today      txn_date=tomorrow
 //
 // Reliability:
-//   - On boot, we check the last successful session per trigger label and
-//     fire any tick missed by <2h while BRAIN was offline (e.g. during a
-//     deploy that straddled a scheduled time).
+//   - On boot, we check the last successful session per tick name and fire
+//     any tick missed by <2h while BRAIN was offline (deploy window etc.).
 
 import cron from 'node-cron';
 import { db } from '../db/pool.js';
 import { runSession } from './runner.js';
 import { notifyAdmin } from '../notifications.js';
 
-// One row per scheduled tick. Cron expr is in UTC (BRAIN's process timezone).
-// EAT = UTC + 3, so subtract 3 hours from EAT to get UTC.
+// Each tick: name + UTC cron + EAT label + kind + txn_date_offset (days).
 const SCHEDULE = [
-  { label: 'cron:03:00-catchup',  utc: '0 0 * * *',  eat: '03:00', kind: 'catchup' },   // 03:00 EAT = 00:00 UTC
-  { label: 'cron:07:00-morning',  utc: '0 4 * * *',  eat: '07:00', kind: 'today' },
-  { label: 'cron:10:00-latemorn', utc: '0 7 * * *',  eat: '10:00', kind: 'today' },
-  { label: 'cron:13:00-noon',     utc: '0 10 * * *', eat: '13:00', kind: 'today' },
-  { label: 'cron:16:15-cutoff',   utc: '15 13 * * *', eat: '16:15', kind: 'today' },
-  { label: 'cron:18:00-evening',  utc: '0 15 * * *', eat: '18:00', kind: 'evening' },
-  { label: 'cron:21:00-night',    utc: '0 18 * * *', eat: '21:00', kind: 'evening' },
+  { name: 'meru0300',      utc: '0 0 * * *',   eat: '03:00', kind: 'catchup-yesterday', txnDateOffset: 0 },
+  { name: 'hanang0700',    utc: '0 4 * * *',   eat: '07:00', kind: 'today-normal',      txnDateOffset: 0 },
+  { name: 'loolmalas1000', utc: '0 7 * * *',   eat: '10:00', kind: 'today-normal',      txnDateOffset: 0 },
+  { name: 'lengai1300',    utc: '0 10 * * *',  eat: '13:00', kind: 'today-normal',      txnDateOffset: 0 },
+  { name: 'kili1615',      utc: '15 13 * * *', eat: '16:15', kind: 'today-cutoff',      txnDateOffset: 0 },
+  { name: 'mawenzi1800',   utc: '0 15 * * *',  eat: '18:00', kind: 'today-evening',     txnDateOffset: 1 },
+  { name: 'kibo2100',      utc: '0 18 * * *',  eat: '21:00', kind: 'today-evening',     txnDateOffset: 1 },
 ];
 
 const ENABLED = process.env.AGENT_SCHEDULER_ENABLED !== 'false';
 
-function buildTriggerContext(kind) {
+function buildTriggerContext(sched) {
   const now = new Date();
   const eatNow = new Date(now.getTime() + 3 * 3600_000);
   const todayEat = eatNow.toISOString().slice(0, 10);
   const yEat = new Date(eatNow.getTime() - 24 * 3600_000).toISOString().slice(0, 10);
   const tEat = new Date(eatNow.getTime() + 24 * 3600_000).toISOString().slice(0, 10);
 
-  // Helper to convert "YYYY-MM-DD HH:mm EAT" → ISO UTC string.
+  const txnDate = sched.txnDateOffset === 0 ? todayEat : tEat;
+
+  // EAT-time → UTC-ISO converter.
   const eatIso = (dateStr, hhmm) => {
     const [h, m] = hhmm.split(':').map(Number);
     const d = new Date(dateStr + 'T00:00:00Z');
-    d.setUTCHours(h - 3, m, 0, 0);  // EAT → UTC
+    d.setUTCHours(h - 3, m, 0, 0);
     return d.toISOString();
   };
 
-  if (kind === 'catchup') {
-    // Cover yesterday's last cutoff (16:15) through end of yesterday + early today
+  if (sched.kind === 'catchup-yesterday') {
+    // Bank txns happened YESTERDAY (16:15 EAT → 23:59 EAT). AS_OF=yesterday.
+    // TxnDate is TODAY (the operator convention — post-cutoff books to next day,
+    // and the meru0300 tick name lives at execution-day-zero offset since it
+    // logically represents "first run of today's bookkeeping cycle").
     return {
-      kind: 'catchup',
+      tick: sched.name,
+      eat_scheduled: sched.eat,
+      kind: sched.kind,
+      txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat },
-        { channel: 'bank',        since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat },
-        { channel: 'iphone_bank', since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat },
+        { channel: 'nmbnew',      since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
+        { channel: 'bank',        since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
+        { channel: 'iphone_bank', since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
       ],
-      note: 'Catch-up for yesterday-evening tail. AS_OF=yesterday is the rule.',
+      note: 'Catchup for yesterday-evening tail. AS_OF=yesterday, TxnDate=today.',
     };
   }
-  if (kind === 'today') {
-    // Window: today 00:00 → now. The auto-upload endpoint will default sinceIso
-    // to "last finalized + safety" if we omit it, but for the agent we want
-    // explicit context.
+  if (sched.kind === 'today-normal' || sched.kind === 'today-cutoff') {
+    // Bank txns happened TODAY (00:00 EAT → now). AS_OF=today.
+    // TxnDate=today since this tick is scheduled at/before 16:15 EAT.
     return {
-      kind: 'today',
+      tick: sched.name,
+      eat_scheduled: sched.eat,
+      kind: sched.kind,
+      txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat },
-        { channel: 'bank',        since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat },
-        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat },
+        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'bank',        since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
       ],
-      note: 'Standard daytime run. AS_OF=today.',
+      note: 'Daytime run. AS_OF=today, TxnDate=today.',
     };
   }
-  if (kind === 'evening') {
-    // Post-16:15 cutoff bank txns happened TODAY → AS_OF=today (today's
-    // invoices are what was due when the customer actually paid).
-    // TxnDate WILL be tomorrow (per the cutoff rule applied at QB-write time
-    // by paymentTxnDate()) — but that's an INDEPENDENT concern. Do NOT use
-    // AS_OF=tomorrow here. That would put tomorrow's just-created invoices
-    // in the pool and pay them ahead of today's real arrears — the same
-    // bug as the morning-catchup AS_OF mistake. See BRAIN_BRAIN.md.
+  if (sched.kind === 'today-evening') {
+    // Bank txns happened TODAY post 16:15 EAT cutoff. AS_OF=today (when
+    // customer actually paid). TxnDate=tomorrow (per cutoff convention).
+    // Do NOT use AS_OF=tomorrow — that's the conflation trap.
     return {
-      kind: 'evening',
+      tick: sched.name,
+      eat_scheduled: sched.eat,
+      kind: sched.kind,
+      txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
-        { channel: 'bank',        since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
-        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
+        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'bank',        since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
       ],
-      note: 'Post-cutoff evening run. AS_OF=today (matches when bank txn happened). TxnDate flips to tomorrow at QB-write time per cutoff rule.',
+      note: 'Post-cutoff evening run. AS_OF=today (bank txn day), TxnDate=tomorrow (cutoff rule).',
     };
   }
-  throw new Error('unknown kind: ' + kind);
+  throw new Error('unknown kind: ' + sched.kind);
 }
 
-async function fireTick(label, kind) {
-  const triggerContext = buildTriggerContext(kind);
-  console.log(`[scheduler] firing ${label} kind=${kind}`);
+async function fireTick(sched) {
+  const triggerContext = buildTriggerContext(sched);
+  const label = 'cron:' + sched.name;
+  console.log(`[scheduler] firing ${sched.name} (eat=${sched.eat}, kind=${sched.kind}, txn_date=${triggerContext.txn_date})`);
   try {
     const r = await runSession({
       db: db(),
@@ -114,11 +130,11 @@ async function fireTick(label, kind) {
       triggerContext,
       mode: 'execute',
     });
-    console.log(`[scheduler] ${label} → session=${r.sessionId} status=${r.status} cost=$${r.cost_usd}`);
+    console.log(`[scheduler] ${sched.name} → session=${r.sessionId} status=${r.status} cost=$${r.cost_usd}`);
   } catch (err) {
-    console.error(`[scheduler] ${label} FAILED:`, err.message);
+    console.error(`[scheduler] ${sched.name} FAILED:`, err.message);
     notifyAdmin({
-      message: `BRAIN scheduler ${label} failed: ${String(err.message || err).slice(0, 200)}`,
+      message: `BRAIN ${sched.name} failed: ${String(err.message || err).slice(0, 200)}`,
       severity: 'critical',
       source: 'agent:scheduler',
     });
@@ -135,13 +151,10 @@ export function startScheduler() {
   }
 
   for (const sched of SCHEDULE) {
-    cron.schedule(sched.utc, () => fireTick(sched.label, sched.kind), { timezone: 'UTC' });
+    cron.schedule(sched.utc, () => fireTick(sched), { timezone: 'UTC' });
   }
-  console.log(`[scheduler] registered ${SCHEDULE.length} ticks: ${SCHEDULE.map(s => s.eat + '(' + s.kind + ')').join(', ')}`);
+  console.log(`[scheduler] registered ${SCHEDULE.length} ticks: ${SCHEDULE.map(s => s.name + '@' + s.eat).join(', ')}`);
 
-  // Missed-tick recovery on boot: if a tick should have fired in the past
-  // 2 hours and we don't have a session for it, fire it now. Prevents
-  // deploys that span a scheduled time from silently dropping a tick.
   setTimeout(checkMissedTicks, 5_000);
 }
 
@@ -152,16 +165,15 @@ async function checkMissedTicks() {
       const lastFire = lastFireTimeUtc(sched.utc, now);
       if (!lastFire) continue;
       const ageMs = now - lastFire;
-      if (ageMs > 2 * 3600_000) continue;  // too old to chase
-      if (ageMs < 60_000) continue;        // about to fire normally
+      if (ageMs > 2 * 3600_000) continue;
+      if (ageMs < 60_000) continue;
       const r = await db().query(
-        `SELECT 1 FROM agent_sessions
-          WHERE trigger=$1 AND started_at > $2 LIMIT 1`,
-        [sched.label, lastFire.toISOString()],
+        `SELECT 1 FROM agent_sessions WHERE trigger=$1 AND started_at > $2 LIMIT 1`,
+        ['cron:' + sched.name, lastFire.toISOString()],
       );
       if (r.rows.length === 0) {
-        console.log(`[scheduler] catching up missed tick ${sched.label} (would have fired ${lastFire.toISOString()})`);
-        fireTick(sched.label, sched.kind);
+        console.log(`[scheduler] catching up missed tick ${sched.name} (would have fired ${lastFire.toISOString()})`);
+        fireTick(sched);
       }
     }
   } catch (err) {
@@ -169,9 +181,6 @@ async function checkMissedTicks() {
   }
 }
 
-// Given a cron expression like "0 4 * * *" and a reference Date, return the
-// most recent firing time in UTC (or null if the expression doesn't match
-// daily-at-fixed-time form).
 function lastFireTimeUtc(cronExpr, ref) {
   const parts = cronExpr.split(/\s+/);
   if (parts.length !== 5) return null;

@@ -252,12 +252,12 @@ function paymentTxnDate() {
 const DEFAULT_DEPOSIT_ACCT_ID = process.env.QB_DEFAULT_DEPOSIT_ACCT_ID || '785';
 
 /** Create a QB Payment for one bank-txn line against one invoice. */
-async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
+async function qbCreatePayment({ customerId, invoiceQbId, amount, memo, txnDate }) {
   const body = {
     CustomerRef: { value: String(customerId) },
     TotalAmt: Number(amount),
     PrivateNote: memo || undefined,
-    TxnDate: paymentTxnDate(),
+    TxnDate: txnDate || paymentTxnDate(),
     DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
     Line: [{
       Amount: Number(amount),
@@ -279,6 +279,9 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo }) {
 async function qbBatchCreatePayments(items) {
   if (items.length === 0) return [];
   if (items.length > 30) throw new Error(`qbBatchCreatePayments: ${items.length} > 30 (QB max)`);
+  // Each item may carry its own txnDate override (the autonomous scheduler
+  // sets this from the tick's name, e.g. kili1615 → today; rwenzori1800 →
+  // tomorrow). Falls back to paymentTxnDate() per-item if omitted.
   const body = {
     BatchItemRequest: items.map((it, ix) => ({
       bId: `b${ix}`,
@@ -287,7 +290,7 @@ async function qbBatchCreatePayments(items) {
         CustomerRef: { value: String(it.customerId) },
         TotalAmt: Number(it.amount),
         PrivateNote: it.memo || undefined,
-        TxnDate: paymentTxnDate(),
+        TxnDate: it.txnDate || paymentTxnDate(),
         DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
         Line: [{ Amount: Number(it.amount), LinkedTxn: [{ TxnId: String(it.invoiceQbId), TxnType: 'Invoice' }] }],
       },
@@ -306,11 +309,11 @@ async function qbBatchCreatePayments(items) {
 }
 
 /** Create a QB Credit Memo (the "unused" side) for one bank-txn line. */
-async function qbCreateCreditMemo({ customerId, amount, memo }) {
+async function qbCreateCreditMemo({ customerId, amount, memo, txnDate }) {
   const body = {
     CustomerRef: { value: String(customerId) },
     PrivateNote: memo || undefined,
-    TxnDate: paymentTxnDate(),
+    TxnDate: txnDate || paymentTxnDate(),
     Line: [{
       DetailType: 'SalesItemLineDetail',
       Amount: Number(amount),

@@ -154,7 +154,11 @@ export const TOOLS = [
         },
         as_of: {
           type: 'string',
-          description: 'YYYY-MM-DD — controls which invoices are in the matching pool (DueDate <= as_of). CRITICAL: for catchup runs covering yesterday-evening bank txns, set as_of=yesterday. See BRAIN_BRAIN.md "AS_OF rule".',
+          description: 'YYYY-MM-DD — controls which invoices are in the matching pool (DueDate <= as_of). The calendar day the BANK TXN HAPPENED. NOT the same as txn_date. See BRAIN_BRAIN.md "AS_OF rule" — independent from txn_date.',
+        },
+        txn_date: {
+          type: 'string',
+          description: 'YYYY-MM-DD — the date written to QB as the Payment TxnDate. Determined by the scheduled tick name: ticks at or before 16:15 EAT → txn_date=execution day; ticks after 16:15 EAT → txn_date=next day. INDEPENDENT from as_of: as_of is when the customer actually paid, txn_date is when the bookkeeper records it. Omit only if you want the wall-clock default (paymentTxnDate() — risky for retries).',
         },
       },
       required: ['channel', 'since_iso', 'until_iso', 'as_of'],
@@ -251,6 +255,7 @@ export async function dispatch(toolName, input, ctx) {
           since_iso: input.since_iso,
           until_iso: input.until_iso,
           as_of: input.as_of,
+          txn_date: input.txn_date || null,
           dry_run: ctx.mode === 'plan',
         };
         const r = await fetch(`${base}/api/payment-batches/auto-upload/${encodeURIComponent(input.channel)}`, {
@@ -267,7 +272,7 @@ export async function dispatch(toolName, input, ctx) {
           result = {
             mode: ctx.mode,
             channel: input.channel,
-            window: { since: input.since_iso, until: input.until_iso, as_of: input.as_of },
+            window: { since: input.since_iso, until: input.until_iso, as_of: input.as_of, txn_date: input.txn_date || null },
             batch_id: j.batch_id || null,
             skipped: !!j.skipped,
             skipped_reason: j.skipped ? (j.reason || null) : null,

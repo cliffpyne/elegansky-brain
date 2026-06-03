@@ -403,6 +403,12 @@ export function mountPaymentBatchesApi(app, deps) {
       const untilIso = req.body?.until_iso || new Date(Date.now() + 60_000).toISOString();
 
       const asOf = req.body?.as_of || null;
+      // Optional TxnDate override. When supplied, ALL Payments/CreditMemos in
+      // this batch get this date instead of the wall-clock paymentTxnDate().
+      // Used by the autonomous scheduler: each named tick (kili1615, etc.)
+      // carries its identity's date even when execution is delayed. See
+      // BRAIN_BRAIN.md "TxnDate by batch identity".
+      const txnDateOverride = req.body?.txn_date || null;
       const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf });
       if (result.skipped) {
         await releaseLock();
@@ -475,6 +481,7 @@ export function mountPaymentBatchesApi(app, deps) {
           batchId: result.batchId,
           paid: result.paid,
           unused: result.unused,
+          txnDate: txnDateOverride,
           qbCreatePayment,
           qbBatchCreatePayments,
           qbCreateCreditMemo,
@@ -1177,7 +1184,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
   return { skipped: false, batchId, paid, unused, sheetSum };
 }
 
-async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo }) {
+async function runAutoUploadBackground({ batchId, paid, unused, txnDate, qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo }) {
   // Use QB Batch API: each batch packs up to 30 ops and counts as 1
   // throttle hit, so we can run several batches concurrently for ~100/s
   // effective throughput vs ~5/s with per-record posts. Falls back to
@@ -1198,6 +1205,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment,
         const items = chunk.map((p) => ({
           customerId: p.customerId, invoiceQbId: p.qbId,
           amount: Number(p.amount), memo: p.memoWithSuffix || '',
+          txnDate,
         }));
         let results;
         try {
@@ -1247,6 +1255,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment,
           const qb = await qbCreatePayment({
             customerId: p.customerId, invoiceQbId: p.qbId,
             amount: Number(p.amount), memo: p.memoWithSuffix || '',
+            txnDate,
           });
           await db().query(
             `INSERT INTO payment_uploads (
@@ -1289,6 +1298,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment,
     try {
       const qb = await qbCreateCreditMemo({
         customerId: u.customerId, amount: Number(u.transactionAmount), memo: u.memoWithSuffix || '',
+        txnDate,
       });
       await db().query(
         `INSERT INTO payment_uploads (
@@ -1339,10 +1349,12 @@ async function runAutoUploadBackground({ batchId, paid, unused, qbCreatePayment,
             qb = await qbCreatePayment({
               customerId: u.customer_id, invoiceQbId: u.invoice_qb_id,
               amount: Number(u.amount), memo: u.memo || '',
+              txnDate,
             });
           } else {
             qb = await qbCreateCreditMemo({
               customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
+              txnDate,
             });
           }
           await db().query(

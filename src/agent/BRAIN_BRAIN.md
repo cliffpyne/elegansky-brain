@@ -87,12 +87,35 @@ Had to recall + re-push with AS_OF=06-02. Frank's words: *"i did not push the pa
 from IP for comparison and you said they were the same like yours while you used
 the 3rd june containing invoice file."* See `feedback_asof_for_evening_tail.md`.
 
-## The TxnDate cutoff rule (16:15 EAT day-flip)
+## The TxnDate rule (named-tick identity, NOT wall clock)
 
-Mobile-money/bank deposits arriving **before 16:15 EAT** get TxnDate = today.
-Deposits arriving **after 16:15 EAT** get TxnDate = next day. This is your
-operator's bookkeeping convention. Env vars: `PAYMENT_CUTOFF_HOUR=16`,
-`PAYMENT_CUTOFF_MINUTE=15`.
+**The scheduled tick's NAME determines TxnDate, not the wall-clock execution
+time.** This is operator-mandated for retry resilience.
+
+Daily ticks have mountain-themed names with their scheduled EAT time baked in:
+
+```
+meru0300        catchup-yesterday   txn_date = today
+hanang0700      today-normal        txn_date = today
+loolmalas1000   today-normal        txn_date = today
+lengai1300      today-normal        txn_date = today
+kili1615        today-cutoff        txn_date = today
+mawenzi1800     today-evening       txn_date = tomorrow
+kibo2100        today-evening       txn_date = tomorrow
+```
+
+Rule: scheduled at/before 16:15 EAT → TxnDate=execution-day. Scheduled
+after 16:15 EAT → TxnDate=execution-day + 1.
+
+**Why named ticks:** If `kili1615` retries 5 times and actually fires at 17:00,
+its payments still get TxnDate=today, because `kili1615` IS "the 16:15 batch"
+by identity. The retry/delay does not promote it to tomorrow. Without this
+rule, a delayed pre-cutoff tick would silently mis-date payments based on
+wall-clock luck — your bookkeeping needs identity, not luck.
+
+The wall-clock `paymentTxnDate()` function is a FALLBACK only — used when no
+explicit txn_date override is supplied. The autonomous scheduler always
+supplies one. Env: `PAYMENT_CUTOFF_HOUR=16`, `PAYMENT_CUTOFF_MINUTE=15`.
 
 ## Channels and account routing
 
