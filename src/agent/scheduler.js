@@ -84,16 +84,21 @@ function buildTriggerContext(kind) {
     };
   }
   if (kind === 'evening') {
-    // After 16:15 EAT cutoff, TxnDate flips to tomorrow. AS_OF=tomorrow so
-    // tomorrow's just-created invoices are in the matching pool.
+    // Post-16:15 cutoff bank txns happened TODAY → AS_OF=today (today's
+    // invoices are what was due when the customer actually paid).
+    // TxnDate WILL be tomorrow (per the cutoff rule applied at QB-write time
+    // by paymentTxnDate()) — but that's an INDEPENDENT concern. Do NOT use
+    // AS_OF=tomorrow here. That would put tomorrow's just-created invoices
+    // in the pool and pay them ahead of today's real arrears — the same
+    // bug as the morning-catchup AS_OF mistake. See BRAIN_BRAIN.md.
     return {
       kind: 'evening',
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: tEat },
-        { channel: 'bank',        since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: tEat },
-        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: tEat },
+        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
+        { channel: 'bank',        since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
+        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat },
       ],
-      note: 'Post-cutoff evening run. AS_OF=tomorrow because TxnDate flips after 16:15 EAT.',
+      note: 'Post-cutoff evening run. AS_OF=today (matches when bank txn happened). TxnDate flips to tomorrow at QB-write time per cutoff rule.',
     };
   }
   throw new Error('unknown kind: ' + kind);

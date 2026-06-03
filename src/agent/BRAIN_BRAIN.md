@@ -44,17 +44,40 @@ The algorithm:
 4. **No multi-plate guessing.** If the bank ref mentions a plate that doesn't match
    the customer, do not silently re-route. Flag for review.
 
-## The AS_OF rule (the rule I broke once, on 2026-06-03)
+## The AS_OF rule (the rule I broke TWICE, on 2026-06-03)
+
+**AS_OF and TxnDate are INDEPENDENT. Do not conflate them.**
+
+```
+AS_OF    = the calendar date the BANK TXN HAPPENED
+           (when customer physically paid through the bank)
+           → controls which invoices are in the matching pool
+           → DueDate filter is `Invoice.DueDate <= AS_OF`
+
+TxnDate  = the calendar date the QB Payment is dated
+           (the bookkeeping ledger date)
+           → controls 16:15 EAT cutoff rule (see paymentTxnDate())
+           → after 16:15 EAT, post-cutoff txns get TxnDate=next day
+
+These are DIFFERENT FACTS. AS_OF reflects reality at deposit time.
+TxnDate reflects when the bookkeeper writes it down.
+```
 
 `AS_OF` controls which invoices are in the matching pool. Get this wrong and money
 lands on the wrong-dated invoices.
 
-- **Catch-up upload** (window covers yesterday-evening bank txns, e.g. 16:15→23:59
-  yesterday): `AS_OF = yesterday's date`. Otherwise today's brand-new invoices end
-  up in the pool and the FIFO rule pays them first — wrong.
-- **Current-day upload** (window 00:00 today → now): `AS_OF = today`.
-- **Self-check before running:** restate the window dates and AS_OF aloud in your
-  plan. If window ends yesterday but AS_OF=today → STOP, fix.
+**Rule of thumb:** AS_OF = the calendar day inside the bank-txn window. Always.
+
+- **Morning catchup** (window = YESTERDAY 16:15 → start-of-today, e.g. 03:00):
+  bank txns happened YESTERDAY → `AS_OF = yesterday`.
+- **Morning normal** (window = TODAY 00:00 → now, before 16:15): bank txns happened
+  TODAY → `AS_OF = today`.
+- **Post-cutoff evening** (window = TODAY 16:15 → 23:59): bank txns happened
+  TODAY → `AS_OF = today`.
+  TxnDate of resulting Payments WILL be tomorrow (per cutoff), but that does NOT
+  change AS_OF. **Common trap — do not use AS_OF=tomorrow here.**
+- **Self-check before running:** restate the window dates AND AS_OF AND expected
+  TxnDate aloud in your plan. If the window-day and AS_OF don't match → STOP, fix.
 - **Don't mirror IP.** When IP and BRAIN both produce identical output, that's NOT
   proof AS_OF is right. IP might be using the wrong snapshot too.
 
