@@ -18,8 +18,15 @@ import { runSession } from './runner.js';
 import { notifyAdmin } from '../notifications.js';
 
 export function mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey }) {
+  // Accept EITHER X-Report-Secret (cron/CLI) OR Supabase JWT (dashboard).
+  const agentRunAuth = (req, res, next) => {
+    const secret = process.env.STATEMENT_REPORT_SECRET;
+    if (secret && req.get('x-report-secret') === secret) return next();
+    return requireSupabaseJwt(req, res, next);
+  };
+
   // ── Fire an agent session ────────────────────────────────────────────────
-  app.post('/api/agent/run', requireSharedSecret, async (req, res) => {
+  app.post('/api/agent/run', agentRunAuth, async (req, res) => {
     const { trigger = 'manual', triggerContext = {}, mode = 'execute', parentSessionId = null } = req.body || {};
     if (!['plan', 'execute'].includes(mode)) return res.status(400).json({ error: 'mode must be plan|execute' });
     try {

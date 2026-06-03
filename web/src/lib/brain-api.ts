@@ -299,3 +299,66 @@ export async function setSetting(key: string, value: string): Promise<Setting> {
   const body = (await r.json()) as { setting: Setting };
   return body.setting;
 }
+
+// ─── Agent (autonomous Claude sessions) ─────────────────────────────────────
+export interface AgentSessionRow {
+  id: string;
+  trigger: string;
+  trigger_context: unknown;
+  mode: 'plan' | 'execute';
+  model: string;
+  status: 'running' | 'completed' | 'paused' | 'aborted' | 'errored';
+  summary: string | null;
+  stats: Record<string, number> | null;
+  input_tokens: string | number | null;
+  output_tokens: string | number | null;
+  cache_read_tokens: string | number | null;
+  cache_write_tokens: string | number | null;
+  cost_usd: string | null;
+  started_at: string;
+  ended_at: string | null;
+}
+
+export interface AgentSessionMessage {
+  id: number;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  kind: string | null;
+  payload: unknown;
+  created_at: string;
+}
+
+export async function listAgentSessions(limit = 50): Promise<{ sessions: AgentSessionRow[] }> {
+  const r = await authed(`/api/agent/sessions?limit=${limit}`);
+  if (!r.ok) throw new Error(`listAgentSessions ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function getAgentSession(
+  id: string,
+): Promise<{ session: AgentSessionRow; messages: AgentSessionMessage[] }> {
+  const r = await authed(`/api/agent/sessions/${id}`);
+  if (!r.ok) throw new Error(`getAgentSession ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export interface AgentRunInput {
+  trigger: string;
+  triggerContext: unknown;
+  mode: 'plan' | 'execute';
+}
+
+export async function fireAgent(input: AgentRunInput): Promise<{ ok: boolean; seed_session_id: string }> {
+  const r = await authed(`/api/agent/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw new Error(`fireAgent ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function getAgentCostSummary(): Promise<{ days: Array<{ day: string; sessions: number; in_tok: string; out_tok: string; cache_read: string; cache_write: string; cost_usd: string }> }> {
+  const r = await authed(`/api/agent/cost-summary`);
+  if (!r.ok) throw new Error(`getAgentCostSummary ${r.status}: ${await r.text()}`);
+  return r.json();
+}

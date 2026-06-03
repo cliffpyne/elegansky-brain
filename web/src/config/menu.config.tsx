@@ -1,6 +1,7 @@
 import {
   Activity,
   Bell,
+  Bot,
   CircleHelp,
   FileSpreadsheet,
   Landmark,
@@ -42,6 +43,7 @@ export const MENU_SIDEBAR: MenuConfig = [
       { title: 'Credit memos', path: '/coming-soon', disabled: true },
     ],
   },
+  { title: 'Agent', icon: Bot, path: '/agent' },
   { heading: 'Insights' },
   { title: 'Reports', icon: LineChart, path: '/coming-soon', disabled: true },
   { title: 'Activity', icon: ScrollText, path: '/coming-soon', disabled: true },
