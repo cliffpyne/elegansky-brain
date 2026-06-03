@@ -66,21 +66,27 @@ function buildTriggerContext(sched) {
   };
 
   if (sched.kind === 'catchup-yesterday') {
-    // Bank txns happened YESTERDAY (16:15 EAT → 23:59 EAT). AS_OF=yesterday.
-    // TxnDate is TODAY (the operator convention — post-cutoff books to next day,
-    // and the meru0300 tick name lives at execution-day-zero offset since it
-    // logically represents "first run of today's bookkeeping cycle").
+    // TWO sub-windows per channel, because the catchup spans midnight:
+    //   1. Yesterday-evening tail (16:15 yesterday → 00:00 today) → AS_OF=yesterday
+    //   2. Today's pre-dawn (00:00 today → execution-time today)   → AS_OF=today
+    // Both produce TxnDate=today (tick runs at 03:00 EAT, pre-cutoff).
+    // Without this split, today's pre-dawn txns would be matched against
+    // yesterday's invoice pool — the AS_OF trap Frank explicitly called out
+    // in the original rule.
     return {
       tick: sched.name,
       eat_scheduled: sched.eat,
       kind: sched.kind,
       txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
-        { channel: 'bank',        since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
-        { channel: 'iphone_bank', since_iso: eatIso(yEat, '16:15'), until_iso: eatIso(todayEat, '03:00'), as_of: yEat, txn_date: txnDate },
+        { channel: 'nmbnew',      since_iso: eatIso(yEat, '16:15'),     until_iso: eatIso(todayEat, '00:00'), as_of: yEat,     txn_date: txnDate },
+        { channel: 'bank',        since_iso: eatIso(yEat, '16:15'),     until_iso: eatIso(todayEat, '00:00'), as_of: yEat,     txn_date: txnDate },
+        { channel: 'iphone_bank', since_iso: eatIso(yEat, '16:15'),     until_iso: eatIso(todayEat, '00:00'), as_of: yEat,     txn_date: txnDate },
+        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(),         as_of: todayEat, txn_date: txnDate },
+        { channel: 'bank',        since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(),         as_of: todayEat, txn_date: txnDate },
+        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(),         as_of: todayEat, txn_date: txnDate },
       ],
-      note: 'Catchup for yesterday-evening tail. AS_OF=yesterday, TxnDate=today.',
+      note: 'Catchup splits the midnight boundary: yesterday-evening windows use AS_OF=yesterday, today-pre-dawn windows use AS_OF=today. All produce TxnDate=today.',
     };
   }
   if (sched.kind === 'today-normal' || sched.kind === 'today-cutoff') {
