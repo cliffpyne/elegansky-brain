@@ -90,36 +90,39 @@ function buildTriggerContext(sched) {
     };
   }
   if (sched.kind === 'today-normal' || sched.kind === 'today-cutoff') {
-    // Bank txns happened TODAY (00:00 EAT → now). AS_OF=today.
-    // TxnDate=today since this tick is scheduled at/before 16:15 EAT.
+    // Daytime tick. AS_OF=today, TxnDate=today.
+    // Use FROM_LAST: omit since_iso/until_iso so the auto-upload endpoint
+    // computes since = MAX(consumed_transactions.sheet_ts)+1ms per channel.
+    // Operator rule 2026-06-04: "all uploads use last used ref + fresh /arrears".
     return {
       tick: sched.name,
       eat_scheduled: sched.eat,
       kind: sched.kind,
+      mode_label: 'from_last',
       txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
-        { channel: 'bank',        since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
-        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '00:00'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'nmbnew',      as_of: todayEat, txn_date: txnDate },
+        { channel: 'bank',        as_of: todayEat, txn_date: txnDate },
+        { channel: 'iphone_bank', as_of: todayEat, txn_date: txnDate },
       ],
-      note: 'Daytime run. AS_OF=today, TxnDate=today.',
+      note: 'Daytime run. from_last (omit since/until). AS_OF=today, TxnDate=today. /arrears pulled fresh per channel.',
     };
   }
   if (sched.kind === 'today-evening') {
-    // Bank txns happened TODAY post 16:15 EAT cutoff. AS_OF=today (when
-    // customer actually paid). TxnDate=tomorrow (per cutoff convention).
-    // Do NOT use AS_OF=tomorrow — that's the conflation trap.
+    // Post-cutoff evening. AS_OF=today (bank txns happened today before
+    // posting), TxnDate=tomorrow (cutoff rule). from_last semantics.
     return {
       tick: sched.name,
       eat_scheduled: sched.eat,
       kind: sched.kind,
+      mode_label: 'from_last',
       txn_date: txnDate,
       windows: [
-        { channel: 'nmbnew',      since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
-        { channel: 'bank',        since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
-        { channel: 'iphone_bank', since_iso: eatIso(todayEat, '16:15'), until_iso: now.toISOString(), as_of: todayEat, txn_date: txnDate },
+        { channel: 'nmbnew',      as_of: todayEat, txn_date: txnDate },
+        { channel: 'bank',        as_of: todayEat, txn_date: txnDate },
+        { channel: 'iphone_bank', as_of: todayEat, txn_date: txnDate },
       ],
-      note: 'Post-cutoff evening run. AS_OF=today (bank txn day), TxnDate=tomorrow (cutoff rule).',
+      note: 'Post-cutoff evening run. from_last. AS_OF=today (bank-txn day), TxnDate=tomorrow (cutoff rule).',
     };
   }
   throw new Error('unknown kind: ' + sched.kind);

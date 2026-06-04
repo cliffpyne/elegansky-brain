@@ -227,6 +227,28 @@ nonsensical. **You do not need to fix IP.** Just know:
 - `app_settings` — kv store
 - `arrears_snapshots` — frozen `/arrears` outputs for audit
 
+## Scheduled-tick window strategy (operator rule 2026-06-04)
+
+The scheduler fires scrapers 15 min before each upload tick:
+
+```
+scraper fires    (T-15min)   →   sheet updated
+upload tick      (T)         →   you run with from_last + fresh /arrears
+```
+
+For EVERY scheduled tick except the catchup `meru0300`:
+- The triggerContext provides ONLY `channel`, `as_of`, `txn_date` per window
+- since_iso and until_iso are INTENTIONALLY OMITTED → endpoint defaults to
+  from_last (latest consumed sheet_ts +1ms → now+60s)
+- /arrears is queried fresh by the endpoint at that tick's AS_OF
+
+For `meru0300` only: TWO explicit sub-windows split at midnight EAT, with
+AS_OF=yesterday for window 1 and AS_OF=today for window 2.
+
+You MUST forward this exactly. Do not "be helpful" and compute since/until
+yourself for non-catchup ticks. Doing so reintroduces the gap bug from
+batch 9342d62c.
+
 ## from_last window computation — let the endpoint do it
 
 When the trigger context says `mode_label: "from_last"`, **DO NOT compute
