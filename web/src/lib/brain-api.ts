@@ -379,3 +379,71 @@ export async function setSchedulerEnabled(enabled: boolean): Promise<{ ok: boole
   if (!r.ok) throw new Error(`setSchedulerEnabled ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ─── Officer collections report ─────────────────────────────────────────────
+export interface OfficerReportRow {
+  officer_id: string;
+  officer_name: string;
+  total_invoice_amount: number;
+  open_invoice_count: number;
+  office_count: number;
+  police_count: number;
+  offline_count: number;
+  offline_adjustment: number;
+  open: number;
+  collection: number;
+  payment_count: number;
+  dueopen: number;
+  percent: number | null;
+  status: 'good' | 'bad' | 'no_invoices';
+}
+
+export interface OfficerReportGrand {
+  total_invoice_amount: number;
+  offline_count: number;
+  offline_adjustment: number;
+  open: number;
+  collection: number;
+  dueopen: number;
+  percent: number | null;
+  status: 'good' | 'bad' | 'no_invoices';
+}
+
+export interface OfficerReport {
+  date: string;
+  per_officer: OfficerReportRow[];
+  grand_total: OfficerReportGrand;
+  fresh: {
+    invoice_totals_pulled_at: string | null;
+    offline_motos_pulled_at: string | null;
+  };
+}
+
+export async function getOfficerReportToday(date?: string): Promise<OfficerReport> {
+  const q = date ? `?date=${encodeURIComponent(date)}` : '';
+  const r = await authed(`/api/officer-reports/today${q}`);
+  if (!r.ok) throw new Error(`getOfficerReportToday ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function refreshOfficerInvoiceTotals(force = false): Promise<{ ok: boolean; started: boolean }> {
+  const r = await authed('/api/officer-reports/refresh-invoice-totals', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  });
+  if (!r.ok) throw new Error(`refresh-invoice-totals ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function refreshOfficerOfflineMotos(): Promise<{ ok: boolean; office_count: number; police_count: number; unresolved_office: number; unresolved_police: number }> {
+  const r = await authed('/api/officer-reports/refresh-offline-motos', { method: 'POST' });
+  if (!r.ok) throw new Error(`refresh-offline-motos ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function rebuildOfficerMap(): Promise<{ ok: boolean; customers_mapped: number; distinct_officers: number }> {
+  const r = await authed('/api/officer-reports/rebuild-map', { method: 'POST' });
+  if (!r.ok) throw new Error(`rebuild-map ${r.status}: ${await r.text()}`);
+  return r.json();
+}

@@ -45,7 +45,7 @@ export const MENU_SIDEBAR: MenuConfig = [
   },
   { title: 'Agent', icon: Bot, path: '/agent' },
   { heading: 'Insights' },
-  { title: 'Reports', icon: LineChart, path: '/coming-soon', disabled: true },
+  { title: 'Officer collections', icon: LineChart, path: '/officer-reports' },
   { title: 'Activity', icon: ScrollText, path: '/coming-soon', disabled: true },
   { heading: 'System' },
   { title: 'Admin notifications', icon: Bell, path: '/admin-sms' },
