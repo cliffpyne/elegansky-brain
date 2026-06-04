@@ -35,7 +35,13 @@ const SUPABASE_JWKS = SUPABASE_URL
   : null;
 
 export function mountPaymentBatchesApi(app, deps) {
-  const { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected } = deps;
+  const {
+    qbCreatePayment, qbBatchCreatePayments,
+    qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
+    qbBatchLookupCustomers,
+    qbCreateCreditMemo,  // kept only for backwards-compat callers; do not use for new work
+    qbVoid, ensureQbConnected,
+  } = deps;
 
   // Startup check: log any pending batches older than 1 hour. Surfaces stuck
   // batches from a previous crash so the operator can investigate. Doesn't
@@ -263,25 +269,25 @@ export function mountPaymentBatchesApi(app, deps) {
         });
         uploaded.push(upload);
       }
-      // Credit memos for the unused side. Rows without customer_id can't be
-      // written to QB (no CustomerRef) — we still record them with
-      // status='unmatched' so officers can review and resolve manually.
+      // Unused side: customer-matched rows go to QB as unapplied Payments
+      // (Payment without LinkedTxn — Frank's rule from 2026-06-04; CreditMemo
+      // is deprecated). Rows without customer_id get queued for SaasAnt.
       for (let i = 0; i < body.unused.length; i++) {
         const row = body.unused[i];
         if (!row.customer_id) {
           await recordUpload({
-            batchId: batch.id, kind: 'credit_memo', row, qbId: null,
-            qbResponse: null, status: 'unmatched',
+            batchId: batch.id, kind: 'payment', row, qbId: null,
+            qbResponse: null, status: 'needs_saasant',
           });
           continue;
         }
-        const qb = await qbCreateCreditMemo({
+        const qb = await qbCreateUnappliedPayment({
           customerId: row.customer_id,
           amount: Number(row.amount),
           memo: row.memo || '',
         });
         const upload = await recordUpload({
-          batchId: batch.id, kind: 'credit_memo', row, qbId: qb.id,
+          batchId: batch.id, kind: 'payment', row, qbId: qb.id,
           qbResponse: qb.response, status: 'created',
         });
         uploaded.push(upload);
@@ -484,6 +490,9 @@ export function mountPaymentBatchesApi(app, deps) {
           txnDate: txnDateOverride,
           qbCreatePayment,
           qbBatchCreatePayments,
+          qbCreateUnappliedPayment,
+          qbBatchCreateUnappliedPayments,
+          qbBatchLookupCustomers,
           qbCreateCreditMemo,
         })
           .catch((err) => {
@@ -714,6 +723,57 @@ export function mountPaymentBatchesApi(app, deps) {
         lines.push(header.map((h) => esc(inv[h])).join(','));
       }
       res.type('text/csv').attachment(`arrears-snapshot-${s.as_of}-${s.id.slice(0,8)}.csv`).send(lines.join('\n'));
+    } catch (err) {
+      res.status(500).type('text/plain').send('error: ' + err.message);
+    }
+  });
+
+  // ── GET /api/saasant-pending[.csv] ──────────────────────────────────────
+  // Returns rows whose customer didn't match in QB (status='needs_saasant')
+  // so the operator can push them via SaasAnt manually. Supports CSV download
+  // matching SaasAnt's import schema.
+  app.get('/api/saasant-pending', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = req.query.channel ? String(req.query.channel) : null;
+      const r = await db().query(
+        `SELECT pu.id, pu.bank_ref, pu.customer_name, pu.amount, pu.memo, pu.created_at, pb.channel
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.status = 'needs_saasant' ${channel ? 'AND pb.channel = $1' : ''}
+          ORDER BY pu.created_at`,
+        channel ? [channel] : [],
+      );
+      res.json({ pending: r.rows });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/saasant-pending.csv', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = req.query.channel ? String(req.query.channel) : null;
+      const r = await db().query(
+        `SELECT pu.bank_ref, pu.customer_name, pu.amount, pu.memo, pu.created_at, pb.channel
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.status = 'needs_saasant' ${channel ? 'AND pb.channel = $1' : ''}
+          ORDER BY pu.created_at`,
+        channel ? [channel] : [],
+      );
+      const esc = (v) => {
+        const s = v == null ? '' : String(v);
+        return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const HEAD = ['Payment Date', 'Customer', 'Payment Method', 'Deposit To Account Name',
+                    'Invoice No', 'Journal No', 'Amount', 'Reference No', 'Memo', 'Country Code', 'Exchange Rate'];
+      const lines = [HEAD.map(esc).join(',')];
+      for (const x of r.rows) {
+        const txnDate = new Date(x.created_at);
+        const mmdd = `${String(txnDate.getUTCMonth() + 1).padStart(2,'0')}-${String(txnDate.getUTCDate()).padStart(2,'0')}-${txnDate.getUTCFullYear()}`;
+        const memo = String(x.memo || x.bank_ref || '').replace(/[NBP]$/, '');
+        lines.push([mmdd, x.customer_name || '', 'Cash', 'Kijichi Collection AC', '', '', x.amount, '', memo, '', ''].map(esc).join(','));
+      }
+      res.type('text/csv').attachment(`saasant-pending${channel ? '-' + channel : ''}.csv`).send(lines.join('\n'));
     } catch (err) {
       res.status(500).type('text/plain').send('error: ' + err.message);
     }
@@ -1196,7 +1256,12 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
   return { skipped: false, batchId, paid, unused, sheetSum };
 }
 
-async function runAutoUploadBackground({ batchId, paid, unused, txnDate, qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo }) {
+async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
+  qbCreatePayment, qbBatchCreatePayments,
+  qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
+  qbBatchLookupCustomers,
+  qbCreateCreditMemo,  // kept only for fallback in sweep retry
+}) {
   // Use QB Batch API: each batch packs up to 30 ops and counts as 1
   // throttle hit, so we can run several batches concurrently for ~100/s
   // effective throughput vs ~5/s with per-record posts. Falls back to
@@ -1295,41 +1360,90 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate, qbCreat
     await Promise.all(Array.from({ length: 2 }, () => worker()));
   }
 
-  // Matched CreditMemos (if any unused has a customer_id from algorithm — none today)
-  for (const u of unused) {
-    if (!u.customerId) {
-      await db().query(
-        `INSERT INTO payment_uploads (
-           batch_id, kind, bank_ref, customer_id, customer_name,
-           amount, memo, status
-         ) VALUES ($1,'credit_memo',$2,NULL,$3,$4,$5,'unmatched')`,
-        [batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix],
-      );
-      continue;
+  // ─── Unused — three-way split (operator rule from 2026-06-04) ──────────
+  // (1) Look up QB customer by DisplayName for any unused row missing customerId.
+  // (2) Has customerId → push as Payment-without-LinkedTxn (= unapplied credit).
+  // (3) No customerId after lookup → status='needs_saasant', no QB write.
+  // No more CreditMemos in this code path.
+  if (unused.length > 0) {
+    const lookupNames = [...new Set(
+      unused.filter((u) => !u.customerId).map((u) => u.customerName).filter(Boolean),
+    )];
+    let nameToCustomerId = {};
+    if (lookupNames.length && qbBatchLookupCustomers) {
+      try { nameToCustomerId = await qbBatchLookupCustomers(lookupNames); }
+      catch (err) { console.error('[auto-upload] customer-lookup failed:', err.message); }
     }
-    try {
-      const qb = await qbCreateCreditMemo({
-        customerId: u.customerId, amount: Number(u.transactionAmount), memo: u.memoWithSuffix || '',
-        txnDate,
-      });
-      await db().query(
-        `INSERT INTO payment_uploads (
-           batch_id, kind, bank_ref, customer_id, customer_name,
-           amount, memo, qb_id, qb_response, status
-         ) VALUES ($1,'credit_memo',$2,$3,$4,$5,$6,$7,$8,'created')`,
-        [batchId, u.memoWithSuffix, u.customerId, u.customerName,
-         round2(u.transactionAmount), u.memoWithSuffix, qb.id, JSON.stringify(qb.response)],
-      );
-    } catch (err) {
-      failed++;
+    const matchedUnused = [];
+    const unmatchedUnused = [];
+    for (const u of unused) {
+      if (!u.customerId) u.customerId = nameToCustomerId[u.customerName];
+      if (u.customerId) matchedUnused.push(u);
+      else unmatchedUnused.push(u);
+    }
+    console.log(`[auto-upload] unused split: matched-to-QB=${matchedUnused.length}, no-match=${unmatchedUnused.length}`);
+
+    // Matched → batch push as Payment-no-LinkedTxn (unapplied credit)
+    if (matchedUnused.length > 0 && qbBatchCreateUnappliedPayments) {
+      const UCHUNK = 30;
+      const UPAR = 6;
+      const ucks = [];
+      for (let i = 0; i < matchedUnused.length; i += UCHUNK) ucks.push(matchedUnused.slice(i, i + UCHUNK));
+      let ucursor = 0;
+      const uworker = async () => {
+        while (true) {
+          const ci = ucursor++;
+          if (ci >= ucks.length) return;
+          const chunk = ucks[ci];
+          const items = chunk.map((u) => ({
+            customerId: u.customerId,
+            amount: Number(u.transactionAmount),
+            memo: u.memoWithSuffix || '',
+            txnDate,
+          }));
+          let results;
+          try { results = await qbBatchCreateUnappliedPayments(items); }
+          catch (err) {
+            results = items.map(() => ({ ok: false, id: null, response: null, error: String(err.message || err).slice(0, 500) }));
+          }
+          for (let i = 0; i < chunk.length; i++) {
+            const u = chunk[i]; const r = results[i];
+            if (r.ok) {
+              await db().query(
+                `INSERT INTO payment_uploads (
+                   batch_id, kind, bank_ref, customer_id, customer_name,
+                   amount, memo, qb_id, qb_response, status
+                 ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'created')`,
+                [batchId, u.memoWithSuffix, u.customerId, u.customerName,
+                 round2(u.transactionAmount), u.memoWithSuffix, r.id, JSON.stringify(r.response)],
+              );
+            } else {
+              failed++;
+              await db().query(
+                `INSERT INTO payment_uploads (
+                   batch_id, kind, bank_ref, customer_id, customer_name,
+                   amount, memo, status, failure_reason
+                 ) VALUES ($1,'payment',$2,$3,$4,$5,$6,'failed',$7)`,
+                [batchId, u.memoWithSuffix, u.customerId, u.customerName,
+                 round2(u.transactionAmount), u.memoWithSuffix,
+                 String(r.error || 'unknown').slice(0, 500)],
+              );
+            }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: UPAR }, () => uworker()));
+    }
+
+    // Unmatched → queue for SaasAnt (no QB write, status='needs_saasant')
+    for (const u of unmatchedUnused) {
       await db().query(
         `INSERT INTO payment_uploads (
            batch_id, kind, bank_ref, customer_id, customer_name,
            amount, memo, status, failure_reason
-         ) VALUES ($1,'credit_memo',$2,$3,$4,$5,$6,'failed',$7)`,
-        [batchId, u.memoWithSuffix, u.customerId, u.customerName,
-         round2(u.transactionAmount), u.memoWithSuffix,
-         String(err.message || err).slice(0, 500)],
+         ) VALUES ($1,'payment',$2,NULL,$3,$4,$5,'needs_saasant',$6)`,
+        [batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix,
+         'customer DisplayName not found in QB; manual SaasAnt push required'],
       );
     }
   }
@@ -1357,13 +1471,21 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate, qbCreat
         const u = stillFailed[idx];
         try {
           let qb;
-          if (u.kind === 'payment') {
+          if (u.kind === 'payment' && u.invoice_qb_id) {
+            // Paid → Payment with LinkedTxn
             qb = await qbCreatePayment({
               customerId: u.customer_id, invoiceQbId: u.invoice_qb_id,
               amount: Number(u.amount), memo: u.memo || '',
               txnDate,
             });
+          } else if (u.kind === 'payment' && !u.invoice_qb_id && qbCreateUnappliedPayment) {
+            // Unapplied (no invoice match) → Payment without LinkedTxn
+            qb = await qbCreateUnappliedPayment({
+              customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
+              txnDate,
+            });
           } else {
+            // Legacy kind='credit_memo' from the single-row manual endpoint
             qb = await qbCreateCreditMemo({
               customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
               txnDate,

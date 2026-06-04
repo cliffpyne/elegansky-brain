@@ -16,6 +16,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { initQbClient } from './qb-client.js';
 import { mountAgentApi } from './agent/api.js';
 import { startScheduler } from './agent/scheduler.js';
+import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -308,6 +309,78 @@ async function qbBatchCreatePayments(items) {
   });
 }
 
+/**
+ * Create a QB Payment WITHOUT a LinkedTxn — this becomes an "unapplied
+ * payment" sitting as a credit on the customer's tab. Used for the
+ * "customer matched but no current arrears" case (per operator rule from
+ * 2026-06-04: do NOT use CreditMemo, the customer-credit semantics are
+ * the same but unapplied Payment is what Frank's books expect).
+ */
+async function qbCreateUnappliedPayment({ customerId, amount, memo, txnDate }) {
+  const body = {
+    CustomerRef: { value: String(customerId) },
+    TotalAmt: Number(amount),
+    PrivateNote: memo || undefined,
+    TxnDate: txnDate || paymentTxnDate(),
+    DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
+    // No Line[] → unapplied. Frank verified this is the correct shape.
+  };
+  const json = await qbPost('payment', body);
+  return { id: json.Payment?.Id, response: json };
+}
+
+/** Batched variant of qbCreateUnappliedPayment (max 30 ops per call). */
+async function qbBatchCreateUnappliedPayments(items) {
+  if (items.length === 0) return [];
+  if (items.length > 30) throw new Error(`qbBatchCreateUnappliedPayments: ${items.length} > 30`);
+  const body = {
+    BatchItemRequest: items.map((it, ix) => ({
+      bId: `u${ix}`,
+      operation: 'create',
+      Payment: {
+        CustomerRef: { value: String(it.customerId) },
+        TotalAmt: Number(it.amount),
+        PrivateNote: it.memo || undefined,
+        TxnDate: it.txnDate || paymentTxnDate(),
+        DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
+      },
+    })),
+  };
+  const json = await qbPost('batch', body);
+  const byBId = {};
+  for (const x of json.BatchItemResponse || []) byBId[x.bId] = x;
+  return items.map((_, ix) => {
+    const resp = byBId[`u${ix}`];
+    if (resp?.Payment?.Id) return { ok: true, id: resp.Payment.Id, response: resp.Payment, error: null };
+    const fault = resp?.Fault;
+    const errMsg = fault?.Error?.[0]?.Detail || fault?.Error?.[0]?.Message || (resp ? JSON.stringify(resp).slice(0, 200) : 'no response');
+    return { ok: false, id: null, response: null, error: errMsg };
+  });
+}
+
+/** Batched QB Customer lookup by DisplayName. Returns name → customerId map. */
+async function qbBatchLookupCustomers(displayNames) {
+  const out = {};
+  const unique = [...new Set(displayNames.filter(Boolean))];
+  for (let i = 0; i < unique.length; i += 30) {
+    const chunk = unique.slice(i, i + 30);
+    const inList = chunk.map((n) => `'${String(n).replace(/'/g, "\\'")}'`).join(',');
+    const j = await qbQuery(`SELECT Id, DisplayName, Active, Balance FROM Customer WHERE DisplayName IN (${inList}) MAXRESULTS 1000`);
+    const all = j.QueryResponse?.Customer || [];
+    const byName = {};
+    for (const cust of all) (byName[cust.DisplayName] ||= []).push(cust);
+    for (const name of chunk) {
+      const cands = byName[name] || [];
+      if (!cands.length) continue;
+      const active = cands.filter((c) => c.Active);
+      const pickFrom = active.length ? active : cands;
+      const withBal = pickFrom.filter((c) => Number(c.Balance || 0) > 0);
+      out[name] = (withBal[0] || pickFrom[0]).Id;
+    }
+  }
+  return out;
+}
+
 /** Create a QB Credit Memo (the "unused" side) for one bank-txn line. */
 async function qbCreateCreditMemo({ customerId, amount, memo, txnDate }) {
   const body = {
@@ -360,7 +433,13 @@ mountCyclesApi(app);
 mountSettingsApi(app);
 mountAdminSmsApi(app);
 // /api/payment-batches*, /api/arrears-snapshots, /api/consumed-transactions
-mountPaymentBatchesApi(app, { qbCreatePayment, qbBatchCreatePayments, qbCreateCreditMemo, qbVoid, ensureQbConnected });
+mountPaymentBatchesApi(app, {
+  qbCreatePayment, qbBatchCreatePayments,
+  qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
+  qbBatchLookupCustomers,
+  qbCreateCreditMemo,
+  qbVoid, ensureQbConnected,
+});
 
 // Standalone QB client (used by the agent runner). Shares the same DB token
 // store as the intuit-oauth client above but has its own fetch-based code
@@ -402,6 +481,7 @@ function requirePhoneKey(req, res, next) {
 }
 mountNotificationsApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
+mountLimboRecoveryApi(app, { requireSupabaseJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
@@ -847,4 +927,8 @@ app.listen(PORT, () => {
   // Autonomous-Claude scheduler — 7 daily ticks, EAT-aware.
   // Set AGENT_SCHEDULER_ENABLED=false to disable (for staging / debug).
   startScheduler();
+  // Limbo-batch recovery: release locks from any payment_batches stuck in
+  // status='pending' with zero uploads. Runs once 5s after boot. Real
+  // incident: NMB 91c0fa9e locked 418 refs after a killed --confirm.
+  startLimboRecoveryOnBoot();
 });

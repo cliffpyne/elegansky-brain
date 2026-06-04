@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS payment_uploads (
   memo             text,
   qb_id            text,                    -- created QB id on success
   qb_response      jsonb,                   -- raw QB POST response
-  status           text          NOT NULL CHECK (status IN ('created', 'voided', 'failed')),
+  status           text          NOT NULL CHECK (status IN ('created', 'voided', 'failed', 'unmatched', 'dry_run', 'needs_saasant')),
   failure_reason   text,
   created_at       timestamptz   NOT NULL DEFAULT now(),
   voided_at        timestamptz,
@@ -314,6 +314,19 @@ CREATE TABLE IF NOT EXISTS sms_inbox (
 
 CREATE INDEX IF NOT EXISTS idx_sms_inbox_unprocessed
   ON sms_inbox (received_at) WHERE processed = false;
+
+-- Migration: extend payment_uploads.status to include 'needs_saasant'
+-- (rows whose customer didn't match in QB; queued for manual SaasAnt push).
+-- Safe to re-run.
+DO $$
+BEGIN
+  ALTER TABLE payment_uploads DROP CONSTRAINT IF EXISTS payment_uploads_status_check;
+  ALTER TABLE payment_uploads ADD CONSTRAINT payment_uploads_status_check
+    CHECK (status IN ('created','voided','failed','unmatched','dry_run','needs_saasant'));
+EXCEPTION WHEN OTHERS THEN
+  -- ignore if table not yet present
+  NULL;
+END $$;
 
 -- Duplicate-customer ledger. Grows over time as Claude (or Frank)
 -- identifies QB customer records that are duplicates of each other.
