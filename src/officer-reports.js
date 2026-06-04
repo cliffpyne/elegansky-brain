@@ -223,39 +223,46 @@ async function readOfflineTab(source) {
 }
 
 /**
- * Resolve a list of plates to (customer_id, officer_id) via customer_officer_map.
- * Matches customer_name ILIKE '%PLATE%' (QB names follow "PLATE=NAME" pattern).
- * Returns Map<plate, { customer_id, officer_id, officer_name } | null>.
+ * Strip trailing junk from a sheet-entered name. Operators sometimes append
+ * a phone number ("NJAUKA BAKARI MOHAMED 0674299966") — we keep alpha tokens
+ * only. Leaves the original case so we can match case-insensitively.
  */
-async function resolvePlatesToOfficers(plates) {
-  const unique = [...new Set(plates.filter(Boolean))];
-  if (!unique.length) return new Map();
+function cleanRiderName(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .split(/\s+/)
+    .filter((t) => /[A-Za-z]/.test(t)) // drop pure-digit tokens
+    .join(' ')
+    .trim();
+}
 
-  // One big query: for every plate, find the customer whose name contains it.
-  // We use a CASE statement to attach the plate as label, then GROUP to dedupe.
-  const params = [];
-  const cases = unique.map((p, i) => {
-    params.push('%' + p + '%');
-    return `WHEN customer_name ILIKE $${i + 1} THEN $${i + 1}`;
-  }).join(' ');
-  const orClauses = unique.map((_, i) => `customer_name ILIKE $${i + 1}`).join(' OR ');
+/**
+ * Resolve a list of rider names from OFFICE/POLICE to officers via
+ * customer_officer_map. Plates from QB don't carry the bike's tag — they
+ * live on invoices — so the rider's name is the join key.
+ *
+ * Returns Map<original_name, { customer_id, officer_id, officer_name } | null>.
+ */
+async function resolveNamesToOfficers(names) {
+  const cleaned = [...new Set(names.map((n) => cleanRiderName(n)).filter(Boolean))];
+  if (!cleaned.length) return new Map();
 
-  const sql = `
-    SELECT
-      customer_id, customer_name, officer_id, officer_name,
-      (CASE ${cases} END) AS matched_pattern
-    FROM customer_officer_map
-    WHERE ${orClauses}
-  `;
-  const r = await db().query(sql, params);
+  // Exact (case-insensitive) match on customer_name.
+  const params = cleaned;
+  const placeholders = cleaned.map((_, i) => `$${i + 1}`).join(',');
+  const r = await db().query(
+    `SELECT customer_id, customer_name, officer_id, officer_name
+       FROM customer_officer_map
+      WHERE UPPER(customer_name) IN (${placeholders})`,
+    cleaned.map((n) => n.toUpperCase()),
+  );
 
-  // matched_pattern is '%PLATE%' — strip the %s back to the plate.
-  const out = new Map();
+  // Keep first match per cleaned name.
+  const byCleaned = new Map();
   for (const row of r.rows) {
-    const plate = String(row.matched_pattern || '').replace(/^%|%$/g, '');
-    // First match wins (ties unlikely; plates are 8 chars unique).
-    if (!out.has(plate)) {
-      out.set(plate, {
+    const key = String(row.customer_name).toUpperCase();
+    if (!byCleaned.has(key)) {
+      byCleaned.set(key, {
         customer_id: row.customer_id,
         customer_name: row.customer_name,
         officer_id: row.officer_id,
@@ -263,8 +270,13 @@ async function resolvePlatesToOfficers(plates) {
       });
     }
   }
-  // Plates with no match → set null so caller knows they're unresolved.
-  for (const p of unique) if (!out.has(p)) out.set(p, null);
+
+  // Map back to caller's original names.
+  const out = new Map();
+  for (const original of names) {
+    const cleanedKey = cleanRiderName(original).toUpperCase();
+    out.set(original, cleanedKey ? (byCleaned.get(cleanedKey) || null) : null);
+  }
   return out;
 }
 
@@ -281,16 +293,16 @@ export async function refreshOfflineMotos(snapshotDate = null) {
     readOfflineTab('POLICE'),
   ]);
 
-  const allPlates = [...officeRows, ...policeRows].map((r) => r.plate).filter(Boolean);
-  const resolved = await resolvePlatesToOfficers(allPlates);
+  const allNames = [...officeRows, ...policeRows].map((r) => r.rider_name).filter(Boolean);
+  const resolved = await resolveNamesToOfficers(allNames);
 
   const rows = [];
   for (const r of officeRows) {
-    const m = r.plate ? resolved.get(r.plate) : null;
+    const m = r.rider_name ? resolved.get(r.rider_name) : null;
     rows.push(['OFFICE', r.rider_name, r.plate || null, m?.customer_id || null, m?.officer_id || null, m?.officer_name || null]);
   }
   for (const r of policeRows) {
-    const m = r.plate ? resolved.get(r.plate) : null;
+    const m = r.rider_name ? resolved.get(r.rider_name) : null;
     rows.push(['POLICE', r.rider_name, r.plate || null, m?.customer_id || null, m?.officer_id || null, m?.officer_name || null]);
   }
 
@@ -324,8 +336,8 @@ export async function refreshOfflineMotos(snapshotDate = null) {
   // Stats
   const office_count = officeRows.length;
   const police_count = policeRows.length;
-  const unresolved_office = officeRows.filter((r) => !r.plate || resolved.get(r.plate) == null).length;
-  const unresolved_police = policeRows.filter((r) => !r.plate || resolved.get(r.plate) == null).length;
+  const unresolved_office = officeRows.filter((r) => !r.rider_name || resolved.get(r.rider_name) == null).length;
+  const unresolved_police = policeRows.filter((r) => !r.rider_name || resolved.get(r.rider_name) == null).length;
   return {
     snapshot_date: date,
     office_count,
