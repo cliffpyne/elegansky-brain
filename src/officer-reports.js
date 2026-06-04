@@ -662,6 +662,18 @@ export async function getOfficerInvoiceTotals(snapshotDate) {
 const FEE_PER_MOTO = 12_000; // TZS per OFFICE/POLICE motorcycle (Frank's spec)
 const GOOD_THRESHOLD_PCT = 81;
 
+// Officers Frank wants hidden from the report (inactive / blocked / not real
+// loan officers). Names matched case-insensitively against officer_name.
+const EXCLUDED_OFFICER_NAMES = new Set([
+  'PERIS THOMAS OKALA',
+  'SULEIMAN LUMBWE BODA',
+  'DANIEL MTERA RHOBI',
+  'HYUVIN RICHARD I BLOCKED',
+]);
+function isExcluded(name) {
+  return EXCLUDED_OFFICER_NAMES.has(String(name || '').trim().toUpperCase());
+}
+
 /**
  * Compute, for one date, the full officer-collections report:
  *   open       = invoice_total − offline_count × 12,000
@@ -717,6 +729,7 @@ export async function computeOfficerReport(date) {
     const col = collections.get(id);
     const arr = arrears.get(id);
     const name = inv?.officer_name || off?.officer_name || arr?.officer_name || 'Unknown';
+    if (isExcluded(name)) continue; // hidden by operator preference
 
     const total_invoice_amount = inv?.total_invoice_amount || 0;
     const offline_count = off?.offline_total || 0;
