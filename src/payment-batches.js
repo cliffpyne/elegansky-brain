@@ -852,6 +852,88 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // ── GET /api/payment-uploads/today-totals ────────────────────────────────
+  // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
+  // day, plus a grand total. Defaults to today EAT. Used for the daily
+  // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  app.get('/api/payment-uploads/today-totals', requireSecretOrJwt, async (req, res) => {
+    try {
+      const dayParam = req.query.date ? String(req.query.date) : null; // 'YYYY-MM-DD' in EAT
+      const dayExpr = dayParam ? `DATE '${dayParam}'` : `(now() AT TIME ZONE 'Africa/Dar_es_Salaam')::date`;
+
+      const byChannelStatus = await db().query(
+        `SELECT
+           COALESCE(pb.channel, 'unknown')   AS channel,
+           pu.status,
+           pu.kind,
+           COUNT(*)                          AS rows,
+           COALESCE(SUM(pu.amount), 0)       AS total
+         FROM payment_uploads pu
+         JOIN payment_batches pb ON pb.id = pu.batch_id
+         WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = ${dayExpr}
+         GROUP BY 1, 2, 3
+         ORDER BY 1, 2, 3`,
+      );
+
+      // Reshape into per-channel summaries.
+      const channels = {};
+      for (const r of byChannelStatus.rows) {
+        const ch = r.channel;
+        if (!channels[ch]) {
+          channels[ch] = {
+            channel: ch,
+            pushed_rows: 0, pushed_amount: 0,
+            voided_rows: 0, voided_amount: 0,
+            failed_rows: 0, failed_amount: 0,
+            needs_saasant_rows: 0, needs_saasant_amount: 0,
+            unmatched_rows: 0, unmatched_amount: 0,
+            other_rows: 0, other_amount: 0,
+            payment_amount: 0, credit_memo_amount: 0,
+          };
+        }
+        const c = channels[ch];
+        const rows = Number(r.rows), amt = Number(r.total);
+        if (r.status === 'created')             { c.pushed_rows += rows; c.pushed_amount += amt; }
+        else if (r.status === 'voided')         { c.voided_rows += rows; c.voided_amount += amt; }
+        else if (r.status === 'failed')         { c.failed_rows += rows; c.failed_amount += amt; }
+        else if (r.status === 'needs_saasant')  { c.needs_saasant_rows += rows; c.needs_saasant_amount += amt; }
+        else if (r.status === 'unmatched')      { c.unmatched_rows += rows; c.unmatched_amount += amt; }
+        else                                    { c.other_rows += rows; c.other_amount += amt; }
+        if (r.status === 'created' && r.kind === 'payment')        c.payment_amount += amt;
+        if (r.status === 'created' && r.kind === 'credit_memo')    c.credit_memo_amount += amt;
+      }
+
+      const by_channel = Object.values(channels).sort((a, b) => a.channel.localeCompare(b.channel));
+      const grand = by_channel.reduce((acc, c) => ({
+        pushed_rows: acc.pushed_rows + c.pushed_rows,
+        pushed_amount: acc.pushed_amount + c.pushed_amount,
+        voided_rows: acc.voided_rows + c.voided_rows,
+        voided_amount: acc.voided_amount + c.voided_amount,
+        failed_rows: acc.failed_rows + c.failed_rows,
+        failed_amount: acc.failed_amount + c.failed_amount,
+        needs_saasant_rows: acc.needs_saasant_rows + c.needs_saasant_rows,
+        needs_saasant_amount: acc.needs_saasant_amount + c.needs_saasant_amount,
+        unmatched_rows: acc.unmatched_rows + c.unmatched_rows,
+        unmatched_amount: acc.unmatched_amount + c.unmatched_amount,
+        payment_amount: acc.payment_amount + c.payment_amount,
+        credit_memo_amount: acc.credit_memo_amount + c.credit_memo_amount,
+      }), {
+        pushed_rows: 0, pushed_amount: 0, voided_rows: 0, voided_amount: 0,
+        failed_rows: 0, failed_amount: 0, needs_saasant_rows: 0, needs_saasant_amount: 0,
+        unmatched_rows: 0, unmatched_amount: 0, payment_amount: 0, credit_memo_amount: 0,
+      });
+
+      const dayRow = await db().query(`SELECT ${dayExpr} AS day`);
+      res.json({
+        date: dayRow.rows[0].day,
+        by_channel,
+        grand_total: grand,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── GET /api/consumed-transactions/:ref ──────────────────────────────────
   app.get('/api/consumed-transactions/:ref', requireSecretOrJwt, async (req, res) => {
     try {
