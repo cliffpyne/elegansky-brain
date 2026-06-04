@@ -178,11 +178,28 @@ CREATE INDEX IF NOT EXISTS idx_payment_uploads_status
 
 -- The gate. While a bank_ref is in this table, it CANNOT be in another
 -- active batch. Recall deletes its rows; rerun re-inserts them.
+--
+-- sheet_ts is the bank-statement timestamp of the txn (col B of the sheet,
+-- in UTC). Populated at insert time so "from_last" defaults can be the
+-- latest *sheet-time* of consumed refs — NOT batch-finalized clock time.
+-- This is the semantic Frank wants: pick up exactly where the last
+-- successful upload left off in bank-data time.
 CREATE TABLE IF NOT EXISTS consumed_transactions (
   bank_ref      text          PRIMARY KEY,
   batch_id      uuid          NOT NULL REFERENCES payment_batches(id) ON DELETE CASCADE,
-  consumed_at   timestamptz   NOT NULL DEFAULT now()
+  consumed_at   timestamptz   NOT NULL DEFAULT now(),
+  sheet_ts      timestamptz
 );
+
+-- Safe to re-run.
+DO $$
+BEGIN
+  ALTER TABLE consumed_transactions ADD COLUMN IF NOT EXISTS sheet_ts timestamptz;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_consumed_transactions_sheet_ts
+  ON consumed_transactions (sheet_ts DESC) WHERE sheet_ts IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_consumed_transactions_batch_id
   ON consumed_transactions (batch_id);

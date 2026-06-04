@@ -390,21 +390,37 @@ export function mountPaymentBatchesApi(app, deps) {
     };
 
     try {
-      // Safety net 2: default window = since last finalized batch (- 5min
-      // overlap) to now. Belt-and-suspenders — consumed_transactions catches
-      // duplicates anyway, but this avoids re-running heavy algorithm over
-      // already-processed rows.
+      // Default window = "from latest consumed ref's SHEET-time" (operator
+      // rule from 2026-06-04). NOT batch finalized_at clock time. The
+      // difference matters: if last upload ran at 12:46 EAT but covered
+      // bank txns up to 12:40 EAT, we want to resume at 12:40 EAT, not 12:46.
+      // We add +1 ms so the latest-consumed ref itself stays excluded
+      // (consumed_transactions check would re-filter it, but this keeps
+      // the window math clean).
+      // Fallback chain: sheet_ts MAX → batch finalized_at − 5min → 24h ago.
       let sinceIso = req.body?.since_iso;
       if (!sinceIso) {
-        const last = await db().query(
-          `SELECT finalized_at FROM payment_batches
-            WHERE channel=$1 AND status='finalized' AND finalized_at IS NOT NULL
-            ORDER BY finalized_at DESC LIMIT 1`,
+        const sheetTsRow = await db().query(
+          `SELECT MAX(ct.sheet_ts) AS max_ts
+             FROM consumed_transactions ct
+             JOIN payment_batches pb ON pb.id = ct.batch_id
+            WHERE pb.channel = $1 AND ct.sheet_ts IS NOT NULL
+              AND pb.status IN ('finalized','pending')`,
           [channel],
         );
-        sinceIso = last.rows.length
-          ? new Date(new Date(last.rows[0].finalized_at).getTime() - 5 * 60_000).toISOString()
-          : new Date(Date.now() - 24 * 3600_000).toISOString();
+        if (sheetTsRow.rows[0]?.max_ts) {
+          sinceIso = new Date(new Date(sheetTsRow.rows[0].max_ts).getTime() + 1).toISOString();
+        } else {
+          const last = await db().query(
+            `SELECT finalized_at FROM payment_batches
+              WHERE channel=$1 AND status='finalized' AND finalized_at IS NOT NULL
+              ORDER BY finalized_at DESC LIMIT 1`,
+            [channel],
+          );
+          sinceIso = last.rows.length
+            ? new Date(new Date(last.rows[0].finalized_at).getTime() - 5 * 60_000).toISOString()
+            : new Date(Date.now() - 24 * 3600_000).toISOString();
+        }
       }
       const untilIso = req.body?.until_iso || new Date(Date.now() + 60_000).toISOString();
 
@@ -725,6 +741,62 @@ export function mountPaymentBatchesApi(app, deps) {
       res.type('text/csv').attachment(`arrears-snapshot-${s.as_of}-${s.id.slice(0,8)}.csv`).send(lines.join('\n'));
     } catch (err) {
       res.status(500).type('text/plain').send('error: ' + err.message);
+    }
+  });
+
+  // ── POST /api/admin/backfill-sheet-ts ────────────────────────────────────
+  // One-time backfill: populate sheet_ts on every consumed_transactions row
+  // by cross-referencing the channel sheets. Used after adding the column.
+  app.post('/api/admin/backfill-sheet-ts', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channels = req.body?.channels || Object.keys(CHANNEL_SHEETS);
+      const summary = {};
+      for (const ch of channels) {
+        const cfg = CHANNEL_SHEETS[ch];
+        if (!cfg) { summary[ch] = { error: 'unknown channel' }; continue; }
+        const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
+        const rows = sheetData.values || sheetData.data || [];
+        // ref-without-suffix → sheet ISO string
+        const refToSheetTs = new Map();
+        for (let i = 1; i < rows.length; i++) {
+          const ts = parseTsAny(String(rows[i][1] || '').trim());
+          const ref = String(rows[i][7] || '').trim();
+          if (ts && ref) refToSheetTs.set(ref + suffixOf(ch), ts.toISOString());
+        }
+        // Pull all consumed refs for this channel (with NULL sheet_ts only)
+        const c = await db().query(
+          `SELECT ct.bank_ref FROM consumed_transactions ct
+             JOIN payment_batches pb ON pb.id = ct.batch_id
+            WHERE pb.channel = $1 AND ct.sheet_ts IS NULL`,
+          [ch],
+        );
+        let updated = 0;
+        const BATCH = 1000;
+        for (let i = 0; i < c.rows.length; i += BATCH) {
+          const chunk = c.rows.slice(i, i + BATCH);
+          const cases = [];
+          const refs = [];
+          for (const row of chunk) {
+            const ts = refToSheetTs.get(row.bank_ref);
+            if (!ts) continue;
+            cases.push(`WHEN '${row.bank_ref}' THEN '${ts}'::timestamptz`);
+            refs.push(row.bank_ref);
+          }
+          if (refs.length === 0) continue;
+          await db().query(
+            `UPDATE consumed_transactions
+                SET sheet_ts = CASE bank_ref ${cases.join(' ')} END
+              WHERE bank_ref = ANY($1)`,
+            [refs],
+          );
+          updated += refs.length;
+        }
+        summary[ch] = { scanned: c.rows.length, sheet_rows: rows.length - 1, updated };
+      }
+      res.json({ ok: true, summary });
+    } catch (err) {
+      console.error('[backfill-sheet-ts]', err);
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -1242,9 +1314,17 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
        paid.length, unused.length, `auto-upload`],
     );
     batchId = ins.rows[0].id;
-    const tuples = bankRefs.map((_, i) => `($${i * 2 + 1},$${i * 2 + 2})`).join(',');
-    const vals = []; bankRefs.forEach((r) => { vals.push(r, batchId); });
-    await client.query(`INSERT INTO consumed_transactions (bank_ref, batch_id) VALUES ${tuples}`, vals);
+    // Build ref → sheet-time map so we can populate consumed_transactions.sheet_ts
+    // (operator-mandated 2026-06-04: "from_last" must mean "from latest consumed
+    // ref's sheet-time", not "from last batch's clock time").
+    const refToSheetTs = new Map();
+    for (const t of txnsClean) {
+      const suf = appendSuf(t.transactionId, channel);
+      if (suf && t.receivedTimestamp) refToSheetTs.set(suf, new Date(t.receivedTimestamp).toISOString());
+    }
+    const tuples = bankRefs.map((_, i) => `($${i * 3 + 1},$${i * 3 + 2},$${i * 3 + 3})`).join(',');
+    const vals = []; bankRefs.forEach((r) => { vals.push(r, batchId, refToSheetTs.get(r) || null); });
+    await client.query(`INSERT INTO consumed_transactions (bank_ref, batch_id, sheet_ts) VALUES ${tuples}`, vals);
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
