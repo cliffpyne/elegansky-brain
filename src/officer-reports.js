@@ -669,6 +669,8 @@ const EXCLUDED_OFFICER_NAMES = new Set([
   'SULEIMAN LUMBWE BODA',
   'DANIEL MTERA RHOBI',
   'HYUVIN RICHARD I BLOCKED',
+  'RACHEAL MNZAVAS IPHONE',
+  'ZAHARA IPHONE',
 ]);
 function isExcluded(name) {
   return EXCLUDED_OFFICER_NAMES.has(String(name || '').trim().toUpperCase());
