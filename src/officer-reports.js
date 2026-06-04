@@ -21,6 +21,12 @@
 
 import { db } from './db/pool.js';
 import { qbQuery } from './qb-client.js';
+import { readSheet } from './sheets.js';
+
+// Frank's tracker sheet (OFFICE / POLICE / TRACKER tabs).
+// Override with env OFFICER_TRACKER_SHEET_ID if it ever moves.
+const TRACKER_SHEET_ID = process.env.OFFICER_TRACKER_SHEET_ID
+  || '1wrM7E9qGKcWJvN4mBwYMpkgp31jlxPGgEYCDsHn0bkc';
 
 // ── Lazy schema (Render has no migration runner — apply on first use) ──────
 const SCHEMA_DDL = `
@@ -193,6 +199,175 @@ export async function rebuildCustomerOfficerMap() {
   };
 }
 
+// ── Phase 2 — OFFICE/POLICE sheet ingestion ─────────────────────────────────
+
+/**
+ * Read one tab (OFFICE or POLICE) from Frank's tracker sheet.
+ * Returns [{ rider_name, plate }] for every data row.
+ */
+async function readOfflineTab(source) {
+  const data = await readSheet(TRACKER_SHEET_ID, `${source}!A1:B5000`);
+  const rows = data.values || [];
+  // Skip header row (CUSTOMER NAME, PLATE NUMBER).
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const name = String(r[0] || '').trim();
+    const plate = String(r[1] || '').trim().toUpperCase();
+    if (!name && !plate) continue; // blank row
+    out.push({ rider_name: name, plate });
+  }
+  return out;
+}
+
+/**
+ * Resolve a list of plates to (customer_id, officer_id) via customer_officer_map.
+ * Matches customer_name ILIKE '%PLATE%' (QB names follow "PLATE=NAME" pattern).
+ * Returns Map<plate, { customer_id, officer_id, officer_name } | null>.
+ */
+async function resolvePlatesToOfficers(plates) {
+  const unique = [...new Set(plates.filter(Boolean))];
+  if (!unique.length) return new Map();
+
+  // One big query: for every plate, find the customer whose name contains it.
+  // We use a CASE statement to attach the plate as label, then GROUP to dedupe.
+  const params = [];
+  const cases = unique.map((p, i) => {
+    params.push('%' + p + '%');
+    return `WHEN customer_name ILIKE $${i + 1} THEN $${i + 1}`;
+  }).join(' ');
+  const orClauses = unique.map((_, i) => `customer_name ILIKE $${i + 1}`).join(' OR ');
+
+  const sql = `
+    SELECT
+      customer_id, customer_name, officer_id, officer_name,
+      (CASE ${cases} END) AS matched_pattern
+    FROM customer_officer_map
+    WHERE ${orClauses}
+  `;
+  const r = await db().query(sql, params);
+
+  // matched_pattern is '%PLATE%' — strip the %s back to the plate.
+  const out = new Map();
+  for (const row of r.rows) {
+    const plate = String(row.matched_pattern || '').replace(/^%|%$/g, '');
+    // First match wins (ties unlikely; plates are 8 chars unique).
+    if (!out.has(plate)) {
+      out.set(plate, {
+        customer_id: row.customer_id,
+        customer_name: row.customer_name,
+        officer_id: row.officer_id,
+        officer_name: row.officer_name,
+      });
+    }
+  }
+  // Plates with no match → set null so caller knows they're unresolved.
+  for (const p of unique) if (!out.has(p)) out.set(p, null);
+  return out;
+}
+
+/**
+ * Pull OFFICE and POLICE for a given date (default: today EAT).
+ * Replaces any prior snapshot for that date. Returns counts.
+ */
+export async function refreshOfflineMotos(snapshotDate = null) {
+  await ensureSchema();
+  const date = snapshotDate || todayEatDate();
+
+  const [officeRows, policeRows] = await Promise.all([
+    readOfflineTab('OFFICE'),
+    readOfflineTab('POLICE'),
+  ]);
+
+  const allPlates = [...officeRows, ...policeRows].map((r) => r.plate).filter(Boolean);
+  const resolved = await resolvePlatesToOfficers(allPlates);
+
+  const rows = [];
+  for (const r of officeRows) {
+    const m = r.plate ? resolved.get(r.plate) : null;
+    rows.push(['OFFICE', r.rider_name, r.plate || null, m?.customer_id || null, m?.officer_id || null, m?.officer_name || null]);
+  }
+  for (const r of policeRows) {
+    const m = r.plate ? resolved.get(r.plate) : null;
+    rows.push(['POLICE', r.rider_name, r.plate || null, m?.customer_id || null, m?.officer_id || null, m?.officer_name || null]);
+  }
+
+  const client = await db().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM officer_offline_motos WHERE snapshot_date = $1', [date]);
+    const CHUNK = 200;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const slice = rows.slice(i, i + CHUNK);
+      const values = slice.map((_, j) => {
+        const b = j * 6;
+        return `($1, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7})`;
+      }).join(',');
+      const params = [date, ...slice.flat()];
+      await client.query(
+        `INSERT INTO officer_offline_motos
+           (snapshot_date, source, rider_name, plate, customer_id, officer_id, officer_name)
+         VALUES ${values}`,
+        params,
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  // Stats
+  const office_count = officeRows.length;
+  const police_count = policeRows.length;
+  const unresolved_office = officeRows.filter((r) => !r.plate || resolved.get(r.plate) == null).length;
+  const unresolved_police = policeRows.filter((r) => !r.plate || resolved.get(r.plate) == null).length;
+  return {
+    snapshot_date: date,
+    office_count,
+    police_count,
+    total: office_count + police_count,
+    unresolved_office,
+    unresolved_police,
+  };
+}
+
+/**
+ * Per-officer offline counts for a given date.
+ * Used by the report endpoint to compute open = invoice_total − count × 12000.
+ */
+export async function getOfficerOfflineCounts(snapshotDate) {
+  const r = await db().query(
+    `SELECT officer_id, officer_name,
+            COUNT(*) FILTER (WHERE source='OFFICE') AS office_count,
+            COUNT(*) FILTER (WHERE source='POLICE') AS police_count
+       FROM officer_offline_motos
+      WHERE snapshot_date = $1 AND officer_id IS NOT NULL
+      GROUP BY officer_id, officer_name`,
+    [snapshotDate],
+  );
+  const map = new Map();
+  for (const x of r.rows) {
+    map.set(x.officer_id, {
+      officer_id: x.officer_id,
+      officer_name: x.officer_name,
+      office_count: Number(x.office_count),
+      police_count: Number(x.police_count),
+      offline_total: Number(x.office_count) + Number(x.police_count),
+    });
+  }
+  return map;
+}
+
+function todayEatDate() {
+  // Africa/Dar_es_Salaam is UTC+3 (no DST). Use UTC arithmetic.
+  const now = new Date();
+  const eat = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  return eat.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
 // ── HTTP mount ──────────────────────────────────────────────────────────────
 
 export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
@@ -229,6 +404,47 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
           officer_name: x.officer_name,
           rider_count: Number(x.rider_count),
         })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/officer-reports/refresh-offline-motos
+  // Reads OFFICE + POLICE tabs, resolves plates → officers, persists for the
+  // given snapshot_date (defaults to today EAT). Replaces prior snapshot for
+  // that date. Should be invoked once each morning (cron) and again whenever
+  // operations changes the sheet.
+  app.post('/api/officer-reports/refresh-offline-motos', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = req.body?.snapshot_date || null;
+      const t0 = Date.now();
+      const stats = await refreshOfflineMotos(date);
+      res.json({ ok: true, took_ms: Date.now() - t0, ...stats });
+    } catch (err) {
+      console.error('[officer-reports] refresh-offline-motos failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/officer-reports/offline-motos?date=YYYY-MM-DD
+  // Returns per-officer office+police counts for a given day.
+  app.get('/api/officer-reports/offline-motos', requireSecretOrJwt, async (req, res) => {
+    try {
+      await ensureSchema();
+      const date = String(req.query.date || todayEatDate());
+      const map = await getOfficerOfflineCounts(date);
+      const rows = [...map.values()].sort((a, b) => b.offline_total - a.offline_total);
+      const unresolved = await db().query(
+        `SELECT source, rider_name, plate FROM officer_offline_motos
+          WHERE snapshot_date = $1 AND officer_id IS NULL
+          ORDER BY source, rider_name`,
+        [date],
+      );
+      res.json({
+        snapshot_date: date,
+        per_officer: rows,
+        unresolved: unresolved.rows,
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
