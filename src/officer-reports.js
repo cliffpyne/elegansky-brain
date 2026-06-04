@@ -451,6 +451,22 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // GET /api/officer-reports/qb-find?q=MC198EWK — debug: live QB Customer search
+  app.get('/api/officer-reports/qb-find', requireSecretOrJwt, async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim();
+      if (!q) return res.status(400).json({ error: 'q required' });
+      const escaped = q.replace(/'/g, "''");
+      const sql = `SELECT Id, DisplayName, FullyQualifiedName, ParentRef, Level, Active ` +
+                  `FROM Customer WHERE DisplayName LIKE '%${escaped}%' MAXRESULTS 10`;
+      const r = await qbQuery(sql);
+      res.json({
+        query: sql,
+        rows: r.QueryResponse?.Customer || [],
+      });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
   // GET /api/officer-reports/customer/:id — debug: who does this customer roll up to?
   app.get('/api/officer-reports/customer/:id', requireSecretOrJwt, async (req, res) => {
     try {
