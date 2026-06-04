@@ -518,6 +518,128 @@ export async function getOfficerInvoiceTotals(snapshotDate) {
   return map;
 }
 
+// ── Phase 4 — the report ────────────────────────────────────────────────────
+
+const FEE_PER_MOTO = 12_000; // TZS per OFFICE/POLICE motorcycle (Frank's spec)
+const GOOD_THRESHOLD_PCT = 81;
+
+/**
+ * Compute, for one date, the full officer-collections report:
+ *   open       = invoice_total − offline_count × 12,000
+ *   collection = today's payments for officer's riders (from payment_uploads)
+ *   dueopen    = open − collection
+ *   percent    = collection / open × 100  (color band)
+ *
+ * Reads three already-populated tables:
+ *   - officer_invoice_snapshots  (Phase 3 — refresh in cron + on demand)
+ *   - officer_offline_motos      (Phase 2 — refresh each morning + on demand)
+ *   - payment_uploads + customer_officer_map (Phase 1) for collections — live join
+ */
+export async function computeOfficerReport(date) {
+  await ensureSchema();
+
+  // Today's collections per officer, joined live from payment_uploads.
+  const collectionsRes = await db().query(
+    `SELECT m.officer_id, m.officer_name,
+            COALESCE(SUM(pu.amount), 0) AS collection,
+            COUNT(*) AS payment_count
+       FROM payment_uploads pu
+       JOIN customer_officer_map m ON m.customer_id = pu.customer_id
+       JOIN payment_batches pb ON pb.id = pu.batch_id
+      WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+        AND pu.status = 'created'
+      GROUP BY m.officer_id, m.officer_name`,
+    [date],
+  );
+  const collections = new Map();
+  for (const r of collectionsRes.rows) {
+    collections.set(r.officer_id, {
+      collection: Number(r.collection),
+      payment_count: Number(r.payment_count),
+    });
+  }
+
+  const invoiceTotals = await getOfficerInvoiceTotals(date);
+  const offlineCounts = await getOfficerOfflineCounts(date);
+
+  // Union of officer ids across the three sources.
+  const officerIds = new Set([
+    ...invoiceTotals.keys(),
+    ...offlineCounts.keys(),
+    ...collections.keys(),
+  ]);
+
+  const rows = [];
+  for (const id of officerIds) {
+    const inv = invoiceTotals.get(id);
+    const off = offlineCounts.get(id);
+    const col = collections.get(id);
+    const name = inv?.officer_name || off?.officer_name || 'Unknown';
+
+    const total_invoice_amount = inv?.total_invoice_amount || 0;
+    const offline_count = off?.offline_total || 0;
+    const open = Math.max(0, total_invoice_amount - offline_count * FEE_PER_MOTO);
+    const collection = col?.collection || 0;
+    const dueopen = open - collection;
+    const percent = open > 0 ? (collection / open) * 100 : null;
+    const status = percent == null ? 'no_invoices' :
+                   percent >= GOOD_THRESHOLD_PCT ? 'good' : 'bad';
+
+    rows.push({
+      officer_id: id,
+      officer_name: name,
+      total_invoice_amount,
+      open_invoice_count: inv?.open_invoice_count || 0,
+      office_count: off?.office_count || 0,
+      police_count: off?.police_count || 0,
+      offline_count,
+      offline_adjustment: offline_count * FEE_PER_MOTO,
+      open,
+      collection,
+      payment_count: col?.payment_count || 0,
+      dueopen,
+      percent: percent == null ? null : Math.round(percent * 100) / 100,
+      status,
+    });
+  }
+
+  rows.sort((a, b) => b.total_invoice_amount - a.total_invoice_amount);
+
+  // Grand totals.
+  const grand = rows.reduce((acc, r) => ({
+    total_invoice_amount: acc.total_invoice_amount + r.total_invoice_amount,
+    offline_count: acc.offline_count + r.offline_count,
+    offline_adjustment: acc.offline_adjustment + r.offline_adjustment,
+    open: acc.open + r.open,
+    collection: acc.collection + r.collection,
+    dueopen: acc.dueopen + r.dueopen,
+  }), { total_invoice_amount: 0, offline_count: 0, offline_adjustment: 0,
+        open: 0, collection: 0, dueopen: 0 });
+  grand.percent = grand.open > 0 ? Math.round((grand.collection / grand.open) * 10000) / 100 : null;
+  grand.status = grand.percent == null ? 'no_invoices' :
+                 grand.percent >= GOOD_THRESHOLD_PCT ? 'good' : 'bad';
+
+  // Cache freshness — when were the invoice totals last pulled?
+  const cacheRes = await db().query(
+    `SELECT MAX(cached_at) AS last FROM officer_invoice_snapshots WHERE snapshot_date = $1`,
+    [date],
+  );
+  const offlineCacheRes = await db().query(
+    `SELECT MAX(cached_at) AS last FROM officer_offline_motos WHERE snapshot_date = $1`,
+    [date],
+  );
+
+  return {
+    date,
+    per_officer: rows,
+    grand_total: grand,
+    fresh: {
+      invoice_totals_pulled_at: cacheRes.rows[0]?.last || null,
+      offline_motos_pulled_at: offlineCacheRes.rows[0]?.last || null,
+    },
+  };
+}
+
 function todayEatDate() {
   // Africa/Dar_es_Salaam is UTC+3 (no DST). Use UTC arithmetic.
   const now = new Date();
@@ -630,6 +752,21 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
       const rows = [...map.values()].sort((a, b) => b.total_invoice_amount - a.total_invoice_amount);
       res.json({ snapshot_date: date, per_officer: rows });
     } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/officer-reports/today?date=YYYY-MM-DD — THE report
+  // Combines Phases 2 + 3 + live payment_uploads collection sum into the
+  // per-officer { open, collection, dueopen, percent, status } breakdown.
+  // Returns immediately from cached snapshots — never blocks on QB.
+  app.get('/api/officer-reports/today', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.query.date || todayEatDate());
+      const report = await computeOfficerReport(date);
+      res.json(report);
+    } catch (err) {
+      console.error('[officer-reports] today failed:', err);
       res.status(500).json({ error: err.message });
     }
   });
