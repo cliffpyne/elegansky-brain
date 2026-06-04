@@ -145,7 +145,7 @@ export function OfficerReportsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Officer</TableHead>
-                <TableHead className="text-right">Today inv</TableHead>
+                <TableHead className="text-right font-bold">Invoices (count)</TableHead>
                 <TableHead className="text-right">Office</TableHead>
                 <TableHead className="text-right">Police</TableHead>
                 <TableHead className="text-right">Invoice total</TableHead>
@@ -161,7 +161,7 @@ export function OfficerReportsPage() {
               {rows.map((r) => (
                 <TableRow key={r.officer_id}>
                   <TableCell className="font-medium">{r.officer_name}</TableCell>
-                  <TableCell className="text-right">{fmt(r.open_invoice_count)}</TableCell>
+                  <TableCell className="text-right font-semibold">{fmt(r.open_invoice_count)}</TableCell>
                   <TableCell className="text-right">{fmt(r.office_count)}</TableCell>
                   <TableCell className="text-right">{fmt(r.police_count)}</TableCell>
                   <TableCell className="text-right">{fmt(r.total_invoice_amount)}</TableCell>
@@ -178,9 +178,9 @@ export function OfficerReportsPage() {
               {grand && (
                 <TableRow className="font-bold bg-muted/40">
                   <TableCell>GRAND TOTAL</TableCell>
-                  <TableCell />
-                  <TableCell />
-                  <TableCell />
+                  <TableCell className="text-right">{fmt(rows.reduce((a, r) => a + r.open_invoice_count, 0))}</TableCell>
+                  <TableCell className="text-right">{fmt(grand.offline_count - rows.reduce((a, r) => a + r.police_count, 0))}</TableCell>
+                  <TableCell className="text-right">{fmt(rows.reduce((a, r) => a + r.police_count, 0))}</TableCell>
                   <TableCell className="text-right">{fmt(grand.total_invoice_amount)}</TableCell>
                   <TableCell className="text-right">−{fmt(grand.offline_adjustment)}</TableCell>
                   <TableCell className="text-right">{fmt(grand.open)}</TableCell>
