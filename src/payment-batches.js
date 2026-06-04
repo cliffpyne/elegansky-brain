@@ -40,6 +40,7 @@ export function mountPaymentBatchesApi(app, deps) {
     qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
     qbBatchLookupCustomers,
     qbCreateCreditMemo,  // kept only for backwards-compat callers; do not use for new work
+    qbPreflightDedup,    // strict (customer, ref) dedup against live QB Payment + CreditMemo
     qbVoid, ensureQbConnected,
   } = deps;
 
@@ -1262,7 +1263,10 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
     };
   }
 
-  // 2. Filter out already-consumed refs.
+  // 2. Filter out refs already in OUR DB:
+  //    a) consumed_transactions — refs from any prior BRAIN batch
+  //    b) external_consumed_refs — refs we've seen in QB via a non-BRAIN
+  //       path (SaasAnt etc.), surfaced by previous QB pre-flights
   const allRefs = txns.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
   const forbidden = new Set();
   const CH = 5000;
@@ -1270,6 +1274,8 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
     const chunk = allRefs.slice(i, i + CH);
     const ec = await db().query(`SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1)`, [chunk]);
     ec.rows.forEach((r) => forbidden.add(r.bank_ref));
+    const ext = await db().query(`SELECT bank_ref FROM external_consumed_refs WHERE bank_ref = ANY($1)`, [chunk]);
+    ext.rows.forEach((r) => forbidden.add(r.bank_ref));
   }
   const txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
   if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
@@ -1295,8 +1301,90 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
 
   // 4. Algorithm
   const result = processInvoicePayments(invoices, txnsClean);
-  const paid = result.filter((p) => !p.isUnused && p.amount > 0);
-  const unused = result.filter((p) => p.isUnused);
+  let paid = result.filter((p) => !p.isUnused && p.amount > 0);
+  let unused = result.filter((p) => p.isUnused);
+
+  // 4b. STRICT QB pre-flight dedup. Operator rule 2026-06-04: we must
+  // never push a (customer, ref) combo that already exists as a Payment
+  // OR CreditMemo in QB — regardless of how it got there (SaasAnt, manual,
+  // legacy BRAIN run before consumed_transactions existed, etc.).
+  //
+  // Fail-mode: if the QB query itself errors persistently, we SMS the
+  // operator and proceed WITHOUT the check (better than blocking a
+  // legitimate upload). Local consumed_transactions is still the
+  // primary guard.
+  if (qbPreflightDedup && paid.length + unused.length > 0) {
+    // Collect (customerId, ref) tuples we're about to push.
+    // For paid rows: each has customerId from the IP algorithm.
+    // For unused rows: customerId may be absent (gets looked up later in
+    // runAutoUploadBackground). For now we only check the ones we KNOW
+    // the customer for — that's the IP-algorithm-matched ones.
+    const tuples = [];
+    for (const p of paid) {
+      if (p.customerId && p.memoWithSuffix) {
+        tuples.push({ customerId: String(p.customerId), ref: p.memoWithSuffix });
+      }
+    }
+    for (const u of unused) {
+      if (u.customerId && u.memoWithSuffix) {
+        tuples.push({ customerId: String(u.customerId), ref: u.memoWithSuffix });
+      }
+    }
+
+    if (tuples.length > 0) {
+      let preflight;
+      try {
+        preflight = await qbPreflightDedup({ tuples });
+      } catch (err) {
+        // Fail open — proceed without check, alert operator.
+        console.error('[auto-upload] QB pre-flight dedup FAILED — proceeding without check:', err.message);
+        try {
+          await db().query(
+            `INSERT INTO notifications (message, severity, source) VALUES ($1, 'warning', 'auto-upload')`,
+            [`QB pre-flight check failed for channel=${channel}. Pushed ${paid.length} paid + ${unused.length} unused WITHOUT cross-checking QB. Manual verification recommended. Error: ${String(err.message || err).slice(0, 200)}`],
+          );
+        } catch { /* notify enqueue must not crash the pipeline */ }
+        preflight = { duplicateKeys: new Set(), detail: [] };
+      }
+
+      if (preflight.duplicateKeys.size > 0) {
+        // Persist what we found so a future batch's step 2 catches them fast.
+        for (const d of preflight.detail) {
+          await db().query(
+            `INSERT INTO external_consumed_refs (bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, found_by)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (bank_ref, customer_id) DO NOTHING`,
+            [d.ref, d.customerId, d.qb_id, d.qb_kind, d.qb_txn_date || null, `auto-upload-${channel}`],
+          );
+        }
+
+        // Filter paid + unused to drop the duplicates.
+        const keep = (r) => {
+          if (!r.customerId || !r.memoWithSuffix) return true;
+          return !preflight.duplicateKeys.has(String(r.customerId) + '|' + r.memoWithSuffix);
+        };
+        const droppedPaid = paid.length;
+        const droppedUnused = unused.length;
+        paid = paid.filter(keep);
+        unused = unused.filter(keep);
+        console.log(
+          `[auto-upload] QB pre-flight: dropped ${droppedPaid - paid.length} paid + ` +
+          `${droppedUnused - unused.length} unused (already in QB). ` +
+          `${preflight.detail.length} (customer, ref) combos surfaced; logged to external_consumed_refs.`,
+        );
+
+        if (preflight.detail.length > 0) {
+          try {
+            await db().query(
+              `INSERT INTO notifications (message, severity, source) VALUES ($1, 'info', 'auto-upload')`,
+              [`QB pre-flight on channel=${channel} caught ${preflight.detail.length} (customer, ref) combos already in QB — skipped from push, locked in external_consumed_refs.`],
+            );
+          } catch { /* nbd */ }
+        }
+      }
+    }
+  }
+
   const sumPaid = paid.reduce((s, p) => s + p.amount, 0);
   const sumUnused = unused.reduce((s, p) => s + (p.transactionAmount || 0), 0);
   const sheetSum = txnsClean.reduce((s, t) => s + (t.amount || 0), 0);

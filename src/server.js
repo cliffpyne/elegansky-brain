@@ -358,6 +358,93 @@ async function qbBatchCreateUnappliedPayments(items) {
   });
 }
 
+/**
+ * QB pre-flight dedup: given a list of (customerId, bankRefWithSuffix) tuples
+ * we're about to push, ask QB which (customerId, PrivateNote) combinations
+ * already exist as a Payment or CreditMemo. Returns a Set of "<custId>|<ref>"
+ * strings that the caller MUST exclude from the push.
+ *
+ * Design constraints discovered via live-API tests on 2026-06-04:
+ *   - QBO's PrivateNote field is NOT directly queryable
+ *     ("property 'PrivateNote' is not queryable", error 4001).
+ *     We can't SELECT WHERE PrivateNote = 'X'. So instead:
+ *   - CustomerRef IS queryable (with IN(...) clauses, tested up to 50 ids).
+ *   - We fetch all Payments+CreditMemos for these customers in the
+ *     relevant date window, then check PrivateNote LOCALLY against our
+ *     pending refs.
+ *   - Pagination: STARTPOSITION + MAXRESULTS works. We loop until a page
+ *     returns fewer than MAXRESULTS rows.
+ *   - Voided Payments don't appear in queries — fewer false positives.
+ *
+ * sinceTxnDate: the earliest TxnDate we want QB to return. Should be far
+ * enough back to cover any plausible historical duplicate. Default is
+ * 60 days, which is far longer than any realistic bank-statement window.
+ *
+ * Failure mode: throws on persistent QB errors. Caller decides whether to
+ * fail open (push anyway + alert) or fail closed (block batch). We
+ * recommend failing OPEN with an SMS to the operator — losing dedup for
+ * one batch is far less harmful than blocking legitimate uploads.
+ */
+async function qbPreflightDedup({ tuples, sinceTxnDate }) {
+  // tuples: [{ customerId: '8334', ref: '101AGD…N' }, …]
+  // Group refs by customerId so we can ask QB per-customer
+  const byCust = new Map();
+  for (const t of tuples) {
+    if (!t.customerId || !t.ref) continue;
+    if (!byCust.has(t.customerId)) byCust.set(t.customerId, new Set());
+    byCust.get(t.customerId).add(t.ref);
+  }
+  if (byCust.size === 0) return { duplicateKeys: new Set(), detail: [] };
+
+  const customerIds = [...byCust.keys()];
+  const sinceISO = sinceTxnDate || (() => {
+    const d = new Date(); d.setUTCDate(d.getUTCDate() - 60);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  const duplicateKeys = new Set();   // "<custId>|<ref>"
+  const detail = [];                  // [{ customerId, ref, qb_id, qb_kind, qb_txn_date }]
+
+  // Query Payment + CreditMemo for each chunk of ≤50 customers
+  const CHUNK = 50;
+  for (let i = 0; i < customerIds.length; i += CHUNK) {
+    const chunk = customerIds.slice(i, i + CHUNK);
+    const inList = chunk.map((id) => "'" + String(id).replace(/'/g, "''") + "'").join(',');
+
+    for (const entity of ['Payment', 'CreditMemo']) {
+      let start = 1;
+      while (true) {
+        const sql = `SELECT Id, PrivateNote, CustomerRef, TxnDate FROM ${entity} ` +
+                    `WHERE CustomerRef IN (${inList}) AND TxnDate >= '${sinceISO}' ` +
+                    `STARTPOSITION ${start} MAXRESULTS 1000`;
+        const j = await qbQuery(sql);
+        const items = j.QueryResponse?.[entity] || [];
+        for (const x of items) {
+          const pn = x.PrivateNote;
+          if (!pn) continue;
+          const cid = x.CustomerRef?.value;
+          if (!cid) continue;
+          const refsForThisCust = byCust.get(cid);
+          if (!refsForThisCust || !refsForThisCust.has(pn)) continue;
+          const key = `${cid}|${pn}`;
+          if (duplicateKeys.has(key)) continue;
+          duplicateKeys.add(key);
+          detail.push({
+            customerId: cid,
+            ref: pn,
+            qb_id: x.Id,
+            qb_kind: entity === 'Payment' ? 'payment' : 'credit_memo',
+            qb_txn_date: x.TxnDate,
+          });
+        }
+        if (items.length < 1000) break;
+        start += 1000;
+      }
+    }
+  }
+  return { duplicateKeys, detail };
+}
+
 /** Batched QB Customer lookup by DisplayName. Returns name → customerId map. */
 async function qbBatchLookupCustomers(displayNames) {
   const out = {};
@@ -438,6 +525,7 @@ mountPaymentBatchesApi(app, {
   qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
   qbBatchLookupCustomers,
   qbCreateCreditMemo,
+  qbPreflightDedup,
   qbVoid, ensureQbConnected,
 });
 

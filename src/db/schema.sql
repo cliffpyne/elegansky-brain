@@ -345,6 +345,35 @@ EXCEPTION WHEN OTHERS THEN
   NULL;
 END $$;
 
+-- External-consumed refs ledger.
+-- Catches refs that were pushed to QB via a path OTHER than BRAIN
+-- (SaasAnt, manual web UI, sister tool, prior BRAIN incarnation whose
+-- consumed_transactions got cleared). Populated by the QB pre-flight
+-- check (see preflightQbDedup in payment-batches.js). Once a ref is
+-- here, BRAIN never tries to push it again — same role as
+-- consumed_transactions but for refs that landed in QB outside our
+-- workflow.
+--
+-- Key on (bank_ref, customer_id) because a misrouted SaasAnt push for
+-- customer A doesn't preclude a legitimate BRAIN push for customer B
+-- with the same ref (very unlikely in practice, but the schema doesn't
+-- need to assume).
+CREATE TABLE IF NOT EXISTS external_consumed_refs (
+  bank_ref      text          NOT NULL,
+  customer_id   text          NOT NULL,
+  qb_id         text          NOT NULL,
+  qb_kind       text          NOT NULL CHECK (qb_kind IN ('payment','credit_memo')),
+  qb_txn_date   date,
+  found_at      timestamptz   NOT NULL DEFAULT now(),
+  found_by      text,                                   -- which batch's pre-flight surfaced it
+  PRIMARY KEY (bank_ref, customer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_consumed_refs_ref
+  ON external_consumed_refs (bank_ref);
+CREATE INDEX IF NOT EXISTS idx_external_consumed_refs_found_at
+  ON external_consumed_refs (found_at DESC);
+
 -- Duplicate-customer ledger. Grows over time as Claude (or Frank)
 -- identifies QB customer records that are duplicates of each other.
 -- The matcher in src/runner/match-customers.js consults this table
