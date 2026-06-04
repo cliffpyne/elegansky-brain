@@ -671,9 +671,16 @@ const EXCLUDED_OFFICER_NAMES = new Set([
   'HYUVIN RICHARD I BLOCKED',
   'RACHEAL MNZAVAS IPHONE',
   'ZAHARA IPHONE',
+  'IGROUP COMPANY LIMITED',
+  'MUTESI SANGABO',
+  'MUTESI IPHONE BLOCKED',
+  'CAROLINE E MATHEW',
 ]);
 function isExcluded(name) {
-  return EXCLUDED_OFFICER_NAMES.has(String(name || '').trim().toUpperCase());
+  // Collapse runs of whitespace so "MUTESI  IPHONE BLOCKED" (double space)
+  // matches "MUTESI IPHONE BLOCKED".
+  const norm = String(name || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  return EXCLUDED_OFFICER_NAMES.has(norm);
 }
 
 /**
