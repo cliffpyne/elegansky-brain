@@ -33,16 +33,50 @@ hard-won real-world testing. **You have no opinion on:**
 - Split-across-multi-invoice logic
 - Whether to favour due-soonest vs largest invoice (it's neither — newest)
 
-The algorithm:
-1. **Customer match:** exact `Customer.DisplayName` lookup in QB. Tiebreak: prefer
-   `Active=true`, then prefer `Balance > 0` (i.e. owes money).
-2. **Invoice pool:** all Open invoices for that customer where
-   `Invoice.TxnDate <= AS_OF` (see AS_OF RULE below).
-3. **Allocate:** sort invoices by TxnDate DESC. Take the payment amount and apply
-   to the newest first; overflow cascades to next-newest. If amount > total open
-   balance, the remainder becomes an **unapplied Payment** (customer credit).
-4. **No multi-plate guessing.** If the bank ref mentions a plate that doesn't match
+The algorithm (verbatim from `processInvoicePayments` in `src/payment-batches.js`):
+1. **Index invoices by customer key**: `key = inv.customerPhone || inv.customerName.toLowerCase().trim()`.
+   `customerPhone` comes from `extractPhone(arrears.customer)` — pulls a 10+ digit
+   number from the customer full path. Most arrears have no phone → key falls back
+   to `customerLeaf.toLowerCase()`. Sort each customer's bucket by `invoiceDate DESC`
+   (newest first), tiebreak by invoiceNumber DESC.
+2. **Match txns to customers**: try keys in order `[t.customerPhone, t.contractName, t.customerName]`
+   (all lowercased+trimmed). First key that finds a bucket wins.
+3. **Allocate FIFO-newest-first**: walk each customer's invoices in sorted order,
+   pay each invoice down to ≤ 1 TZS, advance to next. Overflow on the last txn
+   gets added to the first allocation's `amount`.
+4. **Unused** = txns whose key didn't match ANY customer bucket OR whose customer
+   had no remaining balance. These split THREE WAYS (see "Three-way split" below).
+5. **No multi-plate guessing.** If the bank ref mentions a plate that doesn't match
    the customer, do not silently re-route. Flag for review.
+
+## The three-way split for processed txns (operator rule)
+
+After the algorithm runs you have two raw buckets — paid + unused — but you must
+push them THREE different ways:
+
+```
+┌─ paid (matched customer + matched invoice) ─────────────────────────────
+│   → QB Payment with LinkedTxn (invoice marked paid down)
+│   → DepositToAccountRef: 785 (Kijichi Collection AC)
+│   → TxnDate: per the tick's identity (see TxnDate rule)
+│
+├─ unused, customer EXISTS in QB (DisplayName lookup succeeds) ──────────
+│   → QB Payment WITHOUT LinkedTxn (becomes unapplied credit on customer)
+│   → DepositToAccountRef: 785
+│   → TxnDate: same as paid in this batch
+│
+└─ unused, customer NOT in QB (DisplayName lookup returns nothing) ──────
+    → Write to NEEDS_SAASANT CSV at /home/clifforddennis/Downloads/
+      Frank reviews + manually pushes via SaasAnt
+    → NEVER auto-push these to QB — wrong customer or new customer needing
+      manual onboarding
+```
+
+**Important:** Use **Payment without LinkedTxn**, NOT `qbCreateCreditMemo`, for the
+"customer exists but no arrears" case. The old BRAIN auto-upload pipeline used
+CreditMemo — that's deprecated per Frank's rule and the upload_04jun_*.mjs flow.
+A Payment-no-LinkedTxn appears as an unapplied credit on the customer's tab, exactly
+what the operator wants.
 
 ## The AS_OF rule (the rule I broke TWICE, on 2026-06-03)
 
@@ -193,17 +227,104 @@ nonsensical. **You do not need to fix IP.** Just know:
 - `app_settings` — kv store
 - `arrears_snapshots` — frozen `/arrears` outputs for audit
 
+## Sheet column-layout gotchas
+
+- **NMB sheet** col B (timestamp) and **CRDB sheet** col B both use format
+  `DD.MM.YYYY HH:MM:SS`, but CRDB has a **leading space** sometimes (` DD.MM…`).
+  Always `.trim()` before regex-matching.
+- Col A is an ID counter that doesn't increment by 1 per row — there are gaps and
+  out-of-order entries. Compute `nextId = max(col A) + 1` from the whole tab when
+  appending; don't assume.
+- Sheet row 1 is header.
+- Each sheet has 8 functional columns A–H even when the tab declares 38.
+
 ## How a session of YOU runs
 
 1. **Wake up** — Cron fires HTTP POST to BRAIN's `/api/agent/run-upload` with a
    trigger context (which window, which channel, AS_OF).
 2. **Load context** — BRAIN passes you: this doc, your last 5 session summaries
    from DB, today's SMS thread.
-3. **Plan** — write a 1-line plan to the DB log + (if anomaly suspected) SMS Frank.
-4. **Execute** — call tools: `sheet_read`, `qb_query`, `qb_batch_push`,
+3. **Limbo-batch sweep** — run the recovery query above. Auto-rollback anything
+   older than 15 min in `status='pending'` with zero uploads.
+4. **Plan** — write a 1-line plan to the DB log + (if anomaly suspected) SMS Frank.
+5. **Execute** — call tools: `sheet_read`, `qb_query`, `qb_batch_push`,
    `db_log`, `sms_notify`.
-5. **Reconcile** — sum sheet-drag = paid + unused. If mismatch, STOP and SMS Frank.
-6. **Summarise** — write final summary to DB log. SMS one-line to Frank.
+6. **Reconcile** — sum sheet-drag = paid + unused-to-QB + unused-to-SaasAnt-CSV.
+   If mismatch, STOP and SMS Frank.
+7. **Summarise** — write final summary to DB log. SMS one-line to Frank with
+   the three-way split totals.
+
+## Dedup — three layers, all required
+
+The sheet, the DB, and the PDF source can each contain the same `bank_ref`
+multiple times. Dedup at EACH layer or you'll double-push.
+
+1. **Intra-window dedup** (sheet-internal). The operator sometimes moves rows
+   around the sheet and re-dates them — same `ref` can show up 2× in your window.
+   After loading rows, dedup by `ref + channel-suffix` keeping FIRST occurrence.
+   Reconciliation will then match the operator's expected total.
+
+2. **Cross-window dedup** (`consumed_transactions` table). Before pushing, query
+   `WHERE bank_ref = ANY(yourRefs)` and exclude anything already locked. This is
+   the database UNIQUE-constraint backed safety net.
+
+3. **PDF→sheet ingestion dedup** (FOUR tabs). When ingesting a bank PDF into
+   the sheet, check ALL FOUR tabs before appending: `PASSED`, `FAILED_NMB`,
+   `PASSED_SAV_NMB`, `ILIYOPATA NMB`. The operator manages multiple parallel
+   tabs of consumed data — a ref in any of them is "seen", do not re-append.
+
+## PDF→sheet ingestion (when USSD is banned)
+
+When Frank's USSD statement-pulls are rate-limited by NMB, he downloads PDF
+statements and you ingest them into the sheet so the processor sees them:
+
+1. **Parse**: extract one row per credit transaction. Each row needs:
+   - timestamp `DD.MM.YYYY HH:MM:SS` (from the narration's `0X0Y HH:MM:SS` prefix
+     where `0X0Y` is DDMM; cross-check with the Value Date column)
+   - customer name (from the narration's `=> NAME` segment + the data-row tail)
+   - plate (from narration's `Description MC###XXX` regex; uppercase)
+   - amount (Credit column)
+   - bank ref (concatenate the `101AGD…` prefix line with the data-row suffix)
+
+2. **Route by plate-presence**:
+   - plate found → append to `PASSED` tab with the plate in col F
+   - plate NOT found → append to `FAILED_NMB` tab with `No phone/plate` in col F
+     (this is the processor's convention for unidentified-plate rows)
+
+3. **Append in chronological order**, continuing each tab's own id sequence
+   (don't reuse PASSED ids in FAILED_NMB).
+
+4. **Column layout for both tabs** (matches the existing processor output):
+   `A: id | B: timestamp | C: 'NMB' | D: '101 - NMB Head Office - Cash Deposit Agency banking - ' + narration | E: amount | F: plate or 'No phone/plate' | G: customer | H: ref`
+
+## Limbo batch recovery (run on every session boot)
+
+If a previous run crashed between `INSERT INTO payment_batches (status='pending')`
+and `UPDATE payment_batches SET status='finalized'`, you have a **limbo batch**:
+refs locked in `consumed_transactions` but no `payment_uploads` rows pushed.
+This blocks the refs from being processed forever.
+
+**Detection**:
+```sql
+SELECT pb.id, pb.idempotency_key, pb.created_at,
+       COUNT(pu.id) AS uploads
+  FROM payment_batches pb
+  LEFT JOIN payment_uploads pu ON pu.batch_id = pb.id
+  WHERE pb.status='pending' AND pb.created_at < now() - interval '15 minutes'
+  GROUP BY pb.id
+  HAVING COUNT(pu.id) = 0;
+```
+
+**Recovery** (auto, no Frank ack needed for this one — it's pure cleanup):
+1. `DELETE FROM consumed_transactions WHERE batch_id = $1` (release the locks)
+2. `UPDATE payment_batches SET status='rolled_back', rolled_back_at=now(),
+   failure_reason='auto-rollback by recovery: created without uploads' WHERE id=$1`
+3. Log it. SMS Frank a one-liner with the released ref-count.
+
+Real incident: 2026-06-04 morning NMB upload `91c0fa9e` created batch + locked
+418 refs (6.679M TZS), then the script was killed before the QB push loop ran.
+A subsequent --confirm run found 418 refs already-consumed and only pushed 10.
+Manual rollback + re-fire recovered all 418. Never let this sit overnight.
 
 ## Hard rules (NEVER break)
 

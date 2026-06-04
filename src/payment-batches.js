@@ -1102,6 +1102,18 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
       receivedTimestamp: ts.getTime(), transactionId: sheet[i][7] || null,
     });
   }
+  // Intra-window dedup: same ref appearing twice in the sheet (operator moves
+  // rows around when reconciling). Keep first occurrence per ref+channel.
+  const seenRef = new Set();
+  const intraTxns = [];
+  let intraDupes = 0;
+  for (const t of txns) {
+    const key = appendSuf(t.transactionId, channel);
+    if (!key) continue;
+    if (seenRef.has(key)) { intraDupes++; continue; }
+    seenRef.add(key); intraTxns.push(t);
+  }
+  txns.length = 0; txns.push(...intraTxns);
   if (txns.length === 0) {
     return {
       skipped: true,
