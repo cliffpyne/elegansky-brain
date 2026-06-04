@@ -410,15 +410,17 @@ export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
     }
   }
 
-  // Pull all open invoices via QB pagination. TotalAmt is the face value;
-  // Balance is what's left. We use TotalAmt per spec.
+  // Pull invoices DATED today (TxnDate = today, the week's billable issue).
+  // Frank's spec 2026-06-04: "total amount of all the invoices not balance
+  // in that specific date". So we filter on TxnDate, not on Balance.
+  // TotalAmt is the face value; Balance is what's left. We use TotalAmt.
   const allInvoices = [];
   const BATCH = 1000;
   let start = 1;
   while (true) {
     const r = await qbQuery(
       `SELECT Id, CustomerRef, TotalAmt, Balance, TxnDate ` +
-      `FROM Invoice WHERE Balance > '0' ` +
+      `FROM Invoice WHERE TxnDate = '${date}' ` +
       `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
     );
     const rows = r.QueryResponse?.Invoice || [];
