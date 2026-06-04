@@ -385,3 +385,53 @@ CREATE TABLE IF NOT EXISTS duplicate_customers (
   noted_by       text,                             -- 'agent:<session>' | 'admin:fmlaki'
   noted_at       timestamptz   NOT NULL DEFAULT now()
 );
+
+-- ── Officer-collections-report tables ──────────────────────────────────────
+-- Frank's loan officers are "parent customers" in QB sitting at the same
+-- hierarchy level as AGRICOLA BODA. Every actual rider/borrower has an
+-- ancestor at that level. The map below caches, for every QB customer,
+-- which officer they roll up to — so the report doesn't traverse the
+-- parent chain on every request.
+CREATE TABLE IF NOT EXISTS customer_officer_map (
+  customer_id      text          PRIMARY KEY,      -- any QB Customer Id
+  customer_name    text,
+  officer_id       text          NOT NULL,         -- ancestor at officer level
+  officer_name     text          NOT NULL,
+  qb_level         int,                            -- this customer's depth in QB
+  cached_at        timestamptz   NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_customer_officer_map_officer
+  ON customer_officer_map (officer_id);
+
+-- OFFICE/POLICE motorcycles from the external Google Sheet.
+-- snapshot_date = the day the sheet was read. source = 'OFFICE' or 'POLICE'.
+-- One row per (date, rider_name, plate). officer_* nullable so unmapped
+-- entries still get persisted for triage.
+CREATE TABLE IF NOT EXISTS officer_offline_motos (
+  id            uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  snapshot_date date          NOT NULL,
+  source        text          NOT NULL CHECK (source IN ('OFFICE','POLICE')),
+  rider_name    text          NOT NULL,
+  plate         text,
+  customer_id   text,                              -- resolved QB id (if matched)
+  officer_id    text,                              -- resolved officer (if matched)
+  officer_name  text,
+  cached_at     timestamptz   NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_officer_offline_motos_date_officer
+  ON officer_offline_motos (snapshot_date, officer_id);
+
+-- Cached daily totals per officer. Frank said live-pull is fine (amount
+-- is immutable post-issuance), so this table is just a 5-min cache to
+-- keep dashboard polling cheap. cached_at is the TTL anchor.
+CREATE TABLE IF NOT EXISTS officer_invoice_snapshots (
+  snapshot_date          date          NOT NULL,
+  officer_id             text          NOT NULL,
+  officer_name           text          NOT NULL,
+  total_invoice_amount   numeric       NOT NULL,   -- Σ Invoice.TotalAmt (NOT Balance)
+  open_invoice_count     int           NOT NULL,
+  cached_at              timestamptz   NOT NULL DEFAULT now(),
+  PRIMARY KEY (snapshot_date, officer_id)
+);

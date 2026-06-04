@@ -15,6 +15,7 @@ import { db } from './db/pool.js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { initQbClient } from './qb-client.js';
 import { mountAgentApi } from './agent/api.js';
+import { mountOfficerReportsApi } from './officer-reports.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 
@@ -567,9 +568,14 @@ function requirePhoneKey(req, res, next) {
   if (req.get('x-phone-key') !== PHONE_API_KEY) return res.status(401).json({ error: 'bad phone key' });
   next();
 }
+function requireSecretOrJwt(req, res, next) {
+  if (req.get('x-report-secret')) return requireSharedSecret(req, res, next);
+  return requireSupabaseJwt(req, res, next);
+}
 mountNotificationsApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
+mountOfficerReportsApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
