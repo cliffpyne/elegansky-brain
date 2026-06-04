@@ -146,11 +146,11 @@ export const TOOLS = [
         },
         since_iso: {
           type: 'string',
-          description: 'Window start in ISO 8601, e.g. "2026-06-03T00:00:00Z". UTC. EAT is UTC+3.',
+          description: 'Window start in ISO 8601 UTC (EAT is UTC+3). OPTIONAL: omit when trigger context says mode_label=from_last — the server then defaults to (MAX(consumed_transactions.sheet_ts) + 1ms) for the channel, which is the operator-blessed semantics. DO NOT compute since_iso yourself from payment_batches.created_at or finalized_at — those are clock times, not bank-data times, and using them creates gaps that miss real rows.',
         },
         until_iso: {
           type: 'string',
-          description: 'Window end in ISO 8601 (exclusive).',
+          description: 'Window end in ISO 8601 UTC (exclusive). OPTIONAL: omit when trigger says mode_label=from_last — server defaults to now+60s. If you supply this, set it to current wall-clock UTC + ~1min so freshly-appended sheet rows are captured.',
         },
         as_of: {
           type: 'string',
@@ -161,7 +161,7 @@ export const TOOLS = [
           description: 'YYYY-MM-DD — the date written to QB as the Payment TxnDate. Determined by the scheduled tick name: ticks at or before 16:15 EAT → txn_date=execution day; ticks after 16:15 EAT → txn_date=next day. INDEPENDENT from as_of: as_of is when the customer actually paid, txn_date is when the bookkeeper records it. Omit only if you want the wall-clock default (paymentTxnDate() — risky for retries).',
         },
       },
-      required: ['channel', 'since_iso', 'until_iso', 'as_of'],
+      required: ['channel', 'as_of'],
     },
   },
   {
@@ -251,9 +251,12 @@ export async function dispatch(toolName, input, ctx) {
           result = { error: 'STATEMENT_REPORT_SECRET not configured — agent cannot call auto-upload' };
           break;
         }
+        // since_iso/until_iso are OPTIONAL — if omitted, the auto-upload
+        // endpoint applies the from_last sheet-time default (Frank's rule
+        // from 2026-06-04). Only include them when truly explicit.
         const body = {
-          since_iso: input.since_iso,
-          until_iso: input.until_iso,
+          ...(input.since_iso ? { since_iso: input.since_iso } : {}),
+          ...(input.until_iso ? { until_iso: input.until_iso } : {}),
           as_of: input.as_of,
           txn_date: input.txn_date || null,
           dry_run: ctx.mode === 'plan',

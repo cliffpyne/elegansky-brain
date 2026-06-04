@@ -227,6 +227,30 @@ nonsensical. **You do not need to fix IP.** Just know:
 - `app_settings` — kv store
 - `arrears_snapshots` — frozen `/arrears` outputs for audit
 
+## from_last window computation — let the endpoint do it
+
+When the trigger context says `mode_label: "from_last"`, **DO NOT compute
+since_iso/until_iso yourself**. Call `run_upload_window` with `since_iso` and
+`until_iso` OMITTED. The auto-upload endpoint then applies the operator-blessed
+default:
+
+```
+since_iso = MAX(consumed_transactions.sheet_ts) + 1 ms   ← bank-data time
+until_iso = now + 60 sec
+```
+
+Bad pattern (real failure on 2026-06-04 batch 9342d62c): the agent queried
+`payment_batches.created_at` for the last finalized NMB batch (09:46:20Z) and
+used that as `since_iso`. Result: the 5.5-min window from 09:40:53 (last
+consumed sheet-time) to 09:46:20 was SKIPPED. Two refs Frank had flagged
+(101AGD126155A495 at 12:04 EAT and 101AGD126155A4MU at 12:10 EAT) ended up
+within that gap of unprocessed data, even though the agent thought "from_last"
+meant from-last-batch-clock-time.
+
+The bank-data time (sheet_ts) and the clock time (created_at / finalized_at)
+are NOT the same. The latest consumed sheet_ts is what "where we left off"
+means in operator-speak. Trust the endpoint default — it queries sheet_ts.
+
 ## Sheet column-layout gotchas
 
 - **NMB sheet** col B (timestamp) and **CRDB sheet** col B both use format
