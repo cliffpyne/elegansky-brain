@@ -607,17 +607,16 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
   });
 
   // POST /api/officer-reports/refresh-invoice-totals
-  // Pulls all open QB invoices, groups by officer, sums TotalAmt (not Balance).
+  // FIRE-AND-ACK: returns immediately, scans all open invoices in background.
+  // QB scan can take 60–120s for thousands of invoices; this avoids blocking
+  // the Render event loop. Poll GET /invoice-totals for completion.
   // Cached for 5 min — pass {force:true} to bypass.
   app.post('/api/officer-reports/refresh-invoice-totals', requireSecretOrJwt, async (req, res) => {
-    try {
-      const t0 = Date.now();
-      const stats = await refreshOfficerInvoiceTotals({ force: !!req.body?.force });
-      res.json({ ok: true, took_ms: Date.now() - t0, ...stats });
-    } catch (err) {
-      console.error('[officer-reports] refresh-invoice-totals failed:', err);
-      res.status(500).json({ error: err.message });
-    }
+    const force = !!req.body?.force;
+    res.json({ ok: true, started: true, note: 'scan running in background — poll GET /invoice-totals' });
+    refreshOfficerInvoiceTotals({ force })
+      .then((stats) => console.log('[officer-reports] invoice-totals refresh done:', JSON.stringify(stats)))
+      .catch((err) => console.error('[officer-reports] invoice-totals refresh failed:', err));
   });
 
   // GET /api/officer-reports/invoice-totals?date=YYYY-MM-DD
