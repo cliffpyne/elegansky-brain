@@ -1085,11 +1085,17 @@ function parseTsAny(s) {
   if (!str) return null;
 
   // Format 1: DD.MM.YYYY HH:MM:SS — today's CRDB/iPhone/NMB rows
+  // CRITICAL: the sheet stores wall-clock time in EAT (UTC+3), NOT UTC.
+  // Subtract 3 hours so the returned Date is in real UTC. Without this,
+  // window filters like (ts < winEnd) silently miss rows at sheet-time
+  // ≥ wall-clock-now-minus-3h. Real failure 2026-06-04: refs at 12:04 EAT
+  // (= 09:04 UTC) were parsed as 12:04 UTC and excluded from windows ending
+  // at 10:31 UTC. 91 rows / 1.6M TZS silently skipped.
   let m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
   if (m) {
     const d = +m[1], mo = +m[2];
     if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-      return new Date(`${m[3]}-${m[2]}-${m[1]}T${m[4]}:${m[5]}:${m[6]}Z`);
+      return new Date(Date.UTC(+m[3], mo - 1, d, +m[4] - 3, +m[5], +m[6]));
     }
     return null;
   }
