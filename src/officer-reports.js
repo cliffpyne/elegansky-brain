@@ -223,17 +223,25 @@ async function readOfflineTab(source) {
 }
 
 /**
- * Strip trailing junk from a sheet-entered name. Operators sometimes append
- * a phone number ("NJAUKA BAKARI MOHAMED 0674299966") — we keep alpha tokens
- * only. Leaves the original case so we can match case-insensitively.
+ * Strip noise from a sheet-entered rider name. Common operator habits:
+ *   - phone number tail: "NJAUKA BAKARI MOHAMED 0674299966"
+ *   - plate fragments interleaved: "JUMA RASHID HEMED MC 782 EYP"
+ * We drop:
+ *   - pure-digit tokens
+ *   - the literal "MC" token
+ *   - any short token that looks like a plate-half (≤4 chars, all caps)
+ *     adjacent to an MC/digit token
+ *   - trailing punctuation
  */
 function cleanRiderName(raw) {
   if (!raw) return '';
-  return String(raw)
+  let tokens = String(raw)
+    .replace(/MC\s*\d+\s*[A-Z]{0,4}/gi, ' ') // remove embedded plates like "MC 782 EYP"
     .split(/\s+/)
-    .filter((t) => /[A-Za-z]/.test(t)) // drop pure-digit tokens
-    .join(' ')
-    .trim();
+    .map((t) => t.replace(/[^\w]/g, ''))
+    .filter((t) => t && /[A-Za-z]/.test(t)) // drop pure-digit tokens
+    .filter((t) => t.toUpperCase() !== 'MC'); // bare "MC" leftovers
+  return tokens.join(' ').trim();
 }
 
 /**
