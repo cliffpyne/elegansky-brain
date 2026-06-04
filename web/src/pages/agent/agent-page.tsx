@@ -14,10 +14,12 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { RefreshCw, ChevronRight, Zap, Bot } from 'lucide-react';
+import { RefreshCw, ChevronRight, Zap, Bot, Activity } from 'lucide-react';
 import {
   listAgentSessions,
   fireAgent,
+  getSchedulerStatus,
+  setSchedulerEnabled,
   type AgentSessionRow,
 } from '@/lib/brain-api';
 
@@ -200,6 +202,70 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
   );
 }
 
+function SchedulerToggle() {
+  const [status, setStatus] = useState<{ enabled: boolean; env_master_switch: boolean; last_changed: string | null; last_changed_by: string | null } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const refresh = useCallback(async () => {
+    try { setStatus(await getSchedulerStatus()); setErr(null); }
+    catch (e) { setErr((e as Error).message); }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const toggle = async () => {
+    if (!status) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await setSchedulerEnabled(!status.enabled);
+      setStatus((s) => s ? { ...s, enabled: r.enabled, last_changed: new Date().toISOString(), last_changed_by: 'dashboard' } : s);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  if (!status) return null;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Activity className="size-5" /> Scheduled cycles (7 daily ticks)
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium">
+              Status:{' '}
+              <Badge variant={status.enabled ? 'default' : 'destructive'}>
+                {status.enabled ? 'ON — ticks will fire' : 'OFF — paused'}
+              </Badge>
+            </div>
+            <div className="text-xs text-muted-foreground mt-1">
+              meru0300 (catchup) · hanang0700 · loolmalas1000 · lengai1300 · kili1615 · mawenzi1800 · kibo2100
+            </div>
+            {status.last_changed && (
+              <div className="text-xs text-muted-foreground mt-1">
+                Last changed: {new Date(status.last_changed).toISOString().slice(0, 19)} by {status.last_changed_by || 'unknown'}
+              </div>
+            )}
+            {!status.env_master_switch && (
+              <div className="text-xs text-red-600 mt-1">
+                ⚠ AGENT_SCHEDULER_ENABLED=false on Render — scheduler is hard-disabled at the env level. Toggle here will be ignored until env is flipped.
+              </div>
+            )}
+          </div>
+          <Button
+            onClick={toggle}
+            disabled={busy || !status.env_master_switch}
+            variant={status.enabled ? 'destructive' : 'default'}
+            className="min-w-32"
+          >
+            {busy ? 'Saving…' : status.enabled ? 'Turn OFF' : 'Turn ON'}
+          </Button>
+        </div>
+        {err && <div className="text-sm text-red-600">{err}</div>}
+      </CardContent>
+    </Card>
+  );
+}
+
 function SessionsTable({ sessions, loading }: { sessions: AgentSessionRow[]; loading: boolean }) {
   return (
     <Card>
@@ -297,6 +363,7 @@ export function AgentPage() {
             {error}
           </div>
         )}
+        <SchedulerToggle />
         <HeisenbergForm onFired={refresh} />
         <SessionsTable sessions={sessions} loading={loading} />
       </Container>

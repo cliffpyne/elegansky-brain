@@ -362,3 +362,20 @@ export async function getAgentCostSummary(): Promise<{ days: Array<{ day: string
   if (!r.ok) throw new Error(`getAgentCostSummary ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ─── Agent scheduler toggle (dashboard button) ──────────────────────────────
+export async function getSchedulerStatus(): Promise<{ enabled: boolean; env_master_switch: boolean; last_changed: string | null; last_changed_by: string | null }> {
+  const r = await authed('/api/agent/scheduler');
+  if (!r.ok) throw new Error(`getSchedulerStatus ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function setSchedulerEnabled(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> {
+  const r = await authed('/api/agent/scheduler', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!r.ok) throw new Error(`setSchedulerEnabled ${r.status}: ${await r.text()}`);
+  return r.json();
+}

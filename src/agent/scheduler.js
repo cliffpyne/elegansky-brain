@@ -46,7 +46,22 @@ const SCHEDULE = [
   { name: 'kibo2100',      utc: '0 18 * * *',  eat: '21:00', kind: 'today-evening',     txnDateOffset: 1 },
 ];
 
-const ENABLED = process.env.AGENT_SCHEDULER_ENABLED !== 'false';
+// Master kill switch via env var (boot time). Runtime toggle via
+// app_settings.agent_scheduler_enabled (dashboard button). If env is
+// 'false', the scheduler never registers at boot. If env is 'true' (default),
+// the scheduler registers and each tick checks the DB flag at fire time.
+const ENV_ENABLED = process.env.AGENT_SCHEDULER_ENABLED !== 'false';
+
+async function isRuntimeEnabled() {
+  try {
+    const r = await db().query(`SELECT value FROM app_settings WHERE key = 'agent_scheduler_enabled'`);
+    if (r.rows.length === 0) return true;  // default-on
+    return String(r.rows[0].value).toLowerCase() === 'true';
+  } catch (err) {
+    console.error('[scheduler] DB toggle check failed (failing safe = enabled):', err.message);
+    return true;
+  }
+}
 
 function buildTriggerContext(sched) {
   const now = new Date();
@@ -129,6 +144,13 @@ function buildTriggerContext(sched) {
 }
 
 async function fireTick(sched) {
+  // Runtime toggle check (dashboard button). Env kill-switch is checked
+  // at startScheduler() time; the DB flag is checked PER TICK so an
+  // operator can pause/resume mid-day from the dashboard.
+  if (!(await isRuntimeEnabled())) {
+    console.log(`[scheduler] ${sched.name} suppressed — app_settings.agent_scheduler_enabled = false`);
+    return;
+  }
   const triggerContext = buildTriggerContext(sched);
   const label = 'cron:' + sched.name;
   console.log(`[scheduler] firing ${sched.name} (eat=${sched.eat}, kind=${sched.kind}, txn_date=${triggerContext.txn_date})`);
@@ -151,7 +173,7 @@ async function fireTick(sched) {
 }
 
 export function startScheduler() {
-  if (!ENABLED) {
+  if (!ENV_ENABLED) {
     console.log('[scheduler] disabled via AGENT_SCHEDULER_ENABLED=false');
     return;
   }

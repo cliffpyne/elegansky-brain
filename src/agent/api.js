@@ -140,6 +140,33 @@ export function mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, re
     }
   });
 
+  // ── GET / POST scheduler toggle (dashboard button) ───────────────────────
+  app.get('/api/agent/scheduler', requireSupabaseJwt, async (req, res) => {
+    try {
+      const r = await db().query(`SELECT value, updated_at, updated_by FROM app_settings WHERE key = 'agent_scheduler_enabled'`);
+      const enabled = r.rows.length === 0 ? true : String(r.rows[0].value).toLowerCase() === 'true';
+      res.json({
+        enabled,
+        env_master_switch: process.env.AGENT_SCHEDULER_ENABLED !== 'false',
+        last_changed: r.rows[0]?.updated_at || null,
+        last_changed_by: r.rows[0]?.updated_by || null,
+      });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  app.post('/api/agent/scheduler', requireSupabaseJwt, async (req, res) => {
+    try {
+      const value = req.body?.enabled === true ? 'true' : 'false';
+      const who = req.body?.by || 'dashboard';
+      await db().query(
+        `INSERT INTO app_settings (key, value, updated_by) VALUES ('agent_scheduler_enabled', $1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+        [value, who],
+      );
+      res.json({ ok: true, enabled: value === 'true' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
   // ── Cost roll-up (last 30 days) ──────────────────────────────────────────
   app.get('/api/agent/cost-summary', requireSupabaseJwt, async (req, res) => {
     try {
