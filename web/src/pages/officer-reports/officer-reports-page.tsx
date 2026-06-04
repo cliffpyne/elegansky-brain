@@ -125,7 +125,7 @@ export function OfficerReportsPage() {
       )}
 
       {grand && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
           <Card>
             <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Open (today)</CardTitle></CardHeader>
             <CardContent className="text-2xl font-bold">{fmt(grand.open)}</CardContent>
@@ -137,6 +137,14 @@ export function OfficerReportsPage() {
           <Card>
             <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">Due Open</CardTitle></CardHeader>
             <CardContent className="text-2xl font-bold">{fmt(grand.dueopen)}</CardContent>
+          </Card>
+          <Card className="border-blue-300">
+            <CardHeader className="pb-2"><CardTitle className="text-sm text-blue-700">Arrears created today</CardTitle></CardHeader>
+            <CardContent className="text-2xl font-bold text-blue-700">{fmt(grand.today_balance_remain)}</CardContent>
+          </Card>
+          <Card className="border-amber-300">
+            <CardHeader className="pb-2"><CardTitle className="text-sm text-amber-700">Lifetime arrears</CardTitle></CardHeader>
+            <CardContent className="text-2xl font-bold text-amber-700">{fmt(grand.total_arrears)}</CardContent>
           </Card>
           <Card className={grand.status === 'good' ? 'border-green-300' : grand.status === 'bad' ? 'border-red-300' : ''}>
             <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">% Collection</CardTitle></CardHeader>
@@ -160,8 +168,8 @@ export function OfficerReportsPage() {
                 <TableHead className="text-right">Office</TableHead>
                 <TableHead className="text-right">Police</TableHead>
                 <TableHead className="text-right">Invoice total</TableHead>
-                <TableHead className="text-right text-blue-700">Remain</TableHead>
-                <TableHead className="text-right text-amber-700">Arrears</TableHead>
+                <TableHead className="text-right text-blue-700">Today's arrears (Remain)</TableHead>
+                <TableHead className="text-right text-amber-700">Lifetime arrears</TableHead>
                 <TableHead className="text-right">Adjustment</TableHead>
                 <TableHead className="text-right">Open</TableHead>
                 <TableHead className="text-right">Collected</TableHead>
