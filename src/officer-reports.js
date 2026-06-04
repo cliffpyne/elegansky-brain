@@ -675,6 +675,9 @@ const EXCLUDED_OFFICER_NAMES = new Set([
   'MUTESI SANGABO',
   'MUTESI IPHONE BLOCKED',
   'CAROLINE E MATHEW',
+  'ASNATH CHARLES',
+  'HYUVIN RICHARD',
+  'HAPPY MAGARI',
 ]);
 function isExcluded(name) {
   // Collapse runs of whitespace so "MUTESI  IPHONE BLOCKED" (double space)
