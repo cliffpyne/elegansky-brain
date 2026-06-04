@@ -98,9 +98,11 @@ export async function fetchAllCustomers() {
   const BATCH = 1000;
   let start = 1;
   while (true) {
+    // QBO default filter is Active=true. Include inactive too — bikes in
+    // OFFICE/POLICE are often riders that got deactivated.
     const r = await qbQuery(
       `SELECT Id, DisplayName, FullyQualifiedName, ParentRef, Level, Active FROM Customer ` +
-      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+      `WHERE Active IN (true, false) STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
     );
     const rows = r.QueryResponse?.Customer || [];
     all.push(...rows);
@@ -458,7 +460,7 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
       if (!q) return res.status(400).json({ error: 'q required' });
       const escaped = q.replace(/'/g, "''");
       const sql = `SELECT Id, DisplayName, FullyQualifiedName, ParentRef, Level, Active ` +
-                  `FROM Customer WHERE DisplayName LIKE '%${escaped}%' MAXRESULTS 10`;
+                  `FROM Customer WHERE DisplayName LIKE '%${escaped}%' AND Active IN (true, false) MAXRESULTS 10`;
       const r = await qbQuery(sql);
       res.json({
         query: sql,
