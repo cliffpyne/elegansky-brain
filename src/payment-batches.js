@@ -432,7 +432,7 @@ export function mountPaymentBatchesApi(app, deps) {
       // carries its identity's date even when execution is delayed. See
       // BRAIN_BRAIN.md "TxnDate by batch identity".
       const txnDateOverride = req.body?.txn_date || null;
-      const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf });
+      const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup });
       if (result.skipped) {
         await releaseLock();
         return res.json({ skipped: true, reason: result.reason, since_iso: sinceIso, until_iso: untilIso });
@@ -1206,7 +1206,7 @@ async function fetchAllArrears(asOf) {
   return arrears;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
