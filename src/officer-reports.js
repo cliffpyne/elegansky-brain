@@ -61,6 +61,23 @@ CREATE TABLE IF NOT EXISTS officer_invoice_snapshots (
   officer_name           text          NOT NULL,
   total_invoice_amount   numeric       NOT NULL,
   open_invoice_count     int           NOT NULL,
+  today_balance_remain   numeric       NOT NULL DEFAULT 0,  -- Σ Balance of today's invoices
+  cached_at              timestamptz   NOT NULL DEFAULT now(),
+  PRIMARY KEY (snapshot_date, officer_id)
+);
+-- Migration for existing rows (added 2026-06-04 evening)
+ALTER TABLE officer_invoice_snapshots
+  ADD COLUMN IF NOT EXISTS today_balance_remain numeric NOT NULL DEFAULT 0;
+
+-- Total arrears per officer.
+-- Arrears = Σ Balance of every invoice WHERE Balance > 0 AND DueDate < today.
+-- Distinct from officer_invoice_snapshots which is just today's billable.
+CREATE TABLE IF NOT EXISTS officer_arrears_snapshots (
+  snapshot_date          date          NOT NULL,
+  officer_id             text          NOT NULL,
+  officer_name           text          NOT NULL,
+  total_arrears          numeric       NOT NULL,   -- Σ Balance of overdue invoices
+  overdue_invoice_count  int           NOT NULL,
   cached_at              timestamptz   NOT NULL DEFAULT now(),
   PRIMARY KEY (snapshot_date, officer_id)
 );
@@ -440,13 +457,15 @@ export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
   );
   const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
 
-  // Aggregate.
+  // Aggregate. Track both TotalAmt (face value, locked) and Balance
+  // (live remaining unpaid — drops to 0 when fully paid).
   const perOfficer = new Map();
   let unmapped_count = 0;
   let unmapped_amount = 0;
   for (const inv of allInvoices) {
     const cid = String(inv.CustomerRef?.value || '');
     const amt = Number(inv.TotalAmt || 0);
+    const bal = Number(inv.Balance || 0);
     const off = cidToOfficer.get(cid);
     if (!off) {
       unmapped_count++;
@@ -459,10 +478,12 @@ export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
         officer_name: off.officer_name,
         total_invoice_amount: 0,
         open_invoice_count: 0,
+        today_balance_remain: 0,
       });
     }
     const p = perOfficer.get(off.officer_id);
     p.total_invoice_amount += amt;
+    p.today_balance_remain += bal;
     p.open_invoice_count += 1;
   }
 
@@ -474,9 +495,9 @@ export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
     for (const p of perOfficer.values()) {
       await client.query(
         `INSERT INTO officer_invoice_snapshots
-           (snapshot_date, officer_id, officer_name, total_invoice_amount, open_invoice_count)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [date, p.officer_id, p.officer_name, p.total_invoice_amount, p.open_invoice_count],
+           (snapshot_date, officer_id, officer_name, total_invoice_amount, open_invoice_count, today_balance_remain)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [date, p.officer_id, p.officer_name, p.total_invoice_amount, p.open_invoice_count, p.today_balance_remain],
       );
     }
     await client.query('COMMIT');
@@ -498,9 +519,126 @@ export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
   };
 }
 
+/**
+ * Pull arrears (overdue open balance) per officer.
+ * arrears = Σ Balance of every invoice WHERE Balance > 0 AND DueDate < today.
+ * Uses Balance (not TotalAmt) because arrears = what's still owed.
+ * Cached 30 min — this is heavier than today's totals (scans all old invoices).
+ */
+export async function refreshOfficerArrears({ force = false } = {}) {
+  await ensureSchema();
+  const date = todayEatDate();
+
+  if (!force) {
+    const cached = await db().query(
+      `SELECT cached_at FROM officer_arrears_snapshots
+        WHERE snapshot_date = $1
+        ORDER BY cached_at DESC LIMIT 1`,
+      [date],
+    );
+    if (cached.rows.length) {
+      const age_ms = Date.now() - new Date(cached.rows[0].cached_at).getTime();
+      if (age_ms < 30 * 60 * 1000) return { cached: true, age_ms };
+    }
+  }
+
+  // Scan all overdue invoices via QB pagination.
+  const allInvoices = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, CustomerRef, TotalAmt, Balance, DueDate ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate < '${date}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Invoice || [];
+    allInvoices.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+
+  const customerIds = [...new Set(allInvoices.map((inv) => String(inv.CustomerRef?.value || '')))]
+    .filter(Boolean);
+  const mapRows = await db().query(
+    `SELECT customer_id, officer_id, officer_name
+       FROM customer_officer_map
+      WHERE customer_id = ANY($1)`,
+    [customerIds],
+  );
+  const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
+
+  const perOfficer = new Map();
+  for (const inv of allInvoices) {
+    const cid = String(inv.CustomerRef?.value || '');
+    const bal = Number(inv.Balance || 0);
+    const off = cidToOfficer.get(cid);
+    if (!off) continue;
+    if (!perOfficer.has(off.officer_id)) {
+      perOfficer.set(off.officer_id, {
+        officer_id: off.officer_id,
+        officer_name: off.officer_name,
+        total_arrears: 0,
+        overdue_invoice_count: 0,
+      });
+    }
+    const p = perOfficer.get(off.officer_id);
+    p.total_arrears += bal;
+    p.overdue_invoice_count += 1;
+  }
+
+  const client = await db().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM officer_arrears_snapshots WHERE snapshot_date = $1', [date]);
+    for (const p of perOfficer.values()) {
+      await client.query(
+        `INSERT INTO officer_arrears_snapshots
+           (snapshot_date, officer_id, officer_name, total_arrears, overdue_invoice_count)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [date, p.officer_id, p.officer_name, p.total_arrears, p.overdue_invoice_count],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return {
+    cached: false,
+    snapshot_date: date,
+    invoices_scanned: allInvoices.length,
+    officers_with_arrears: perOfficer.size,
+  };
+}
+
+export async function getOfficerArrears(snapshotDate) {
+  const r = await db().query(
+    `SELECT officer_id, officer_name, total_arrears, overdue_invoice_count, cached_at
+       FROM officer_arrears_snapshots
+      WHERE snapshot_date = $1`,
+    [snapshotDate],
+  );
+  const map = new Map();
+  for (const x of r.rows) {
+    map.set(x.officer_id, {
+      officer_id: x.officer_id,
+      officer_name: x.officer_name,
+      total_arrears: Number(x.total_arrears),
+      overdue_invoice_count: Number(x.overdue_invoice_count),
+      cached_at: x.cached_at,
+    });
+  }
+  return map;
+}
+
 export async function getOfficerInvoiceTotals(snapshotDate) {
   const r = await db().query(
-    `SELECT officer_id, officer_name, total_invoice_amount, open_invoice_count, cached_at
+    `SELECT officer_id, officer_name, total_invoice_amount, open_invoice_count,
+            today_balance_remain, cached_at
        FROM officer_invoice_snapshots
       WHERE snapshot_date = $1`,
     [snapshotDate],
@@ -512,6 +650,7 @@ export async function getOfficerInvoiceTotals(snapshotDate) {
       officer_name: x.officer_name,
       total_invoice_amount: Number(x.total_invoice_amount),
       open_invoice_count: Number(x.open_invoice_count),
+      today_balance_remain: Number(x.today_balance_remain || 0),
       cached_at: x.cached_at,
     });
   }
@@ -561,12 +700,14 @@ export async function computeOfficerReport(date) {
 
   const invoiceTotals = await getOfficerInvoiceTotals(date);
   const offlineCounts = await getOfficerOfflineCounts(date);
+  const arrears = await getOfficerArrears(date);
 
-  // Union of officer ids across the three sources.
+  // Union of officer ids across the four sources.
   const officerIds = new Set([
     ...invoiceTotals.keys(),
     ...offlineCounts.keys(),
     ...collections.keys(),
+    ...arrears.keys(),
   ]);
 
   const rows = [];
@@ -574,7 +715,8 @@ export async function computeOfficerReport(date) {
     const inv = invoiceTotals.get(id);
     const off = offlineCounts.get(id);
     const col = collections.get(id);
-    const name = inv?.officer_name || off?.officer_name || 'Unknown';
+    const arr = arrears.get(id);
+    const name = inv?.officer_name || off?.officer_name || arr?.officer_name || 'Unknown';
 
     const total_invoice_amount = inv?.total_invoice_amount || 0;
     const offline_count = off?.offline_total || 0;
@@ -589,7 +731,10 @@ export async function computeOfficerReport(date) {
       officer_id: id,
       officer_name: name,
       total_invoice_amount,
+      today_balance_remain: inv?.today_balance_remain || 0,
       open_invoice_count: inv?.open_invoice_count || 0,
+      total_arrears: arr?.total_arrears || 0,
+      overdue_invoice_count: arr?.overdue_invoice_count || 0,
       office_count: off?.office_count || 0,
       police_count: off?.police_count || 0,
       offline_count,
@@ -608,24 +753,30 @@ export async function computeOfficerReport(date) {
   // Grand totals.
   const grand = rows.reduce((acc, r) => ({
     total_invoice_amount: acc.total_invoice_amount + r.total_invoice_amount,
+    today_balance_remain: acc.today_balance_remain + r.today_balance_remain,
+    total_arrears: acc.total_arrears + r.total_arrears,
     offline_count: acc.offline_count + r.offline_count,
     offline_adjustment: acc.offline_adjustment + r.offline_adjustment,
     open: acc.open + r.open,
     collection: acc.collection + r.collection,
     dueopen: acc.dueopen + r.dueopen,
-  }), { total_invoice_amount: 0, offline_count: 0, offline_adjustment: 0,
-        open: 0, collection: 0, dueopen: 0 });
+  }), { total_invoice_amount: 0, today_balance_remain: 0, total_arrears: 0,
+        offline_count: 0, offline_adjustment: 0, open: 0, collection: 0, dueopen: 0 });
   grand.percent = grand.open > 0 ? Math.round((grand.collection / grand.open) * 10000) / 100 : null;
   grand.status = grand.percent == null ? 'no_invoices' :
                  grand.percent >= GOOD_THRESHOLD_PCT ? 'good' : 'bad';
 
-  // Cache freshness — when were the invoice totals last pulled?
+  // Cache freshness — when was each source last pulled?
   const cacheRes = await db().query(
     `SELECT MAX(cached_at) AS last FROM officer_invoice_snapshots WHERE snapshot_date = $1`,
     [date],
   );
   const offlineCacheRes = await db().query(
     `SELECT MAX(cached_at) AS last FROM officer_offline_motos WHERE snapshot_date = $1`,
+    [date],
+  );
+  const arrearsCacheRes = await db().query(
+    `SELECT MAX(cached_at) AS last FROM officer_arrears_snapshots WHERE snapshot_date = $1`,
     [date],
   );
 
@@ -636,6 +787,7 @@ export async function computeOfficerReport(date) {
     fresh: {
       invoice_totals_pulled_at: cacheRes.rows[0]?.last || null,
       offline_motos_pulled_at: offlineCacheRes.rows[0]?.last || null,
+      arrears_pulled_at: arrearsCacheRes.rows[0]?.last || null,
     },
   };
 }
@@ -741,6 +893,17 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
     refreshOfficerInvoiceTotals({ force })
       .then((stats) => console.log('[officer-reports] invoice-totals refresh done:', JSON.stringify(stats)))
       .catch((err) => console.error('[officer-reports] invoice-totals refresh failed:', err));
+  });
+
+  // POST /api/officer-reports/refresh-arrears
+  // Heavy scan — all overdue (Balance>0 AND DueDate<today) invoices.
+  // FIRE-AND-ACK, 30-min cache.
+  app.post('/api/officer-reports/refresh-arrears', requireSecretOrJwt, async (req, res) => {
+    const force = !!req.body?.force;
+    res.json({ ok: true, started: true, note: 'arrears scan running in background — poll GET /today' });
+    refreshOfficerArrears({ force })
+      .then((stats) => console.log('[officer-reports] arrears refresh done:', JSON.stringify(stats)))
+      .catch((err) => console.error('[officer-reports] arrears refresh failed:', err));
   });
 
   // GET /api/officer-reports/invoice-totals?date=YYYY-MM-DD

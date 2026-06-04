@@ -9,6 +9,7 @@ import { RefreshCw, FileSearch, MapPin } from 'lucide-react';
 import {
   getOfficerReportToday,
   refreshOfficerInvoiceTotals,
+  refreshOfficerArrears,
   refreshOfficerOfflineMotos,
   rebuildOfficerMap,
   type OfficerReport,
@@ -55,6 +56,12 @@ export function OfficerReportsPage() {
     catch (e) { setError(String((e as Error).message || e)); }
     finally { setTimeout(() => setRefreshing(null), 5000); }
   };
+  const onRefreshArrears = async () => {
+    setRefreshing('arrears');
+    try { await refreshOfficerArrears(true); setTimeout(load, 6000); }
+    catch (e) { setError(String((e as Error).message || e)); }
+    finally { setTimeout(() => setRefreshing(null), 8000); }
+  };
   const onRefreshOffline = async () => {
     setRefreshing('offline');
     try { await refreshOfficerOfflineMotos(); setTimeout(load, 2000); }
@@ -95,6 +102,10 @@ export function OfficerReportsPage() {
           <Button variant="outline" size="sm" disabled={refreshing !== null} onClick={onRefreshInvoices}>
             <FileSearch className="h-4 w-4 mr-1" />
             {refreshing === 'invoices' ? 'Refreshing…' : 'Refresh invoices'}
+          </Button>
+          <Button variant="outline" size="sm" disabled={refreshing !== null} onClick={onRefreshArrears}>
+            <FileSearch className="h-4 w-4 mr-1" />
+            {refreshing === 'arrears' ? 'Scanning…' : 'Refresh arrears'}
           </Button>
           <Button variant="outline" size="sm" disabled={refreshing !== null} onClick={onRefreshOffline}>
             <RefreshCw className="h-4 w-4 mr-1" />
@@ -149,6 +160,8 @@ export function OfficerReportsPage() {
                 <TableHead className="text-right">Office</TableHead>
                 <TableHead className="text-right">Police</TableHead>
                 <TableHead className="text-right">Invoice total</TableHead>
+                <TableHead className="text-right text-blue-700">Remain</TableHead>
+                <TableHead className="text-right text-amber-700">Arrears</TableHead>
                 <TableHead className="text-right">Adjustment</TableHead>
                 <TableHead className="text-right">Open</TableHead>
                 <TableHead className="text-right">Collected</TableHead>
@@ -165,6 +178,8 @@ export function OfficerReportsPage() {
                   <TableCell className="text-right">{fmt(r.office_count)}</TableCell>
                   <TableCell className="text-right">{fmt(r.police_count)}</TableCell>
                   <TableCell className="text-right">{fmt(r.total_invoice_amount)}</TableCell>
+                  <TableCell className="text-right text-blue-700 font-semibold">{fmt(r.today_balance_remain)}</TableCell>
+                  <TableCell className="text-right text-amber-700 font-semibold">{fmt(r.total_arrears)}</TableCell>
                   <TableCell className="text-right text-muted-foreground">−{fmt(r.offline_adjustment)}</TableCell>
                   <TableCell className="text-right font-semibold">{fmt(r.open)}</TableCell>
                   <TableCell className="text-right">{fmt(r.collection)}</TableCell>
@@ -182,6 +197,8 @@ export function OfficerReportsPage() {
                   <TableCell className="text-right">{fmt(grand.offline_count - rows.reduce((a, r) => a + r.police_count, 0))}</TableCell>
                   <TableCell className="text-right">{fmt(rows.reduce((a, r) => a + r.police_count, 0))}</TableCell>
                   <TableCell className="text-right">{fmt(grand.total_invoice_amount)}</TableCell>
+                  <TableCell className="text-right text-blue-700">{fmt(grand.today_balance_remain)}</TableCell>
+                  <TableCell className="text-right text-amber-700">{fmt(grand.total_arrears)}</TableCell>
                   <TableCell className="text-right">−{fmt(grand.offline_adjustment)}</TableCell>
                   <TableCell className="text-right">{fmt(grand.open)}</TableCell>
                   <TableCell className="text-right">{fmt(grand.collection)}</TableCell>

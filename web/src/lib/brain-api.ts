@@ -385,7 +385,10 @@ export interface OfficerReportRow {
   officer_id: string;
   officer_name: string;
   total_invoice_amount: number;
+  today_balance_remain: number;
   open_invoice_count: number;
+  total_arrears: number;
+  overdue_invoice_count: number;
   office_count: number;
   police_count: number;
   offline_count: number;
@@ -400,6 +403,8 @@ export interface OfficerReportRow {
 
 export interface OfficerReportGrand {
   total_invoice_amount: number;
+  today_balance_remain: number;
+  total_arrears: number;
   offline_count: number;
   offline_adjustment: number;
   open: number;
@@ -416,6 +421,7 @@ export interface OfficerReport {
   fresh: {
     invoice_totals_pulled_at: string | null;
     offline_motos_pulled_at: string | null;
+    arrears_pulled_at: string | null;
   };
 }
 
@@ -433,6 +439,16 @@ export async function refreshOfficerInvoiceTotals(force = false): Promise<{ ok: 
     body: JSON.stringify({ force }),
   });
   if (!r.ok) throw new Error(`refresh-invoice-totals ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function refreshOfficerArrears(force = false): Promise<{ ok: boolean; started: boolean }> {
+  const r = await authed('/api/officer-reports/refresh-arrears', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  });
+  if (!r.ok) throw new Error(`refresh-arrears ${r.status}: ${await r.text()}`);
   return r.json();
 }
 
