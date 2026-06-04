@@ -383,6 +383,139 @@ export async function getOfficerOfflineCounts(snapshotDate) {
   return map;
 }
 
+// ── Phase 3 — live invoice totals per officer ───────────────────────────────
+
+/**
+ * Pull every open (Balance > 0) invoice from QB and group by officer via
+ * customer_officer_map. Sum invoice.TotalAmt — NOT Balance — per Frank's
+ * spec 2026-06-04: open is measured against the full invoice face value.
+ *
+ * Cached in officer_invoice_snapshots with a 5-min TTL so dashboard polling
+ * is cheap. Pass force=true to bypass the cache.
+ */
+export async function refreshOfficerInvoiceTotals({ force = false } = {}) {
+  await ensureSchema();
+  const date = todayEatDate();
+
+  if (!force) {
+    const cached = await db().query(
+      `SELECT cached_at FROM officer_invoice_snapshots
+        WHERE snapshot_date = $1
+        ORDER BY cached_at DESC LIMIT 1`,
+      [date],
+    );
+    if (cached.rows.length) {
+      const age_ms = Date.now() - new Date(cached.rows[0].cached_at).getTime();
+      if (age_ms < 5 * 60 * 1000) return { cached: true, age_ms };
+    }
+  }
+
+  // Pull all open invoices via QB pagination. TotalAmt is the face value;
+  // Balance is what's left. We use TotalAmt per spec.
+  const allInvoices = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, CustomerRef, TotalAmt, Balance, TxnDate ` +
+      `FROM Invoice WHERE Balance > '0' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Invoice || [];
+    allInvoices.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+
+  // Group by officer. customer_officer_map lookup in one query.
+  const customerIds = [...new Set(allInvoices.map((inv) => String(inv.CustomerRef?.value || '')))]
+    .filter(Boolean);
+  const mapRows = await db().query(
+    `SELECT customer_id, officer_id, officer_name
+       FROM customer_officer_map
+      WHERE customer_id = ANY($1)`,
+    [customerIds],
+  );
+  const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
+
+  // Aggregate.
+  const perOfficer = new Map();
+  let unmapped_count = 0;
+  let unmapped_amount = 0;
+  for (const inv of allInvoices) {
+    const cid = String(inv.CustomerRef?.value || '');
+    const amt = Number(inv.TotalAmt || 0);
+    const off = cidToOfficer.get(cid);
+    if (!off) {
+      unmapped_count++;
+      unmapped_amount += amt;
+      continue;
+    }
+    if (!perOfficer.has(off.officer_id)) {
+      perOfficer.set(off.officer_id, {
+        officer_id: off.officer_id,
+        officer_name: off.officer_name,
+        total_invoice_amount: 0,
+        open_invoice_count: 0,
+      });
+    }
+    const p = perOfficer.get(off.officer_id);
+    p.total_invoice_amount += amt;
+    p.open_invoice_count += 1;
+  }
+
+  // Persist.
+  const client = await db().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM officer_invoice_snapshots WHERE snapshot_date = $1', [date]);
+    for (const p of perOfficer.values()) {
+      await client.query(
+        `INSERT INTO officer_invoice_snapshots
+           (snapshot_date, officer_id, officer_name, total_invoice_amount, open_invoice_count)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [date, p.officer_id, p.officer_name, p.total_invoice_amount, p.open_invoice_count],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return {
+    cached: false,
+    snapshot_date: date,
+    invoices_scanned: allInvoices.length,
+    officers_with_open_invoices: perOfficer.size,
+    unmapped_invoices: unmapped_count,
+    unmapped_amount,
+    grand_total: [...perOfficer.values()].reduce((a, p) => a + p.total_invoice_amount, 0),
+  };
+}
+
+export async function getOfficerInvoiceTotals(snapshotDate) {
+  const r = await db().query(
+    `SELECT officer_id, officer_name, total_invoice_amount, open_invoice_count, cached_at
+       FROM officer_invoice_snapshots
+      WHERE snapshot_date = $1`,
+    [snapshotDate],
+  );
+  const map = new Map();
+  for (const x of r.rows) {
+    map.set(x.officer_id, {
+      officer_id: x.officer_id,
+      officer_name: x.officer_name,
+      total_invoice_amount: Number(x.total_invoice_amount),
+      open_invoice_count: Number(x.open_invoice_count),
+      cached_at: x.cached_at,
+    });
+  }
+  return map;
+}
+
 function todayEatDate() {
   // Africa/Dar_es_Salaam is UTC+3 (no DST). Use UTC arithmetic.
   const now = new Date();
@@ -468,6 +601,33 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
         per_officer: rows,
         unresolved: unresolved.rows,
       });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/officer-reports/refresh-invoice-totals
+  // Pulls all open QB invoices, groups by officer, sums TotalAmt (not Balance).
+  // Cached for 5 min — pass {force:true} to bypass.
+  app.post('/api/officer-reports/refresh-invoice-totals', requireSecretOrJwt, async (req, res) => {
+    try {
+      const t0 = Date.now();
+      const stats = await refreshOfficerInvoiceTotals({ force: !!req.body?.force });
+      res.json({ ok: true, took_ms: Date.now() - t0, ...stats });
+    } catch (err) {
+      console.error('[officer-reports] refresh-invoice-totals failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/officer-reports/invoice-totals?date=YYYY-MM-DD
+  app.get('/api/officer-reports/invoice-totals', requireSecretOrJwt, async (req, res) => {
+    try {
+      await ensureSchema();
+      const date = String(req.query.date || todayEatDate());
+      const map = await getOfficerInvoiceTotals(date);
+      const rows = [...map.values()].sort((a, b) => b.total_invoice_amount - a.total_invoice_amount);
+      res.json({ snapshot_date: date, per_officer: rows });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
