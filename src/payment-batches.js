@@ -1334,7 +1334,13 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     if (tuples.length > 0) {
       let preflight;
       try {
-        preflight = await qbPreflightDedup({ tuples });
+        // Hard 60-second timeout so a slow/stuck QB query never blocks
+        // the whole pipeline. If the timeout fires we fall through to
+        // the catch block which proceeds without dedup + alerts.
+        preflight = await Promise.race([
+          qbPreflightDedup({ tuples }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('preflight timeout 60s')), 60_000)),
+        ]);
       } catch (err) {
         // Fail open — proceed without check, alert operator.
         console.error('[auto-upload] QB pre-flight dedup FAILED — proceeding without check:', err.message);
