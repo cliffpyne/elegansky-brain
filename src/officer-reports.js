@@ -865,9 +865,9 @@ function todayEatDate() {
  * Sum of QB Payments deposited TODAY into the Kijichi Collection AC account,
  * regardless of source (BRAIN upload, manual, SaasAnt). Uses TxnDate = today.
  */
-export async function getKijichiTodayTotal() {
+export async function getKijichiTodayTotal(dateOverride) {
   // Look up the account id once per session.
-  const today = todayEatDate();
+  const today = dateOverride || todayEatDate();
   const acctRes = await qbQuery(
     `SELECT Id, Name FROM Account WHERE Name = '${KIJICHI_ACCOUNT_NAME.replace(/'/g, "''")}'`,
   );
@@ -1072,7 +1072,8 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
   // GET /api/officer-reports/kijichi-today
   app.get('/api/officer-reports/kijichi-today', requireSecretOrJwt, async (req, res) => {
     try {
-      const out = await getKijichiTodayTotal();
+      const date = req.query.date ? String(req.query.date) : null;
+      const out = await getKijichiTodayTotal(date);
       res.json(out);
     } catch (err) {
       res.status(500).json({ error: err.message });
