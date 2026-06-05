@@ -487,3 +487,24 @@ export async function getSheetTotalsUploadDay(): Promise<SheetTotalsUploadDay> {
   if (!r.ok) throw new Error(`sheet-totals-uploadday ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+export interface PaymentUploadsTotals {
+  date: string;
+  by_channel: Array<{
+    channel: string;
+    pushed_rows: number;
+    pushed_amount: number;
+    voided_rows: number;
+    voided_amount: number;
+    failed_rows: number;
+    failed_amount: number;
+    needs_saasant_rows: number;
+    needs_saasant_amount: number;
+  }>;
+  grand_total: { pushed_rows: number; pushed_amount: number };
+}
+export async function getPaymentUploadsTodayTotals(): Promise<PaymentUploadsTotals> {
+  const r = await authed('/api/payment-uploads/today-totals');
+  if (!r.ok) throw new Error(`today-totals ${r.status}: ${await r.text()}`);
+  return r.json();
+}

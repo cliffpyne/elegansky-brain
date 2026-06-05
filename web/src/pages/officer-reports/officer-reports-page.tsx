@@ -14,9 +14,11 @@ import {
   rebuildOfficerMap,
   getKijichiToday,
   getSheetTotalsUploadDay,
+  getPaymentUploadsTodayTotals,
   type OfficerReport,
   type KijichiToday,
   type SheetTotalsUploadDay,
+  type PaymentUploadsTotals,
 } from '@/lib/brain-api';
 
 const fmt = (n: number) => n.toLocaleString();
@@ -33,20 +35,23 @@ export function OfficerReportsPage() {
   const [report, setReport] = useState<OfficerReport | null>(null);
   const [kijichi, setKijichi] = useState<KijichiToday | null>(null);
   const [sheetTotals, setSheetTotals] = useState<SheetTotalsUploadDay | null>(null);
+  const [pushedTotals, setPushedTotals] = useState<PaymentUploadsTotals | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState<string | null>(null); // which button is busy
   const [lastFetch, setLastFetch] = useState<Date | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [r, k, s] = await Promise.all([
+      const [r, k, s, p] = await Promise.all([
         getOfficerReportToday(),
         getKijichiToday().catch(() => null),
         getSheetTotalsUploadDay().catch(() => null),
+        getPaymentUploadsTodayTotals().catch(() => null),
       ]);
       setReport(r);
       setKijichi(k);
       setSheetTotals(s);
+      setPushedTotals(p);
       setError(null);
       setLastFetch(new Date());
     } catch (e) {
@@ -161,6 +166,52 @@ export function OfficerReportsPage() {
         <Card className="mb-4 border-red-300">
           <CardContent className="py-3 text-red-700 text-sm">Error: {error}</CardContent>
         </Card>
+      )}
+
+      {/* BRAIN-pushed today by channel — what actually landed in QB Payments today */}
+      {pushedTotals && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+          {(() => {
+            const nmb = pushedTotals.by_channel.find((c) => c.channel === 'nmbnew');
+            const bank = pushedTotals.by_channel.find((c) => c.channel === 'bank');
+            const iph = pushedTotals.by_channel.find((c) => c.channel === 'iphone_bank');
+            const grand = pushedTotals.grand_total;
+            return (
+              <>
+                <Card className="border-green-300">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm text-green-700">BRAIN pushed today (all)</CardTitle>
+                  </CardHeader>
+                  <CardContent className="text-2xl font-bold text-green-700">
+                    {fmt(grand.pushed_amount)}
+                    <div className="text-xs font-normal text-muted-foreground">{grand.pushed_rows} txns</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">NMB pushed today</CardTitle></CardHeader>
+                  <CardContent className="text-2xl font-bold">
+                    {fmt(nmb?.pushed_amount || 0)}
+                    <div className="text-xs font-normal text-muted-foreground">{nmb?.pushed_rows || 0} txns</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">CRDB pushed today</CardTitle></CardHeader>
+                  <CardContent className="text-2xl font-bold">
+                    {fmt(bank?.pushed_amount || 0)}
+                    <div className="text-xs font-normal text-muted-foreground">{bank?.pushed_rows || 0} txns</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">iPhone pushed today</CardTitle></CardHeader>
+                  <CardContent className="text-2xl font-bold">
+                    {fmt(iph?.pushed_amount || 0)}
+                    <div className="text-xs font-normal text-muted-foreground">{iph?.pushed_rows || 0} txns</div>
+                  </CardContent>
+                </Card>
+              </>
+            );
+          })()}
+        </div>
       )}
 
       {/* Sheet-totals row: what's flowed in since the upload-day started (last kili1615) */}
