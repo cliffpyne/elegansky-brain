@@ -856,6 +856,52 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // POST /api/admin/batch-ref-lookup
+  // Body: { refs: ["101AGD...", ...] }
+  // Returns status of each ref across consumed_transactions + external_consumed_refs.
+  app.post('/api/admin/batch-ref-lookup', requireSecretOrJwt, async (req, res) => {
+    try {
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String) : [];
+      if (!refs.length) return res.status(400).json({ error: 'refs[] required' });
+      // Build a list with each ref + every possible suffix.
+      const allKeys = [];
+      for (const r of refs) {
+        allKeys.push(r);
+        for (const sfx of ['N', 'B', 'P']) allKeys.push(r + sfx);
+      }
+      const ct = await db().query(
+        `SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1)`,
+        [allKeys],
+      );
+      const ec = await db().query(
+        `SELECT bank_ref, qb_id, qb_kind, qb_txn_date, found_at FROM external_consumed_refs WHERE bank_ref = ANY($1)`,
+        [allKeys],
+      );
+      const ctSet = new Set(ct.rows.map((r) => r.bank_ref));
+      const ecMap = new Map(ec.rows.map((r) => [r.bank_ref, r]));
+      const out = refs.map((base) => {
+        const candidates = [base, base + 'N', base + 'B', base + 'P'];
+        const inCt = candidates.find((c) => ctSet.has(c));
+        const inEc = candidates.find((c) => ecMap.has(c));
+        return {
+          ref: base,
+          in_consumed_transactions: inCt || null,
+          in_external_consumed_refs: inEc ? ecMap.get(inEc) : null,
+        };
+      });
+      const counts = {
+        total: out.length,
+        in_consumed: out.filter((x) => x.in_consumed_transactions).length,
+        in_external: out.filter((x) => x.in_external_consumed_refs).length,
+        clean: out.filter((x) => !x.in_consumed_transactions && !x.in_external_consumed_refs).length,
+      };
+      res.json({ counts, refs: out });
+    } catch (err) {
+      console.error('[batch-ref-lookup] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/sheet-ts-hour?pushed_date=YYYY-MM-DD&sheet_date=YYYY-MM-DD&channel=nmbnew
   // Hour-of-day (EAT) distribution of sheet_ts for refs pushed on a given day.
   // Lets us see if any morning-portion (00-16h EAT) refs got TxnDate set as
