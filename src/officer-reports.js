@@ -876,15 +876,15 @@ export async function getKijichiTodayTotal() {
     return { account_name: KIJICHI_ACCOUNT_NAME, account_id: null, date: today,
              rows: 0, total: 0, note: 'account not found in QB' };
   }
-  // Sum Payment.TotalAmt for TxnDate=today AND DepositToAccountRef=<id>.
-  // QBO LIKE/ORDER on DepositToAccountRef supports equality.
+  // QBO restriction: DepositToAccountRef is NOT queryable in WHERE.
+  // Pull all Payments for today, then filter locally by DepositToAccountRef.
   const all = [];
   const BATCH = 1000;
   let start = 1;
   while (true) {
     const r = await qbQuery(
       `SELECT Id, TotalAmt, TxnDate, DepositToAccountRef ` +
-      `FROM Payment WHERE TxnDate = '${today}' AND DepositToAccountRef = '${acct.Id}' ` +
+      `FROM Payment WHERE TxnDate = '${today}' ` +
       `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
     );
     const rows = r.QueryResponse?.Payment || [];
@@ -892,9 +892,17 @@ export async function getKijichiTodayTotal() {
     if (rows.length < BATCH) break;
     start += BATCH;
   }
-  const total = all.reduce((s, p) => s + Number(p.TotalAmt || 0), 0);
-  return { account_name: acct.Name, account_id: acct.Id, date: today,
-           rows: all.length, total };
+  const matched = all.filter((p) => String(p.DepositToAccountRef?.value || '') === String(acct.Id));
+  const total = matched.reduce((s, p) => s + Number(p.TotalAmt || 0), 0);
+  return {
+    account_name: acct.Name,
+    account_id: acct.Id,
+    date: today,
+    rows: matched.length,
+    total,
+    total_payments_today: all.length,
+    note: `filtered ${matched.length} of ${all.length} today's Payments by DepositToAccountRef`,
+  };
 }
 
 /**
