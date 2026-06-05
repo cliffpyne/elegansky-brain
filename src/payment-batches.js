@@ -954,53 +954,55 @@ export function mountPaymentBatchesApi(app, deps) {
   });
 
   // POST /api/admin/void-payments
-  // Body: { qb_ids: ["1606530", "1605381", ...], reason: "stranded duplicates" }
-  // Voids each listed QB Payment directly. Retries each up to 3 times.
-  // After successful void, marks any matching payment_uploads row as 'voided'
-  // and removes the bank_ref from consumed_transactions so re-firing is possible.
-  // Use this AFTER verify-recall surfaces stranded Payments.
+  // Body: { qb_ids: ["1606530", ...], reason: "stranded duplicates" }
+  // Voids each Payment in QB. Processes 8 in parallel for speed (was sequential
+  // and timed out on large lists). Single attempt per id — caller should
+  // re-poll verify-recall and re-fire the list for any that fail.
   app.post('/api/admin/void-payments', requireSecretOrJwt, async (req, res) => {
     try {
       const qbIds = Array.isArray(req.body?.qb_ids) ? req.body.qb_ids.map(String) : [];
       const reason = String(req.body?.reason || 'admin force-void stranded payment');
       if (!qbIds.length) return res.status(400).json({ error: 'qb_ids[] required' });
-      const results = [];
-      for (const qbId of qbIds) {
-        let voided = false;
-        let lastErr = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
+      const results = new Array(qbIds.length);
+      let cursor = 0;
+      const PAR = 8;
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= qbIds.length) return;
+          const qbId = qbIds[i];
+          let voided = false;
+          let lastErr = null;
           try {
             const r = await qbVoid({ entity: 'payment', id: qbId });
             voided = !!r && (r.ok !== false);
-            if (voided) break;
-            lastErr = r?.error || 'unknown';
+            if (!voided) lastErr = r?.error || 'unknown';
           } catch (err) {
             lastErr = String(err.message || err).slice(0, 300);
           }
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));
-        }
-        // Update payment_uploads + consumed_transactions for the matching ref
-        if (voided) {
-          const u = await db().query(
-            `UPDATE payment_uploads SET status='voided', voided_at=now()
-              WHERE qb_id = $1 AND status = 'created'
-              RETURNING id, bank_ref, customer_id`,
-            [qbId],
-          );
-          for (const row of u.rows) {
-            await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = $1`, [row.bank_ref]);
+          if (voided) {
+            const u = await db().query(
+              `UPDATE payment_uploads SET status='voided', voided_at=now()
+                WHERE qb_id = $1 AND status = 'created'
+                RETURNING id, bank_ref`,
+              [qbId],
+            );
+            for (const row of u.rows) {
+              await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = $1`, [row.bank_ref]);
+            }
+            results[i] = { qb_id: qbId, ok: true, updated: u.rowCount };
+          } else {
+            results[i] = { qb_id: qbId, ok: false, error: lastErr };
           }
-          results.push({ qb_id: qbId, ok: true, payment_uploads_updated: u.rowCount });
-        } else {
-          results.push({ qb_id: qbId, ok: false, error: lastErr });
         }
-      }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
       const summary = {
         total: results.length,
-        succeeded: results.filter((r) => r.ok).length,
-        failed: results.filter((r) => !r.ok).length,
+        succeeded: results.filter((r) => r && r.ok).length,
+        failed: results.filter((r) => r && !r.ok).length,
       };
-      res.json({ summary, reason, results });
+      res.json({ summary, reason });
     } catch (err) {
       console.error('[void-payments] failed:', err);
       res.status(500).json({ error: err.message });
