@@ -1002,7 +1002,8 @@ export function mountPaymentBatchesApi(app, deps) {
         succeeded: results.filter((r) => r && r.ok).length,
         failed: results.filter((r) => r && !r.ok).length,
       };
-      res.json({ summary, reason });
+      const failures = results.filter((r) => r && !r.ok).slice(0, 10);
+      res.json({ summary, reason, sample_failures: failures });
     } catch (err) {
       console.error('[void-payments] failed:', err);
       res.status(500).json({ error: err.message });
