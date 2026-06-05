@@ -27,6 +27,7 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 import { readSheet } from './sheets.js';
+import { qbQuery } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
 
