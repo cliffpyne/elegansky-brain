@@ -1332,10 +1332,11 @@ export function mountPaymentBatchesApi(app, deps) {
         const refBase = refRaw.replace(/[NBP]$/, '');
         // 1. Find customer_id from any payment_upload for this ref
         const pu = await db().query(
-          `SELECT pu.customer_id, pu.customer_name, pu.bank_ref, pu.batch_id, pu.status, pu.qb_id
+          `SELECT pu.customer_id, pu.customer_name, pu.bank_ref, pu.batch_id, pu.status, pu.qb_id,
+                  pu.amount, pu.invoice_qb_id, pu.invoice_no, pu.created_at, pu.kind
              FROM payment_uploads pu
             WHERE pu.bank_ref LIKE $1
-            ORDER BY pu.created_at DESC LIMIT 5`,
+            ORDER BY pu.created_at ASC`,
           [refBase + '%'],
         );
         const brainRows = pu.rows;
@@ -1361,7 +1362,13 @@ export function mountPaymentBatchesApi(app, deps) {
             customer_id: customerId,
             customer_name: brainRows[0]?.customer_name || null,
             brain_payment_uploads: brainRows.map((b) => ({
-              status: b.status, batch_id: b.batch_id?.slice(0, 8), qb_id: b.qb_id, bank_ref: b.bank_ref,
+              status: b.status, batch_id: String(b.batch_id || '').slice(0, 8),
+              qb_id: b.qb_id, bank_ref: b.bank_ref,
+              amount: Number(b.amount || 0),
+              invoice_qb_id: b.invoice_qb_id,
+              invoice_no: b.invoice_no,
+              kind: b.kind,
+              created_at: b.created_at,
             })),
             qb_payments_matching_ref: matching.map((p) => ({
               qb_id: p.Id,
