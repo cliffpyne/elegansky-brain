@@ -573,24 +573,33 @@ export function mountPaymentBatchesApi(app, deps) {
         `SELECT * FROM payment_uploads WHERE batch_id=$1 AND status='created' ORDER BY created_at`,
         [batchId],
       );
-      // Retry failed voids up to 3 times with backoff. The single-pass
-      // voidUploadsBestEffort lets transient QB errors silently strand
-      // Payments — root cause of the 2026-06-05 inflation incident.
+      // Keep retrying failed voids until ALL succeed (or hard ceiling of 20
+      // attempts to prevent infinite loop on permanent errors). Frank's rule
+      // 2026-06-05: "pure recall retry until recalled" — don't leave any
+      // Payment stranded silently.
+      const MAX_RECALL_ATTEMPTS = 20;
       let voids = await voidUploadsBestEffort(ups.rows, qbVoid);
-      for (let attempt = 2; attempt <= 3; attempt++) {
+      for (let attempt = 2; attempt <= MAX_RECALL_ATTEMPTS; attempt++) {
         const stillFailed = voids.filter((v) => !v.ok);
-        if (!stillFailed.length) break;
-        console.log(`[recall ${batchId}] retry attempt ${attempt}: ${stillFailed.length} voids still failing`);
-        await new Promise((r) => setTimeout(r, 2000 * attempt)); // 4s, 6s
-        // voidUploadsBestEffort expects payment_upload rows — rebuild them.
+        if (!stillFailed.length) {
+          console.log(`[recall ${batchId}] all voids succeeded after ${attempt - 1} attempts`);
+          break;
+        }
+        console.log(`[recall ${batchId}] attempt ${attempt}/${MAX_RECALL_ATTEMPTS}: ${stillFailed.length} voids still failing`);
+        // Exponential-ish backoff capped at 30s. 3s, 6s, 10s, 15s, 20s, 25s, 30s, 30s, …
+        const wait = Math.min(30_000, 3_000 + (attempt - 2) * 4_000);
+        await new Promise((r) => setTimeout(r, wait));
         const failedUploadIds = new Set(stillFailed.map((v) => v.upload_id));
         const failedUploads = ups.rows.filter((u) => failedUploadIds.has(u.id));
         const retryResults = await voidUploadsBestEffort(failedUploads, qbVoid);
-        // Merge: keep the successes, overlay the new attempt
         const retryById = new Map(retryResults.map((r) => [r.upload_id, r]));
         voids = voids.map((v) => v.ok ? v : (retryById.get(v.upload_id) || v));
       }
       const allOk = voids.every((v) => v.ok);
+      const stuckCount = voids.filter((v) => !v.ok).length;
+      if (!allOk) {
+        console.warn(`[recall ${batchId}] gave up after ${MAX_RECALL_ATTEMPTS} attempts — ${stuckCount} voids still failing (permanent errors?)`);
+      }
 
       const c = await db().connect();
       try {
@@ -940,6 +949,60 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[qb-double-payment-scan] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/void-payments
+  // Body: { qb_ids: ["1606530", "1605381", ...], reason: "stranded duplicates" }
+  // Voids each listed QB Payment directly. Retries each up to 3 times.
+  // After successful void, marks any matching payment_uploads row as 'voided'
+  // and removes the bank_ref from consumed_transactions so re-firing is possible.
+  // Use this AFTER verify-recall surfaces stranded Payments.
+  app.post('/api/admin/void-payments', requireSecretOrJwt, async (req, res) => {
+    try {
+      const qbIds = Array.isArray(req.body?.qb_ids) ? req.body.qb_ids.map(String) : [];
+      const reason = String(req.body?.reason || 'admin force-void stranded payment');
+      if (!qbIds.length) return res.status(400).json({ error: 'qb_ids[] required' });
+      const results = [];
+      for (const qbId of qbIds) {
+        let voided = false;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const r = await qbVoid({ entity: 'payment', id: qbId });
+            voided = !!r && (r.ok !== false);
+            if (voided) break;
+            lastErr = r?.error || 'unknown';
+          } catch (err) {
+            lastErr = String(err.message || err).slice(0, 300);
+          }
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));
+        }
+        // Update payment_uploads + consumed_transactions for the matching ref
+        if (voided) {
+          const u = await db().query(
+            `UPDATE payment_uploads SET status='voided', voided_at=now()
+              WHERE qb_id = $1 AND status = 'created'
+              RETURNING id, bank_ref, customer_id`,
+            [qbId],
+          );
+          for (const row of u.rows) {
+            await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = $1`, [row.bank_ref]);
+          }
+          results.push({ qb_id: qbId, ok: true, payment_uploads_updated: u.rowCount });
+        } else {
+          results.push({ qb_id: qbId, ok: false, error: lastErr });
+        }
+      }
+      const summary = {
+        total: results.length,
+        succeeded: results.filter((r) => r.ok).length,
+        failed: results.filter((r) => !r.ok).length,
+      };
+      res.json({ summary, reason, results });
+    } catch (err) {
+      console.error('[void-payments] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });
