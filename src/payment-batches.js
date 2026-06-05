@@ -1047,10 +1047,13 @@ export function mountPaymentBatchesApi(app, deps) {
           for (const cid of chunk) {
             const batchRefs = byCustomer.get(cid) || [];
             for (const br of batchRefs) {
-              const matching = pmts.filter((p) =>
-                String(p.CustomerRef?.value || '') === cid &&
-                String(p.PrivateNote || '').trim() === String(br.bank_ref).replace(/[NBP]$/, ''),
-              );
+              const refRaw = String(br.bank_ref);
+              const refBase = refRaw.replace(/[NBP]$/, '');
+              const matching = pmts.filter((p) => {
+                if (String(p.CustomerRef?.value || '') !== cid) return false;
+                const pn = String(p.PrivateNote || '').trim();
+                return pn === refRaw || pn === refBase;
+              });
               if (matching.length > 0) {
                 surviving.push({
                   bank_ref: br.bank_ref,
