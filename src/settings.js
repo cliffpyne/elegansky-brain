@@ -17,7 +17,12 @@ const SUPABASE_JWKS = SUPABASE_URL
  * The :key path is locked to a known allowlist so a stolen JWT can't write
  * arbitrary settings.
  */
-const ALLOWED_KEYS = new Set(['statement_pull_enabled']);
+const ALLOWED_KEYS = new Set([
+  'statement_pull_enabled',
+  'admin_phones',              // SMS recipient list (dashboard /admin-sms page)
+  'sms_recipients',            // legacy key for the same thing
+  'agent_scheduler_enabled',   // BRAIN agent scheduler toggle
+]);
 
 export function mountSettingsApi(app) {
   app.get('/api/settings', requireAuth, async (_req, res) => {
