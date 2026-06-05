@@ -438,6 +438,17 @@ export function mountPaymentBatchesApi(app, deps) {
         await releaseLock();
         return res.json({ skipped: true, reason: result.reason, since_iso: sinceIso, until_iso: untilIso });
       }
+      if (result.aborted) {
+        await releaseLock();
+        return res.status(503).json({
+          aborted: true,
+          reason: result.reason,
+          detail: result.detail,
+          paid_planned: result.paid_planned,
+          unused_planned: result.unused_planned,
+          message: 'QB pre-flight check failed — upload safely aborted, no Payments created.',
+        });
+      }
 
       // Safety net 3: row cap to protect BRAIN's Starter plan memory.
       if (result.paid.length > maxPaid) {
@@ -2116,25 +2127,53 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
 
     if (tuples.length > 0) {
       let preflight;
+      let preflightFailed = false;
       try {
-        // Hard 60-second timeout so a slow/stuck QB query never blocks
-        // the whole pipeline. If the timeout fires we fall through to
-        // the catch block which proceeds without dedup + alerts.
-        preflight = await Promise.race([
-          qbPreflightDedup({ tuples }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('preflight timeout 60s')), 60_000)),
-        ]);
+        // Retry preflight up to 3 times with backoff before giving up. Each
+        // attempt has a 120-second timeout (QB queries can be slow when
+        // hundreds of customers are scanned).
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            preflight = await Promise.race([
+              qbPreflightDedup({ tuples }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('preflight timeout 120s')), 120_000)),
+            ]);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            console.warn(`[auto-upload] QB pre-flight attempt ${attempt}/3 failed: ${err.message}`);
+            if (attempt < 3) await new Promise((r) => setTimeout(r, 3000 * attempt));
+          }
+        }
+        if (lastErr) throw lastErr;
       } catch (err) {
-        // Fail open — proceed without check, alert operator.
-        console.error('[auto-upload] QB pre-flight dedup FAILED — proceeding without check:', err.message);
+        // FAIL CLOSED 2026-06-05: previously fail-open silently — that allowed
+        // the 7.74M inflation incident. Now we ABORT the entire upload with
+        // an alert. Better to skip a tick than push duplicates.
+        preflightFailed = true;
+        console.error('[auto-upload] QB pre-flight dedup FAILED after 3 attempts — ABORTING upload:', err.message);
         try {
           await db().query(
-            `INSERT INTO notifications (message, severity, source) VALUES ($1, 'warning', 'auto-upload')`,
-            [`QB pre-flight check failed for channel=${channel}. Pushed ${paid.length} paid + ${unused.length} unused WITHOUT cross-checking QB. Manual verification recommended. Error: ${String(err.message || err).slice(0, 200)}`],
+            `INSERT INTO notifications (message, severity, source) VALUES ($1, 'critical', 'auto-upload')`,
+            [`BRAIN ABORTED upload for channel=${channel}: QB pre-flight check failed 3× (${String(err.message || err).slice(0, 150)}). ${paid.length} paid + ${unused.length} unused NOT pushed. Retry the upload window manually after QB recovers.`],
           );
         } catch { /* notify enqueue must not crash the pipeline */ }
-        preflight = { duplicateKeys: new Set(), detail: [] };
+        // Delete the batch + consumed_transactions so refs stay eligible for retry.
+        try {
+          await db().query(`DELETE FROM consumed_transactions WHERE batch_id = $1`, [batchId]);
+          await db().query(`DELETE FROM payment_batches WHERE id = $1`, [batchId]);
+        } catch (e) { console.error('[auto-upload] cleanup after preflight-fail:', e.message); }
+        return {
+          aborted: true,
+          reason: 'qb-preflight-failed',
+          detail: String(err.message || err).slice(0, 200),
+          paid_planned: paid.length,
+          unused_planned: unused.length,
+        };
       }
+      if (preflightFailed) return { aborted: true };
 
       if (preflight.duplicateKeys.size > 0) {
         // Persist what we found so a future batch's step 2 catches them fast.
