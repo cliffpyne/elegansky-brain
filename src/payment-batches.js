@@ -1275,6 +1275,26 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/force-release-channel-lock
+  // Body: { channel: "nmbnew" | "bank" | "iphone_bank" }
+  // Operator-triggered force-release when a lock got orphaned (eg deploy
+  // killed the holder mid-run). Lock has 30-min TTL anyway but this is faster.
+  app.post('/api/admin/force-release-channel-lock', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
+        return res.status(400).json({ error: 'channel must be nmbnew | bank | iphone_bank' });
+      }
+      const r = await db().query(
+        `DELETE FROM auto_upload_locks WHERE channel = $1 RETURNING holder, locked_at`,
+        [channel],
+      );
+      res.json({ released: r.rowCount, channel, previous: r.rows[0] || null });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/release-all-orphans-today
   // Bulk version: finds ALL orphaned consumed_transactions rows from batches
   // created in last 24h (where CT row has no matching PU row), verifies QB
