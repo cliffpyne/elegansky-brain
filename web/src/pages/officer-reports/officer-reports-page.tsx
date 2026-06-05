@@ -50,17 +50,44 @@ export function OfficerReportsPage() {
     return () => clearInterval(id);
   }, [load]);
 
+  // QB scans run in background and take ~60-90s. Poll the report's `fresh`
+  // timestamp every 10s for up to 2 min, reload as soon as it advances.
+  async function waitForFreshAdvance(getStamp: (r: OfficerReport) => string | null, deadlineMs = 120_000) {
+    const baseline = report ? getStamp(report) : null;
+    const start = Date.now();
+    while (Date.now() - start < deadlineMs) {
+      await new Promise(r => setTimeout(r, 10_000));
+      try {
+        const r = await getOfficerReportToday();
+        const cur = getStamp(r);
+        if (cur && cur !== baseline) { setReport(r); setLastFetch(new Date()); return; }
+      } catch { /* keep polling */ }
+    }
+    // Fallback: do a final load so user sees whatever cache state is.
+    await load();
+  }
+
   const onRefreshInvoices = async () => {
     setRefreshing('invoices');
-    try { await refreshOfficerInvoiceTotals(true); setTimeout(load, 4000); }
-    catch (e) { setError(String((e as Error).message || e)); }
-    finally { setTimeout(() => setRefreshing(null), 5000); }
+    try {
+      await refreshOfficerInvoiceTotals(true);
+      await waitForFreshAdvance((r) => r.fresh.invoice_totals_pulled_at);
+    } catch (e) {
+      setError(String((e as Error).message || e));
+    } finally {
+      setRefreshing(null);
+    }
   };
   const onRefreshArrears = async () => {
     setRefreshing('arrears');
-    try { await refreshOfficerArrears(true); setTimeout(load, 6000); }
-    catch (e) { setError(String((e as Error).message || e)); }
-    finally { setTimeout(() => setRefreshing(null), 8000); }
+    try {
+      await refreshOfficerArrears(true);
+      await waitForFreshAdvance((r) => r.fresh.arrears_pulled_at);
+    } catch (e) {
+      setError(String((e as Error).message || e));
+    } finally {
+      setRefreshing(null);
+    }
   };
   const onRefreshOffline = async () => {
     setRefreshing('offline');
