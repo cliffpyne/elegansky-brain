@@ -1275,6 +1275,99 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/release-orphan-consumed-refs
+  // Finds consumed_transactions rows from recent batches that have NO matching
+  // payment_uploads row (meaning preflight caught the ref and it never got pushed).
+  // For each, double-check QB has no live Payment with that PrivateNote, then
+  // DELETE the consumed_transactions lock so a fresh upload can re-push.
+  //
+  // Body: { batch_ids: ["8e2b183c", "c7e6c10f", ...] } — required, only release
+  //       locks from these batch IDs (safer than a blanket "today" query).
+  app.post('/api/admin/release-orphan-consumed-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.batch_ids) ? req.body.batch_ids.map(String) : [];
+      if (!ids.length) return res.status(400).json({ error: 'batch_ids[] required' });
+      // Resolve short IDs to UUIDs
+      const fullIds = [];
+      for (const short of ids) {
+        if (short.length >= 36) { fullIds.push(short); continue; }
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [short + '%']);
+        if (r.rows.length) fullIds.push(r.rows[0].id);
+      }
+      if (!fullIds.length) return res.status(400).json({ error: 'no matching batches' });
+      // Find orphans
+      const orphans = await db().query(
+        `SELECT ct.bank_ref, ct.batch_id, pb.channel
+           FROM consumed_transactions ct
+           JOIN payment_batches pb ON pb.id = ct.batch_id
+           LEFT JOIN payment_uploads pu
+             ON pu.bank_ref = ct.bank_ref AND pu.batch_id = ct.batch_id
+          WHERE ct.batch_id = ANY($1)
+            AND pu.id IS NULL`,
+        [fullIds],
+      );
+      // For each orphan, verify no QB Payment with this PrivateNote (= bank_ref)
+      // Group by channel for batched lookup
+      const sinceISO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      let released = 0, kept = 0, errors = 0;
+      const releasedRefs = [];
+      const keptRefs = [];
+      // Build a customer-id lookup from prior payment_uploads (the IP-algorithm
+      // already learned the customer for this ref across the day). Best-effort —
+      // if we can't find the customer we still release the lock, since the ref
+      // is orphaned (no PU row, no QB push happened).
+      for (const o of orphans.rows) {
+        try {
+          // Try to find a customer id from earlier payment_uploads for the same ref
+          const cust = await db().query(
+            `SELECT customer_id FROM payment_uploads
+              WHERE bank_ref = $1 AND customer_id IS NOT NULL
+              LIMIT 1`,
+            [o.bank_ref],
+          );
+          const custId = cust.rows[0]?.customer_id;
+          let hasLive = false;
+          if (custId) {
+            const refBase = o.bank_ref.replace(/[NBP]$/, '');
+            const q = await qbQuery(
+              `SELECT Id, TotalAmt, PrivateNote FROM Payment ` +
+              `WHERE CustomerRef = '${custId}' AND TxnDate >= '${sinceISO}' MAXRESULTS 200`,
+            );
+            const pmts = q.QueryResponse?.Payment || [];
+            for (const p of pmts) {
+              const pn = String(p.PrivateNote || '').trim();
+              if ((pn === o.bank_ref || pn === refBase) && Number(p.TotalAmt || 0) > 0) {
+                hasLive = true; break;
+              }
+            }
+          }
+          if (!hasLive) {
+            await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = $1 AND batch_id = $2`, [o.bank_ref, o.batch_id]);
+            released++;
+            releasedRefs.push(o.bank_ref);
+          } else {
+            kept++;
+            keptRefs.push(o.bank_ref);
+          }
+        } catch (err) {
+          errors++;
+          console.warn(`[release-orphan-consumed-refs] ${o.bank_ref}: ${err.message}`);
+        }
+      }
+      res.json({
+        examined: orphans.rows.length,
+        released,
+        kept,
+        errors,
+        sample_released: releasedRefs.slice(0, 10),
+        sample_kept: keptRefs.slice(0, 5),
+      });
+    } catch (err) {
+      console.error('[release-orphan-consumed-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/cleanup-stale-external-refs
   // For each external_consumed_refs entry added in last 24h, query QB for
   // Payments matching that PrivateNote (= bank_ref) for the recorded customer.
@@ -1316,6 +1409,13 @@ export function mountPaymentBatchesApi(app, deps) {
               await db().query(
                 `DELETE FROM external_consumed_refs WHERE bank_ref = $1 AND customer_id = $2`,
                 [row.bank_ref, row.customer_id],
+              );
+              // Also release the consumed_transactions lock — without this the
+              // next auto-upload still filters the ref via step 2 (forbidden set).
+              // Safe: by this point we've confirmed no live QB Payment exists.
+              await db().query(
+                `DELETE FROM consumed_transactions WHERE bank_ref = $1`,
+                [row.bank_ref],
               );
               stale++;
               staleRefs.push(row.bank_ref);
