@@ -1275,6 +1275,57 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/peek-sheet-refs
+  // Body: { channel: "nmbnew", refs: ["101AGD..."] }
+  // Reads the channel's sheet and returns the full row for each matching bank_ref
+  // (the value in column H). Shows what BRAIN sees so we can debug "missing" refs.
+  app.post('/api/admin/peek-sheet-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || 'nmbnew');
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String) : [];
+      if (!refs.length) return res.status(400).json({ error: 'refs[] required' });
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H200000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      // Strip suffix to match against the raw sheet bank_ref (column H)
+      const wanted = new Map();
+      for (const r of refs) {
+        const base = r.replace(/[NBP]$/, '');
+        wanted.set(base, r);
+      }
+      const found = [];
+      for (let i = 1; i < sheet.length; i++) {
+        const colH = String(sheet[i][7] || '').trim();
+        if (wanted.has(colH)) {
+          found.push({
+            sheet_row_index: i + 1,
+            ref_requested: wanted.get(colH),
+            row_id: sheet[i][0] || null,
+            date_col_B: sheet[i][1] || null,
+            channel_col_C: sheet[i][2] || null,
+            narration_col_D: (sheet[i][3] || '').toString().slice(0, 80),
+            amount_col_E: sheet[i][4] || null,
+            plate_col_F: sheet[i][5] || null,
+            customer_col_G: sheet[i][6] || null,
+            bank_ref_col_H: colH,
+          });
+          wanted.delete(colH);
+        }
+      }
+      const missing = [...wanted.values()];
+      res.json({
+        total_rows_read: sheet.length,
+        last_data_row_index: sheet.length,
+        found,
+        not_found_in_sheet: missing,
+      });
+    } catch (err) {
+      console.error('[peek-sheet-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/batch-breakdown?batch_id=<uuid-or-short>
   // Returns paid/unused/failed totals + lists each unused with its assigned
   // customer + amount so the operator can audit the IP algorithm's picks.
