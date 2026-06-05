@@ -1309,6 +1309,70 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/peek-sheet-window
+  // Body: { channel, since_iso, until_iso }
+  // Returns EVERY row in the date window with full A-H columns + a running
+  // total. Use to compare BRAIN's view of the sheet against operator's
+  // visual selection. No CT/PU/preflight filtering — pure sheet read.
+  app.post('/api/admin/peek-sheet-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || 'nmbnew');
+      const sinceIso = String(req.body?.since_iso || '');
+      const untilIso = String(req.body?.until_iso || '');
+      if (!sinceIso || !untilIso) return res.status(400).json({ error: 'since_iso + until_iso required' });
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const winStart = new Date(sinceIso);
+      const winEnd = new Date(untilIso);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H200000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const rows = [];
+      let totalAmt = 0, badDateCount = 0, dupeCount = 0;
+      const seenRef = new Set();
+      const dupes = [];
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) { badDateCount++; continue; }
+        if (ts < winStart || ts >= winEnd) continue;
+        const ref = String(sheet[i][7] || '').trim();
+        const amt = sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : 0;
+        const refKey = ref + (channel === 'nmbnew' ? 'N' : channel === 'bank' ? 'B' : 'P');
+        if (ref && seenRef.has(refKey)) {
+          dupeCount++;
+          dupes.push({ sheet_row: i + 1, col_a: sheet[i][0], ref, amount: amt });
+          continue;
+        }
+        seenRef.add(refKey);
+        totalAmt += amt;
+        rows.push({
+          sheet_row: i + 1,
+          col_a: sheet[i][0],
+          date: dCell,
+          amount: amt,
+          plate: sheet[i][5] || '',
+          customer: sheet[i][6] || '',
+          ref,
+        });
+      }
+      res.json({
+        channel,
+        window: { since: sinceIso, until: untilIso },
+        total_rows_in_window: rows.length,
+        total_amount: totalAmt,
+        dupes_skipped: dupeCount,
+        bad_dates_skipped: badDateCount,
+        dupes: dupes.slice(0, 5),
+        first_5: rows.slice(0, 5),
+        last_5: rows.slice(-5),
+      });
+    } catch (err) {
+      console.error('[peek-sheet-window] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/peek-sheet-refs
   // Body: { channel: "nmbnew", refs: ["101AGD..."] }
   // Reads the channel's sheet and returns the full row for each matching bank_ref
