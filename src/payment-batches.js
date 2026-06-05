@@ -1282,10 +1282,10 @@ export function mountPaymentBatchesApi(app, deps) {
   app.get('/api/admin/preflight-catches-today', requireSecretOrJwt, async (req, res) => {
     try {
       const r = await db().query(
-        `SELECT bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, source, created_at
+        `SELECT bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, found_by, found_at
            FROM external_consumed_refs
-          WHERE created_at >= (CURRENT_DATE - INTERVAL '1 day')::timestamptz
-          ORDER BY created_at DESC`,
+          WHERE found_at >= (CURRENT_DATE - INTERVAL '1 day')::timestamptz
+          ORDER BY found_at DESC`,
       );
       // Enrich with QB details so we can see CreatedBy.
       const out = [];
@@ -1299,8 +1299,8 @@ export function mountPaymentBatchesApi(app, deps) {
           qb_id: row.qb_id,
           qb_kind: row.qb_kind,
           qb_txn_date: row.qb_txn_date,
-          source: row.source,
-          caught_at: row.created_at,
+          found_by: row.found_by,
+          caught_at: row.found_at,
           qb_total: null,
           qb_created_by: null,
           qb_create_time: null,
