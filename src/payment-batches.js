@@ -867,6 +867,67 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // GET /api/admin/qb-double-payment-scan?date=2026-06-05
+  // Scans ALL QB Payments for one date, groups by the invoice_id (LinkedTxn).
+  // Returns invoices that received >1 Payment = REAL double-payments.
+  app.get('/api/admin/qb-double-payment-scan', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.query.date || '');
+      if (!date) return res.status(400).json({ error: 'date YYYY-MM-DD required' });
+      const all = [];
+      const BATCH = 1000;
+      let start = 1;
+      while (true) {
+        const r = await qbQuery(
+          `SELECT Id, TotalAmt, TxnDate, PrivateNote, Line, CustomerRef ` +
+          `FROM Payment WHERE TxnDate = '${date}' ` +
+          `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+        );
+        const rows = r.QueryResponse?.Payment || [];
+        all.push(...rows);
+        if (rows.length < BATCH) break;
+        start += BATCH;
+      }
+      // Group by invoice id
+      const invoiceMap = {};
+      for (const p of all) {
+        for (const l of (p.Line || [])) {
+          const inv = l.LinkedTxn?.[0]?.TxnId;
+          if (!inv) continue;
+          if (!invoiceMap[inv]) invoiceMap[inv] = [];
+          invoiceMap[inv].push({
+            payment_id: p.Id,
+            paid_amount: Number(l.Amount || 0),
+            private_note: p.PrivateNote || null,
+            customer_id: p.CustomerRef?.value || null,
+          });
+        }
+      }
+      const doubles = [];
+      let excessRows = 0;
+      let excessAmount = 0;
+      for (const [invoiceId, payments] of Object.entries(invoiceMap)) {
+        if (payments.length > 1) {
+          excessRows += payments.length - 1;
+          excessAmount += payments.slice(1).reduce((s, p) => s + p.paid_amount, 0);
+          if (doubles.length < 50) doubles.push({ invoice_id: invoiceId, payments });
+        }
+      }
+      res.json({
+        date,
+        total_payments_scanned: all.length,
+        total_invoices_paid: Object.keys(invoiceMap).length,
+        invoices_with_2plus_payments: Object.values(invoiceMap).filter((v) => v.length > 1).length,
+        excess_payment_rows: excessRows,
+        excess_amount: excessAmount,
+        sample_doubles: doubles,
+      });
+    } catch (err) {
+      console.error('[qb-double-payment-scan] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/qb-payments-for-customer?customer_id=10198&date=2026-06-05
   // Returns all QB Payment records for one customer on one date — with their
   // PrivateNote (= bank_ref) and LinkedTxn count. Used to distinguish
