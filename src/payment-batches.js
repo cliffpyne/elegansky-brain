@@ -856,6 +856,59 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // GET /api/payment-uploads/asof-audit?pushed_date=YYYY-MM-DD&sheet_date=YYYY-MM-DD&channel=nmbnew
+  // For payment_uploads pushed on `pushed_date` with underlying sheet date `sheet_date`,
+  // return the AS_OF used (joined via batch → arrears_snapshot).
+  // Answers: "for the evening-tail of June 4 pushed today, was AS_OF set to yesterday?"
+  app.get('/api/payment-uploads/asof-audit', requireSecretOrJwt, async (req, res) => {
+    try {
+      const pushedDate = String(req.query.pushed_date || '');
+      const sheetDate  = String(req.query.sheet_date  || '');
+      const channelParam = req.query.channel ? String(req.query.channel) : null;
+      if (!pushedDate || !sheetDate) {
+        return res.status(400).json({ error: 'pushed_date + sheet_date required' });
+      }
+      const params = [pushedDate, sheetDate];
+      let chFilter = '';
+      if (channelParam) { params.push(channelParam); chFilter = `AND pb.channel = $${params.length}`; }
+
+      const r = await db().query(
+        `SELECT
+            arr.as_of                                          AS as_of,
+            pb.channel                                         AS channel,
+            COUNT(*)                                           AS rows,
+            COALESCE(SUM(pu.amount), 0)                        AS total
+          FROM payment_uploads pu
+          JOIN payment_batches pb              ON pb.id = pu.batch_id
+          JOIN arrears_snapshots arr           ON arr.id = pb.arrears_snapshot_id
+          LEFT JOIN consumed_transactions ct   ON ct.bank_ref = pu.bank_ref
+         WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+           AND (ct.sheet_ts  AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $2
+           AND pu.status = 'created'
+           ${chFilter}
+         GROUP BY 1, 2
+         ORDER BY 1, 2`,
+        params,
+      );
+
+      res.json({
+        pushed_date: pushedDate,
+        sheet_date: sheetDate,
+        channel: channelParam,
+        breakdown: r.rows.map((row) => ({
+          as_of: row.as_of ? new Date(row.as_of).toISOString().slice(0, 10) : null,
+          channel: row.channel,
+          rows: Number(row.rows),
+          total: Number(row.total),
+          correct_asof: row.as_of ? (new Date(row.as_of).toISOString().slice(0,10) === sheetDate) : null,
+        })),
+      });
+    } catch (err) {
+      console.error('[asof-audit] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/payment-uploads/by-sheet-date?date=YYYY-MM-DD&channel=nmbnew
   // For all payment_uploads created (pushed to QB) on a given EAT day, group by
   // the underlying bank-statement's sheet date (sheet_ts EAT-day) so we can see
