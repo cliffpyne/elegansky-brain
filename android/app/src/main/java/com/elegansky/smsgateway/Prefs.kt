@@ -13,12 +13,23 @@ import android.content.SharedPreferences
 class Prefs(ctx: Context) {
     private val sp: SharedPreferences = ctx.getSharedPreferences("brain-sms", Context.MODE_PRIVATE)
 
+    // Hard-coded defaults so the operator doesn't have to type long secrets on
+    // a phone keyboard. The UI text fields still work if Frank ever wants to
+    // override on a per-device basis.
+    companion object {
+        const val DEFAULT_BRAIN_URL = "https://elegansky-brain.onrender.com"
+        const val DEFAULT_API_KEY = "noLaiW_syb23iKYyk5Ox-sdc7H57HMUNVocgNqyfwgI"
+    }
+
     var brainUrl: String
-        get() = sp.getString("brain_url", "https://elegansky-brain.onrender.com") ?: ""
+        get() = sp.getString("brain_url", DEFAULT_BRAIN_URL) ?: DEFAULT_BRAIN_URL
         set(v) { sp.edit().putString("brain_url", v.trim().trimEnd('/')).apply() }
 
     var apiKey: String
-        get() = sp.getString("api_key", "") ?: ""
+        get() {
+            val stored = sp.getString("api_key", "") ?: ""
+            return if (stored.isBlank()) DEFAULT_API_KEY else stored
+        }
         set(v) { sp.edit().putString("api_key", v.trim()).apply() }
 
     var deviceId: String
