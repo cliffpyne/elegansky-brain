@@ -928,6 +928,124 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/qb-ref-inflation-scan?date=2026-06-05
+  // For each PrivateNote (= bank ref) in today's QB Payments, sums Payment.TotalAmt
+  // and compares to the bank deposit amount from consumed_transactions/sheet.
+  // Reports refs where QB total > bank deposit (= real money inflation).
+  // Also reports which BRAIN batch(es) pushed each problem ref.
+  app.get('/api/admin/qb-ref-inflation-scan', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.query.date || '');
+      if (!date) return res.status(400).json({ error: 'date YYYY-MM-DD required' });
+
+      // 1. Pull all today's QB Payments
+      const all = [];
+      const BATCH = 1000;
+      let start = 1;
+      while (true) {
+        const r = await qbQuery(
+          `SELECT Id, TotalAmt, TxnDate, PrivateNote, CustomerRef ` +
+          `FROM Payment WHERE TxnDate = '${date}' ` +
+          `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+        );
+        const rows = r.QueryResponse?.Payment || [];
+        all.push(...rows);
+        if (rows.length < BATCH) break;
+        start += BATCH;
+      }
+
+      // 2. Group by PrivateNote → list of Payments
+      const byRef = {};
+      for (const p of all) {
+        const ref = String(p.PrivateNote || '').trim();
+        if (!ref) continue;
+        if (!byRef[ref]) byRef[ref] = [];
+        byRef[ref].push({ qb_id: p.Id, total: Number(p.TotalAmt || 0), customer_id: p.CustomerRef?.value });
+      }
+
+      // 3. For refs with >1 Payment, fetch bank-deposit amount from sheet via consumed_transactions
+      // We look up bank_refs with suffix (N|B|P) since consumed_transactions stores with suffix
+      const refsWithDupes = Object.entries(byRef).filter(([, ps]) => ps.length > 1);
+      const refKeys = refsWithDupes.flatMap(([ref]) => [ref, ref + 'N', ref + 'B', ref + 'P']);
+      const ct = await db().query(
+        `SELECT bank_ref, batch_id FROM consumed_transactions WHERE bank_ref = ANY($1)`,
+        [refKeys],
+      );
+      const ctMap = new Map(ct.rows.map((r) => [r.bank_ref, r.batch_id]));
+
+      // 4. Find sheet_amount per ref (from payment_uploads.amount or sheet)
+      const pu = await db().query(
+        `SELECT bank_ref, amount, batch_id FROM payment_uploads WHERE bank_ref = ANY($1) AND status IN ('created','voided')`,
+        [refKeys],
+      );
+      const puMap = new Map();
+      for (const r of pu.rows) {
+        if (!puMap.has(r.bank_ref)) puMap.set(r.bank_ref, []);
+        puMap.get(r.bank_ref).push({ amount: Number(r.amount), batch_id: r.batch_id });
+      }
+
+      // 5. Build report
+      const inflated = [];
+      let totalInflation = 0;
+      const batchHits = {};
+      for (const [ref, payments] of refsWithDupes) {
+        const qbTotal = payments.reduce((s, p) => s + p.total, 0);
+        // Look up the bank_ref in consumed_transactions to find the BRAIN-known amount
+        const candidates = [ref, ref + 'N', ref + 'B', ref + 'P'];
+        let bankAmount = null;
+        let primaryBatch = null;
+        for (const c of candidates) {
+          if (puMap.has(c)) {
+            const rows = puMap.get(c);
+            // Use the max amount as the bank deposit (first push)
+            bankAmount = Math.max(...rows.map((r) => r.amount));
+            primaryBatch = rows[0].batch_id;
+            break;
+          }
+        }
+        if (bankAmount == null) continue; // can't determine
+        if (qbTotal > bankAmount) {
+          const overBy = qbTotal - bankAmount;
+          totalInflation += overBy;
+          inflated.push({
+            ref,
+            qb_total: qbTotal,
+            bank_amount: bankAmount,
+            over_by: overBy,
+            qb_payment_count: payments.length,
+            qb_payment_ids: payments.map((p) => p.qb_id),
+            brain_batch: primaryBatch ? primaryBatch.slice(0, 8) : null,
+          });
+          if (primaryBatch) {
+            const k = primaryBatch.slice(0, 8);
+            if (!batchHits[k]) batchHits[k] = { count: 0, over: 0 };
+            batchHits[k].count++;
+            batchHits[k].over += overBy;
+          }
+        }
+      }
+
+      // Sort batches by impact
+      const batchRanking = Object.entries(batchHits)
+        .sort((a, b) => b[1].over - a[1].over)
+        .map(([batch, stats]) => ({ batch_prefix: batch, refs_affected: stats.count, total_inflation: stats.over }));
+
+      res.json({
+        date,
+        total_qb_payments: all.length,
+        refs_with_inflation: inflated.length,
+        total_inflation_amount: totalInflation,
+        worst_offenders: inflated
+          .sort((a, b) => b.over_by - a.over_by)
+          .slice(0, 30),
+        batches_responsible: batchRanking,
+      });
+    } catch (err) {
+      console.error('[qb-ref-inflation-scan] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/qb-payments-for-customer?customer_id=10198&date=2026-06-05
   // Returns all QB Payment records for one customer on one date — with their
   // PrivateNote (= bank_ref) and LinkedTxn count. Used to distinguish
