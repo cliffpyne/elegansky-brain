@@ -1275,6 +1275,40 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/release-recalled-batch-cts
+  // DELETE every consumed_transactions row whose batch was recalled on/after
+  // since_iso. Covers refs with status='needs_saasant', 'failed', or 'voided'
+  // that the full-redo missed. Returns count released + sample refs.
+  // Body: { since_iso: "2026-06-04T13:15:00.000Z" }
+  app.post('/api/admin/release-recalled-batch-cts', requireSecretOrJwt, async (req, res) => {
+    try {
+      const sinceIso = String(req.body?.since_iso || '');
+      if (!sinceIso) return res.status(400).json({ error: 'since_iso required' });
+      const r = await db().query(
+        `DELETE FROM consumed_transactions ct
+          USING payment_batches pb
+          WHERE ct.batch_id = pb.id
+            AND pb.status = 'recalled'
+            AND pb.recalled_at >= $1::timestamptz
+          RETURNING ct.bank_ref, ct.batch_id`,
+        [sinceIso],
+      );
+      const byBatch = {};
+      for (const row of r.rows) {
+        const bid = String(row.batch_id).slice(0, 8);
+        byBatch[bid] = (byBatch[bid] || 0) + 1;
+      }
+      res.json({
+        released: r.rowCount,
+        by_batch: byBatch,
+        sample: r.rows.slice(0, 10).map((x) => x.bank_ref),
+      });
+    } catch (err) {
+      console.error('[release-recalled-batch-cts] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/peek-sheet-refs
   // Body: { channel: "nmbnew", refs: ["101AGD..."] }
   // Reads the channel's sheet and returns the full row for each matching bank_ref
