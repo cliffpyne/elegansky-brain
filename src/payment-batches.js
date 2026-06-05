@@ -1500,13 +1500,36 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     customerPhone: extractPhone(inv.customer || ''),
     customerId: inv.customerId, qbId: inv.qbId,
   }));
+  // FIX 2026-06-05: persist the actual asOf used (not today's date).
+  // Without this fix, the audit endpoint can't tell wrong-AS_OF batches from
+  // right-AS_OF batches because every snapshot reads "as_of=today".
+  // If caller didn't pass an asOf, derive it from the LATEST sheet_ts EAT-day
+  // in this batch's window — that's the "the bank ledger date the txns are
+  // actually from" rule per Frank's memory (feedback-asof-for-evening-tail.md).
+  let snapshotAsOf = asOf;
+  if (!snapshotAsOf) {
+    // Derive: max sheet_ts of the cleaned txns, EAT-day.
+    const maxTs = txnsClean.reduce((m, t) => {
+      const ts = t.sheet_ts || t.sheetTs || null;
+      if (!ts) return m;
+      const d = new Date(ts);
+      return (!m || d > m) ? d : m;
+    }, null);
+    if (maxTs) {
+      // Convert to EAT calendar day (UTC+3, no DST).
+      const eat = new Date(maxTs.getTime() + 3 * 60 * 60 * 1000);
+      snapshotAsOf = eat.toISOString().slice(0, 10);
+    } else {
+      snapshotAsOf = new Date().toISOString().slice(0, 10);
+    }
+  }
   const snapInsert = await db().query(
     `INSERT INTO arrears_snapshots (as_of, data, row_count, total_balance, created_by, notes)
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
     [
-      new Date().toISOString().slice(0, 10), JSON.stringify(arrears), arrears.length,
+      snapshotAsOf, JSON.stringify(arrears), arrears.length,
       arrears.reduce((s, r) => s + (Number(r.balance) || 0), 0),
-      `auto-upload-${channel}`, `auto cycle since=${sinceIso}`,
+      `auto-upload-${channel}`, `auto cycle since=${sinceIso} asOf=${snapshotAsOf}`,
     ],
   );
   const snapshotId = snapInsert.rows[0].id;
