@@ -1275,6 +1275,64 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/preflight-catches-today
+  // Lists external_consumed_refs added today + each ref's QB Payment provenance
+  // (qb_id, total, TxnDate, CreatedBy, CreateTime). Used after a fresh upload
+  // to explain the gap between sheet_sum and Kijichi-delta.
+  app.get('/api/admin/preflight-catches-today', requireSecretOrJwt, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, source, created_at
+           FROM external_consumed_refs
+          WHERE created_at >= (CURRENT_DATE - INTERVAL '1 day')::timestamptz
+          ORDER BY created_at DESC`,
+      );
+      // Enrich with QB details so we can see CreatedBy.
+      const out = [];
+      const seen = new Set();
+      for (const row of r.rows) {
+        if (seen.has(row.bank_ref)) continue; // dedupe per ref
+        seen.add(row.bank_ref);
+        const enriched = {
+          bank_ref: row.bank_ref,
+          customer_id: row.customer_id,
+          qb_id: row.qb_id,
+          qb_kind: row.qb_kind,
+          qb_txn_date: row.qb_txn_date,
+          source: row.source,
+          caught_at: row.created_at,
+          qb_total: null,
+          qb_created_by: null,
+          qb_create_time: null,
+        };
+        if (row.qb_id && row.qb_kind) {
+          try {
+            const entityName = row.qb_kind === 'payment' ? 'Payment' : 'CreditMemo';
+            const q = await qbQuery(`SELECT Id, TotalAmt, TxnDate, PrivateNote, MetaData FROM ${entityName} WHERE Id = '${row.qb_id}'`);
+            const entity = q.QueryResponse?.[entityName]?.[0];
+            if (entity) {
+              enriched.qb_total = Number(entity.TotalAmt || 0);
+              enriched.qb_created_by = entity.MetaData?.CreatedBy || null;
+              enriched.qb_create_time = entity.MetaData?.CreateTime || null;
+            }
+          } catch (err) {
+            enriched.qb_error = String(err.message || err).slice(0, 100);
+          }
+        }
+        out.push(enriched);
+      }
+      const totalAmount = out.reduce((s, r) => s + Number(r.qb_total || 0), 0);
+      res.json({
+        count: out.length,
+        total_amount: totalAmount,
+        catches: out,
+      });
+    } catch (err) {
+      console.error('[preflight-catches-today] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/customer-payment-history?customer_id=11789&days=90
   // Returns ALL Payments + CreditMemos for that customer in last N days,
   // showing PrivateNote / CreatedBy / TxnDate so we can see what formats
