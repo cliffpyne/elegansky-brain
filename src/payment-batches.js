@@ -895,6 +895,21 @@ export function mountPaymentBatchesApi(app, deps) {
         in_external: out.filter((x) => x.in_external_consumed_refs).length,
         clean: out.filter((x) => !x.in_consumed_transactions && !x.in_external_consumed_refs).length,
       };
+      // Also pull payment_uploads + batch status for each ref.
+      const pu = await db().query(
+        `SELECT pu.bank_ref, pu.status AS upload_status, pu.qb_id, pu.batch_id,
+                pb.status AS batch_status, pb.recalled_at
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.bank_ref = ANY($1)`,
+        [allKeys],
+      );
+      const puMap = new Map(pu.rows.map((r) => [r.bank_ref, r]));
+      for (const x of out) {
+        const cand = [x.ref, x.ref + 'N', x.ref + 'B', x.ref + 'P'];
+        const hit = cand.find((c) => puMap.has(c));
+        x.payment_upload = hit ? puMap.get(hit) : null;
+      }
       res.json({ counts, refs: out });
     } catch (err) {
       console.error('[batch-ref-lookup] failed:', err);
