@@ -928,6 +928,35 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/batches-info — bulk metadata lookup for a list of batch ids
+  app.post('/api/admin/batches-info', requireSecretOrJwt, async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+      // Support partial id prefixes (first 8 chars)
+      const params = [];
+      let where;
+      if (!ids.length) return res.status(400).json({ error: 'ids[] required' });
+      if (ids.every((i) => i.length === 36)) {
+        params.push(ids);
+        where = `id = ANY($1)`;
+      } else {
+        const ors = ids.map((i, n) => { params.push(i + '%'); return `id::text LIKE $${n+1}`; });
+        where = ors.join(' OR ');
+      }
+      const r = await db().query(
+        `SELECT id, channel, status, created_by, recalled_by, failure_reason,
+                created_at, finalized_at, recalled_at,
+                paid_count, unused_count, paid_total, unused_total
+           FROM payment_batches WHERE ${where} ORDER BY created_at`,
+        params,
+      );
+      res.json({ batches: r.rows });
+    } catch (err) {
+      console.error('[batches-info] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/qb-ref-inflation-scan?date=2026-06-05
   // For each PrivateNote (= bank ref) in today's QB Payments, sums Payment.TotalAmt
   // and compares to the bank deposit amount from consumed_transactions/sheet.
