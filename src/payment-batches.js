@@ -866,6 +866,39 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // GET /api/admin/qb-payments-for-customer?customer_id=10198&date=2026-06-05
+  // Returns all QB Payment records for one customer on one date — with their
+  // PrivateNote (= bank_ref) and LinkedTxn count. Used to distinguish
+  // "12 rows in xlsx" being 12 separate Payments vs 1 Payment paying 12 invoices.
+  app.get('/api/admin/qb-payments-for-customer', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customerId = String(req.query.customer_id || '');
+      const date = String(req.query.date || '');
+      if (!customerId || !date) return res.status(400).json({ error: 'customer_id + date required' });
+      const r = await qbQuery(
+        `SELECT Id, TotalAmt, TxnDate, PrivateNote, Line, CustomerRef ` +
+        `FROM Payment WHERE CustomerRef = '${customerId}' AND TxnDate = '${date}'`,
+      );
+      const payments = r.QueryResponse?.Payment || [];
+      const summary = payments.map((p) => ({
+        qb_id: p.Id,
+        total_amt: Number(p.TotalAmt || 0),
+        txn_date: p.TxnDate,
+        private_note: p.PrivateNote || null,
+        linked_txn_count: (p.Line || []).length,
+        linked_txn_summary: (p.Line || []).map((l) => ({
+          amount: Number(l.Amount || 0),
+          txn_type: l.LinkedTxn?.[0]?.TxnType || null,
+          txn_id: l.LinkedTxn?.[0]?.TxnId || null,
+        })),
+      }));
+      res.json({ customer_id: customerId, date, count: payments.length, payments: summary });
+    } catch (err) {
+      console.error('[qb-payments-for-customer] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/batch-ref-lookup
   // Body: { refs: ["101AGD...", ...] }
   // Returns status of each ref across consumed_transactions + external_consumed_refs.
