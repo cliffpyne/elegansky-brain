@@ -974,7 +974,7 @@ export function mountPaymentBatchesApi(app, deps) {
           let voided = false;
           let lastErr = null;
           try {
-            const r = await qbVoid({ entity: 'payment', id: qbId });
+            const r = await qbVoid({ kind: 'payment', qbId });
             voided = !!r && (r.ok !== false);
             if (!voided) lastErr = r?.error || 'unknown';
           } catch (err) {
