@@ -856,6 +856,54 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // GET /api/admin/sheet-ts-hour?pushed_date=YYYY-MM-DD&sheet_date=YYYY-MM-DD&channel=nmbnew
+  // Hour-of-day (EAT) distribution of sheet_ts for refs pushed on a given day.
+  // Lets us see if any morning-portion (00-16h EAT) refs got TxnDate set as
+  // if they were evening tail.
+  app.get('/api/admin/sheet-ts-hour', requireSecretOrJwt, async (req, res) => {
+    try {
+      const pushedDate = String(req.query.pushed_date || '');
+      const sheetDate  = String(req.query.sheet_date  || '');
+      const channelParam = req.query.channel ? String(req.query.channel) : null;
+      if (!pushedDate || !sheetDate) return res.status(400).json({ error: 'pushed_date + sheet_date required' });
+      const params = [pushedDate, sheetDate];
+      let chFilter = '';
+      if (channelParam) { params.push(channelParam); chFilter = `AND pb.channel = $${params.length}`; }
+      const r = await db().query(
+        `SELECT
+            EXTRACT(HOUR FROM (ct.sheet_ts AT TIME ZONE 'Africa/Dar_es_Salaam'))::int  AS eat_hour,
+            COUNT(*)                          AS rows,
+            COALESCE(SUM(pu.amount), 0)       AS total
+          FROM payment_uploads pu
+          JOIN payment_batches pb              ON pb.id = pu.batch_id
+          LEFT JOIN consumed_transactions ct   ON ct.bank_ref = pu.bank_ref
+         WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+           AND (ct.sheet_ts  AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $2
+           AND pu.status = 'created'
+           ${chFilter}
+         GROUP BY 1
+         ORDER BY 1 NULLS LAST`,
+        params,
+      );
+      res.json({
+        pushed_date: pushedDate,
+        sheet_date: sheetDate,
+        channel: channelParam,
+        by_eat_hour: r.rows.map((row) => ({
+          eat_hour: row.eat_hour,
+          rows: Number(row.rows),
+          total: Number(row.total),
+          should_be_txndate: row.eat_hour == null ? null
+            : (row.eat_hour < 16 || (row.eat_hour === 16 && false))  // <16:15
+                ? sheetDate
+                : new Date(new Date(sheetDate).getTime() + 24*60*60*1000).toISOString().slice(0,10),
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/release-voided-refs
   // For refs that are 'voided' in payment_uploads but still locked in
   // consumed_transactions (= partial recall left them stranded), delete the
