@@ -13,11 +13,19 @@ import { getSetting, setSetting } from '@/lib/brain-api';
 // don't use Supabase JWT — they're producer/consumer flow secrets — so we
 // hit them directly with a separate prefix. For the dashboard we add a thin
 // wrapper that posts through the existing BRAIN host.
+import { supabase } from '@/lib/supabase';
+
 const BRAIN_BASE = import.meta.env.VITE_BRAIN_BASE || '';
 
-async function fetchMessages(secret: string) {
+async function authHeader(): Promise<Record<string, string>> {
+  const session = (await supabase.auth.getSession()).data.session;
+  const token = session?.access_token;
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+async function fetchMessages(_secret: string) {
   const r = await fetch(`${BRAIN_BASE}/api/admin-sms?limit=100`, {
-    headers: { 'X-Report-Secret': secret },
+    headers: await authHeader(),
   });
   if (!r.ok) throw new Error(`fetch ${r.status}: ${await r.text()}`);
   return (await r.json()) as {
@@ -34,10 +42,10 @@ async function fetchMessages(secret: string) {
   };
 }
 
-async function sendTest(secret: string, message: string) {
+async function sendTest(_secret: string, message: string) {
   const r = await fetch(`${BRAIN_BASE}/api/admin-sms/queue`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Report-Secret': secret },
+    headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
     body: JSON.stringify({ message, kind: 'test' }),
   });
   if (!r.ok) throw new Error(`queue ${r.status}: ${await r.text()}`);
