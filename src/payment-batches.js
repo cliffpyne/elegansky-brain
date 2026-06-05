@@ -573,7 +573,23 @@ export function mountPaymentBatchesApi(app, deps) {
         `SELECT * FROM payment_uploads WHERE batch_id=$1 AND status='created' ORDER BY created_at`,
         [batchId],
       );
-      const voids = await voidUploadsBestEffort(ups.rows, qbVoid);
+      // Retry failed voids up to 3 times with backoff. The single-pass
+      // voidUploadsBestEffort lets transient QB errors silently strand
+      // Payments — root cause of the 2026-06-05 inflation incident.
+      let voids = await voidUploadsBestEffort(ups.rows, qbVoid);
+      for (let attempt = 2; attempt <= 3; attempt++) {
+        const stillFailed = voids.filter((v) => !v.ok);
+        if (!stillFailed.length) break;
+        console.log(`[recall ${batchId}] retry attempt ${attempt}: ${stillFailed.length} voids still failing`);
+        await new Promise((r) => setTimeout(r, 2000 * attempt)); // 4s, 6s
+        // voidUploadsBestEffort expects payment_upload rows — rebuild them.
+        const failedUploadIds = new Set(stillFailed.map((v) => v.upload_id));
+        const failedUploads = ups.rows.filter((u) => failedUploadIds.has(u.id));
+        const retryResults = await voidUploadsBestEffort(failedUploads, qbVoid);
+        // Merge: keep the successes, overlay the new attempt
+        const retryById = new Map(retryResults.map((r) => [r.upload_id, r]));
+        voids = voids.map((v) => v.ok ? v : (retryById.get(v.upload_id) || v));
+      }
       const allOk = voids.every((v) => v.ok);
 
       const c = await db().connect();
@@ -924,6 +940,77 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[qb-double-payment-scan] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/admin/verify-recall?batch_id=...
+  // For a given batch, check QB to see if any Payments with that batch's refs
+  // are still active. Returns which refs are surviving and which are clean.
+  // SAFE — read-only. Use BEFORE any re-fire to confirm recall fully succeeded.
+  app.get('/api/admin/verify-recall', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.query.batch_id || '');
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      // Get all refs that were in this batch via payment_uploads
+      const refs = await db().query(
+        `SELECT pu.bank_ref, pu.customer_id, pu.status, pu.qb_id, pu.amount
+           FROM payment_uploads pu
+          WHERE pu.batch_id = $1`,
+        [batchId],
+      );
+      if (!refs.rows.length) return res.json({ batch_id: batchId, refs_count: 0, surviving: [] });
+      // Group by customer to minimize QB queries
+      const byCustomer = new Map();
+      for (const r of refs.rows) {
+        if (!r.customer_id) continue;
+        if (!byCustomer.has(r.customer_id)) byCustomer.set(r.customer_id, []);
+        byCustomer.get(r.customer_id).push(r);
+      }
+      const surviving = [];
+      const customerIds = [...byCustomer.keys()];
+      const CHUNK = 50;
+      const dateFrom = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      for (let i = 0; i < customerIds.length; i += CHUNK) {
+        const chunk = customerIds.slice(i, i + CHUNK);
+        const inList = chunk.map((id) => `'${id}'`).join(',');
+        try {
+          const r = await qbQuery(
+            `SELECT Id, PrivateNote, CustomerRef, TotalAmt, TxnDate ` +
+            `FROM Payment WHERE CustomerRef IN (${inList}) AND TxnDate >= '${dateFrom}' MAXRESULTS 1000`,
+          );
+          const pmts = r.QueryResponse?.Payment || [];
+          // For each batch ref, see if a Payment in QB matches it
+          for (const cid of chunk) {
+            const batchRefs = byCustomer.get(cid) || [];
+            for (const br of batchRefs) {
+              const matching = pmts.filter((p) =>
+                String(p.CustomerRef?.value || '') === cid &&
+                String(p.PrivateNote || '').trim() === String(br.bank_ref).replace(/[NBP]$/, ''),
+              );
+              if (matching.length > 0) {
+                surviving.push({
+                  bank_ref: br.bank_ref,
+                  customer_id: cid,
+                  batch_upload_status: br.status,
+                  qb_payments_still_present: matching.map((m) => ({ qb_id: m.Id, total: Number(m.TotalAmt || 0), txn_date: m.TxnDate })),
+                });
+              }
+            }
+          }
+        } catch (err) {
+          console.error('[verify-recall] customer chunk failed:', err.message);
+        }
+      }
+      res.json({
+        batch_id: batchId,
+        refs_in_batch: refs.rows.length,
+        surviving_count: surviving.length,
+        clean: surviving.length === 0,
+        surviving,
+      });
+    } catch (err) {
+      console.error('[verify-recall] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });
