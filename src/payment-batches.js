@@ -459,10 +459,20 @@ export function mountPaymentBatchesApi(app, deps) {
       }
 
       // Safety net 4: dry-run — records the plan but doesn't touch QB.
+      // CRITICAL FIX 2026-06-05: prepareAutoUpload inserts into
+      // consumed_transactions BEFORE we reach this branch — silently locking
+      // those refs from any future real upload. On dry_run we MUST delete
+      // them here, otherwise plan-mode agent tests leak refs forever.
+      // Incident: 23 NMB morning refs from 04.06 were orphaned in QB until
+      // Frank caught it — see project_evening_audit_pending_items.md item #7.
       if (dryRun) {
         await db().query(
+          `DELETE FROM consumed_transactions WHERE batch_id = $1`,
+          [result.batchId],
+        );
+        await db().query(
           `UPDATE payment_batches SET status='finalized', finalized_at=now(),
-             failure_reason='dry_run — no QB calls' WHERE id=$1`,
+             failure_reason='dry_run — no QB calls; consumed_transactions cleared so refs stay eligible for real upload' WHERE id=$1`,
           [result.batchId],
         );
         for (const p of result.paid) {
