@@ -1275,6 +1275,124 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/full-redo-window
+  // Nuclear option: void every BRAIN-created Payment whose payment_uploads
+  // row was created on/after since_iso, then clear all related locks so a
+  // fresh fire can start with a 100% clean slate.
+  // Body: { since_iso: "2026-06-04T13:15:00.000Z" }  ← required
+  app.post('/api/admin/full-redo-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const sinceIso = String(req.body?.since_iso || '');
+      if (!sinceIso) return res.status(400).json({ error: 'since_iso required' });
+      // 1. Find all live BRAIN Payments (status='created', qb_id set) in window
+      const r = await db().query(
+        `SELECT pu.id, pu.bank_ref, pu.qb_id, pu.kind, pu.amount, pu.batch_id, pb.channel
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.status = 'created'
+            AND pu.qb_id IS NOT NULL
+            AND pu.created_at >= $1::timestamptz
+          ORDER BY pu.created_at`,
+        [sinceIso],
+      );
+      const rows = r.rows;
+      const total = rows.length;
+      const byChannel = {};
+      for (const x of rows) {
+        const c = x.channel || 'unknown';
+        byChannel[c] = byChannel[c] || { count: 0, sum: 0 };
+        byChannel[c].count++;
+        byChannel[c].sum += Number(x.amount || 0);
+      }
+      // 2. Void each in QB with 8x concurrency
+      const PAR = 8;
+      let cursor = 0;
+      let okCount = 0, failCount = 0;
+      const fails = [];
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= rows.length) return;
+          const row = rows[i];
+          try {
+            await qbVoid({ kind: row.kind === 'credit_memo' ? 'credit_memo' : 'payment', qbId: row.qb_id });
+            await db().query(
+              `UPDATE payment_uploads SET status='voided', voided_at=now() WHERE id=$1`,
+              [row.id],
+            );
+            okCount++;
+          } catch (err) {
+            // retry once after 3s
+            try {
+              await new Promise((r) => setTimeout(r, 3000));
+              await qbVoid({ kind: row.kind === 'credit_memo' ? 'credit_memo' : 'payment', qbId: row.qb_id });
+              await db().query(
+                `UPDATE payment_uploads SET status='voided', voided_at=now() WHERE id=$1`,
+                [row.id],
+              );
+              okCount++;
+            } catch (err2) {
+              failCount++;
+              fails.push({ qb_id: row.qb_id, bank_ref: row.bank_ref, err: String(err2.message || err2).slice(0, 100) });
+            }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+
+      // 3. Cleanup state for every ref touched (whether void succeeded or not —
+      //    if void failed, we still need CT released so fresh fire can retry).
+      const refs = rows.map((r) => r.bank_ref);
+      let ctReleased = 0, extReleased = 0;
+      if (refs.length) {
+        const ct = await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = ANY($1) RETURNING bank_ref`, [refs]);
+        ctReleased = ct.rowCount;
+        const ext = await db().query(`DELETE FROM external_consumed_refs WHERE bank_ref = ANY($1) RETURNING bank_ref`, [refs]);
+        extReleased = ext.rowCount;
+      }
+      // 4. Also clear ALL external_consumed_refs added in the window (stale catches).
+      const extWindow = await db().query(
+        `DELETE FROM external_consumed_refs WHERE found_at >= $1::timestamptz RETURNING bank_ref`,
+        [sinceIso],
+      );
+      // 5. Also DELETE dry_run payment_uploads from the window so they don't confuse later queries
+      const dryDel = await db().query(
+        `DELETE FROM payment_uploads WHERE status = 'dry_run' AND created_at >= $1::timestamptz RETURNING id`,
+        [sinceIso],
+      );
+      // 6. Mark batches in window as recalled
+      const batchIds = [...new Set(rows.map((r) => r.batch_id))];
+      let batchesMarked = 0;
+      if (batchIds.length) {
+        const bm = await db().query(
+          `UPDATE payment_batches SET status='recalled', recalled_at=now()
+            WHERE id = ANY($1) AND status IN ('finalized', 'pending') RETURNING id`,
+          [batchIds],
+        );
+        batchesMarked = bm.rowCount;
+      }
+      // 7. Release any auto_upload_locks
+      const lockDel = await db().query(`DELETE FROM auto_upload_locks RETURNING channel`);
+
+      res.json({
+        scanned_uploads: total,
+        by_channel_before: byChannel,
+        voided_ok: okCount,
+        voided_failed: failCount,
+        fails: fails.slice(0, 10),
+        consumed_transactions_released: ctReleased,
+        external_consumed_refs_released_by_ref: extReleased,
+        external_consumed_refs_released_by_window: extWindow.rowCount,
+        dry_run_uploads_deleted: dryDel.rowCount,
+        batches_marked_recalled: batchesMarked,
+        auto_upload_locks_cleared: lockDel.rowCount,
+      });
+    } catch (err) {
+      console.error('[full-redo-window] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/force-release-channel-lock
   // Body: { channel: "nmbnew" | "bank" | "iphone_bank" }
   // Operator-triggered force-release when a lock got orphaned (eg deploy
