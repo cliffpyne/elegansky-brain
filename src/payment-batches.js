@@ -856,6 +856,37 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // POST /api/admin/release-voided-refs
+  // For refs that are 'voided' in payment_uploads but still locked in
+  // consumed_transactions (= partial recall left them stranded), delete the
+  // consumed_transactions row so the auto-upload can re-push them.
+  app.post('/api/admin/release-voided-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = req.body?.batch_id ? String(req.body.batch_id) : null;
+      const where = batchId
+        ? `WHERE pu.batch_id = $1 AND pu.status = 'voided'`
+        : `WHERE pu.status = 'voided'`;
+      const params = batchId ? [batchId] : [];
+      const result = await db().query(
+        `DELETE FROM consumed_transactions
+          WHERE bank_ref IN (
+            SELECT pu.bank_ref FROM payment_uploads pu ${where}
+          )
+          RETURNING bank_ref`,
+        params,
+      );
+      res.json({
+        ok: true,
+        released_count: result.rowCount,
+        batch_id_filter: batchId,
+        sample: result.rows.slice(0, 10).map((r) => r.bank_ref),
+      });
+    } catch (err) {
+      console.error('[release-voided-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/payment-uploads/asof-audit?pushed_date=YYYY-MM-DD&sheet_date=YYYY-MM-DD&channel=nmbnew
   // For payment_uploads pushed on `pushed_date` with underlying sheet date `sheet_date`,
   // return the AS_OF used (joined via batch → arrears_snapshot).
