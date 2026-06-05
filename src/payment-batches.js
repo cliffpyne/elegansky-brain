@@ -1275,6 +1275,58 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/batch-breakdown?batch_id=<uuid-or-short>
+  // Returns paid/unused/failed totals + lists each unused with its assigned
+  // customer + amount so the operator can audit the IP algorithm's picks.
+  app.get('/api/admin/batch-breakdown', requireSecretOrJwt, async (req, res) => {
+    try {
+      const id = String(req.query.batch_id || '');
+      if (!id) return res.status(400).json({ error: 'batch_id required' });
+      // Resolve short id
+      let fullId = id;
+      if (id.length < 36) {
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [id + '%']);
+        if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = r.rows[0].id;
+      }
+      const batch = await db().query(`SELECT id, channel, status, paid_count, unused_count, sheet_total, paid_total, unused_total, created_at FROM payment_batches WHERE id=$1`, [fullId]);
+      if (!batch.rows.length) return res.status(404).json({ error: 'batch not found' });
+      const rows = await db().query(
+        `SELECT kind, bank_ref, customer_name, customer_id, amount, status, qb_id, invoice_no
+           FROM payment_uploads WHERE batch_id = $1 ORDER BY kind, customer_name`,
+        [fullId],
+      );
+      const paid = rows.rows.filter((r) => r.kind === 'payment');
+      const unused = rows.rows.filter((r) => r.kind === 'credit_memo');
+      const failed = rows.rows.filter((r) => r.status === 'failed');
+      const sum = (arr) => arr.reduce((s, r) => s + Number(r.amount || 0), 0);
+      res.json({
+        batch: batch.rows[0],
+        paid: {
+          count: paid.length,
+          total: sum(paid),
+          by_status: paid.reduce((acc, r) => { acc[r.status] = (acc[r.status] || 0) + 1; return acc; }, {}),
+        },
+        unused: {
+          count: unused.length,
+          total: sum(unused),
+          rows: unused.map((r) => ({
+            bank_ref: r.bank_ref,
+            customer_name: r.customer_name,
+            customer_id: r.customer_id,
+            amount: Number(r.amount || 0),
+            status: r.status,
+            qb_id: r.qb_id,
+          })),
+        },
+        failed: failed.length ? failed.map((r) => ({ bank_ref: r.bank_ref, kind: r.kind, customer_name: r.customer_name, amount: Number(r.amount || 0) })) : [],
+      });
+    } catch (err) {
+      console.error('[batch-breakdown] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/full-redo-window
   // Nuclear option: void every BRAIN-created Payment whose payment_uploads
   // row was created on/after since_iso, then clear all related locks so a
