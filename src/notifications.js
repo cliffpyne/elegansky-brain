@@ -63,9 +63,15 @@ export function mountNotificationsApi(app, { requireSharedSecret, requireSupabas
           WHERE status='sending' AND picked_up_at < now() - INTERVAL '5 minutes'`,
       );
 
-      // Atomically claim up to 50 pending rows
+      // Atomically claim up to 50 pending rows. Recipients are managed via
+      // the dashboard /admin-sms page which writes to app_settings.admin_phones.
+      // We also fall back to the legacy sms_recipients key for backwards
+      // compatibility with older docs.
       const rcp = await db().query(
-        `SELECT value::jsonb AS list FROM app_settings WHERE key='sms_recipients'`,
+        `SELECT value::jsonb AS list FROM app_settings
+          WHERE key IN ('admin_phones', 'sms_recipients')
+          ORDER BY CASE key WHEN 'admin_phones' THEN 0 ELSE 1 END
+          LIMIT 1`,
       );
       const recipients = Array.isArray(rcp.rows[0]?.list) ? rcp.rows[0].list : [];
 
