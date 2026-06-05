@@ -856,6 +856,57 @@ export function mountPaymentBatchesApi(app, deps) {
   // Returns per-channel and per-status totals for a given Africa/Dar_es_Salaam
   // day, plus a grand total. Defaults to today EAT. Used for the daily
   // "what did we push?" view. Auth: X-Report-Secret or JWT.
+  // GET /api/payment-uploads/by-sheet-date?date=YYYY-MM-DD&channel=nmbnew
+  // For all payment_uploads created (pushed to QB) on a given EAT day, group by
+  // the underlying bank-statement's sheet date (sheet_ts EAT-day) so we can see
+  // which actual transaction days got caught up that day. Answers questions like
+  // "the 1,565 NMB rows we pushed on 06-04 — which sheet dates did they come from?"
+  app.get('/api/payment-uploads/by-sheet-date', requireSecretOrJwt, async (req, res) => {
+    try {
+      const dayParam = String(req.query.date || '');
+      const channelParam = req.query.channel ? String(req.query.channel) : null;
+      if (!dayParam) return res.status(400).json({ error: 'date=YYYY-MM-DD required' });
+
+      const params = [dayParam];
+      let chFilter = '';
+      if (channelParam) {
+        params.push(channelParam);
+        chFilter = `AND pb.channel = $${params.length}`;
+      }
+
+      const r = await db().query(
+        `SELECT
+           COALESCE(pb.channel, 'unknown')                                 AS channel,
+           (ct.sheet_ts AT TIME ZONE 'Africa/Dar_es_Salaam')::date          AS sheet_date,
+           COUNT(*)                                                        AS rows,
+           COALESCE(SUM(pu.amount), 0)                                     AS total
+         FROM payment_uploads pu
+         JOIN payment_batches pb        ON pb.id = pu.batch_id
+         LEFT JOIN consumed_transactions ct ON ct.bank_ref = pu.bank_ref
+         WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+           AND pu.status = 'created'
+           ${chFilter}
+         GROUP BY 1, 2
+         ORDER BY 1, 2 NULLS LAST`,
+        params,
+      );
+
+      const out = {};
+      for (const row of r.rows) {
+        const ch = row.channel;
+        if (!out[ch]) out[ch] = { channel: ch, by_sheet_date: [], total_rows: 0, total_amount: 0 };
+        const sheetDate = row.sheet_date ? new Date(row.sheet_date).toISOString().slice(0, 10) : null;
+        out[ch].by_sheet_date.push({ sheet_date: sheetDate, rows: Number(row.rows), total: Number(row.total) });
+        out[ch].total_rows += Number(row.rows);
+        out[ch].total_amount += Number(row.total);
+      }
+      res.json({ pushed_on: dayParam, channels: Object.values(out) });
+    } catch (err) {
+      console.error('[by-sheet-date] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get('/api/payment-uploads/today-totals', requireSecretOrJwt, async (req, res) => {
     try {
       const dayParam = req.query.date ? String(req.query.date) : null; // 'YYYY-MM-DD' in EAT
