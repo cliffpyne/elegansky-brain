@@ -23,6 +23,41 @@ import { db } from './db/pool.js';
 import { qbQuery } from './qb-client.js';
 import { readSheet } from './sheets.js';
 
+const KIJICHI_ACCOUNT_NAME = 'Kijichi Collection AC';
+
+// Channel → sheet config. Matches CHANNEL_SHEETS in payment-batches.js.
+const BANK_SHEETS = {
+  nmbnew:      { sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
+  bank:        { sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED' },
+  iphone_bank: { sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+};
+
+/**
+ * Compute upload-day start instant (UTC). Upload-day rolls over at 16:15 EAT
+ * (kili1615 cutoff). Returns a Date — the boundary BEFORE which txns belong
+ * to the previous upload-day, AT/AFTER which they belong to the current one.
+ */
+function uploadDayStart(now = new Date()) {
+  // 16:15 EAT today in UTC = today's 13:15 UTC
+  const today1315utc = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 13, 15, 0,
+  ));
+  if (now >= today1315utc) return today1315utc;
+  return new Date(today1315utc.getTime() - 24 * 60 * 60 * 1000);
+}
+
+/**
+ * Parse a "DD.MM.YYYY HH:MM:SS" sheet timestamp string into a Date (EAT→UTC).
+ */
+function parseSheetTs(s) {
+  if (!s) return null;
+  const m = String(s).trim().match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const [, d, mo, y, hh, mm, ss] = m;
+  // EAT = UTC+3 → subtract 3 from hour.
+  return new Date(Date.UTC(+y, +mo - 1, +d, +hh - 3, +mm, +(ss || 0)));
+}
+
 // Frank's tracker sheet (OFFICE / POLICE / TRACKER tabs).
 // Override with env OFFICER_TRACKER_SHEET_ID if it ever moves.
 const TRACKER_SHEET_ID = process.env.OFFICER_TRACKER_SHEET_ID
@@ -824,6 +859,73 @@ function todayEatDate() {
   return eat.toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+// ── Day-summary KPIs ───────────────────────────────────────────────────────
+
+/**
+ * Sum of QB Payments deposited TODAY into the Kijichi Collection AC account,
+ * regardless of source (BRAIN upload, manual, SaasAnt). Uses TxnDate = today.
+ */
+export async function getKijichiTodayTotal() {
+  // Look up the account id once per session.
+  const today = todayEatDate();
+  const acctRes = await qbQuery(
+    `SELECT Id, Name FROM Account WHERE Name = '${KIJICHI_ACCOUNT_NAME.replace(/'/g, "''")}'`,
+  );
+  const acct = acctRes.QueryResponse?.Account?.[0];
+  if (!acct) {
+    return { account_name: KIJICHI_ACCOUNT_NAME, account_id: null, date: today,
+             rows: 0, total: 0, note: 'account not found in QB' };
+  }
+  // Sum Payment.TotalAmt for TxnDate=today AND DepositToAccountRef=<id>.
+  // QBO LIKE/ORDER on DepositToAccountRef supports equality.
+  const all = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, TotalAmt, TxnDate, DepositToAccountRef ` +
+      `FROM Payment WHERE TxnDate = '${today}' AND DepositToAccountRef = '${acct.Id}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Payment || [];
+    all.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  const total = all.reduce((s, p) => s + Number(p.TotalAmt || 0), 0);
+  return { account_name: acct.Name, account_id: acct.Id, date: today,
+           rows: all.length, total };
+}
+
+/**
+ * Per-channel total from each bank's sheet since the current upload-day-start
+ * (last kili1615 cutoff). Reads PASSED tab, parses date col (B), sums amount
+ * col (E). Used to show "what's in the sheet since upload day began".
+ */
+export async function getSheetTotalsSinceUploadDayStart() {
+  const start = uploadDayStart(new Date());
+  const out = [];
+  for (const [channel, cfg] of Object.entries(BANK_SHEETS)) {
+    let rows = 0, total = 0;
+    try {
+      const sheet = await readSheet(cfg.sheetId, `${cfg.tab}!A1:F100000`);
+      const data = sheet.values || [];
+      for (let i = 1; i < data.length; i++) {
+        const r = data[i] || [];
+        const ts = parseSheetTs(r[1]);
+        if (!ts || ts < start) continue;
+        rows++;
+        total += Number(String(r[4] || '').replace(/[, ]/g, '')) || 0;
+      }
+    } catch (e) {
+      // Continue with 0 if a sheet read fails.
+      console.error('[sheet-totals]', channel, e.message);
+    }
+    out.push({ channel, rows, total });
+  }
+  return { upload_day_start: start.toISOString(), by_channel: out };
+}
+
 // ── HTTP mount ──────────────────────────────────────────────────────────────
 
 export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
@@ -955,6 +1057,26 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
       res.json(report);
     } catch (err) {
       console.error('[officer-reports] today failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/officer-reports/kijichi-today
+  app.get('/api/officer-reports/kijichi-today', requireSecretOrJwt, async (req, res) => {
+    try {
+      const out = await getKijichiTodayTotal();
+      res.json(out);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/officer-reports/sheet-totals-uploadday
+  app.get('/api/officer-reports/sheet-totals-uploadday', requireSecretOrJwt, async (req, res) => {
+    try {
+      const out = await getSheetTotalsSinceUploadDayStart();
+      res.json(out);
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });

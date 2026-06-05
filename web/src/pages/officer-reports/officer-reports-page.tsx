@@ -12,7 +12,11 @@ import {
   refreshOfficerArrears,
   refreshOfficerOfflineMotos,
   rebuildOfficerMap,
+  getKijichiToday,
+  getSheetTotalsUploadDay,
   type OfficerReport,
+  type KijichiToday,
+  type SheetTotalsUploadDay,
 } from '@/lib/brain-api';
 
 const fmt = (n: number) => n.toLocaleString();
@@ -27,14 +31,22 @@ const fmtTime = (s: string | null) => {
 
 export function OfficerReportsPage() {
   const [report, setReport] = useState<OfficerReport | null>(null);
+  const [kijichi, setKijichi] = useState<KijichiToday | null>(null);
+  const [sheetTotals, setSheetTotals] = useState<SheetTotalsUploadDay | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState<string | null>(null); // which button is busy
   const [lastFetch, setLastFetch] = useState<Date | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const r = await getOfficerReportToday();
+      const [r, k, s] = await Promise.all([
+        getOfficerReportToday(),
+        getKijichiToday().catch(() => null),
+        getSheetTotalsUploadDay().catch(() => null),
+      ]);
       setReport(r);
+      setKijichi(k);
+      setSheetTotals(s);
       setError(null);
       setLastFetch(new Date());
     } catch (e) {
@@ -149,6 +161,35 @@ export function OfficerReportsPage() {
         <Card className="mb-4 border-red-300">
           <CardContent className="py-3 text-red-700 text-sm">Error: {error}</CardContent>
         </Card>
+      )}
+
+      {/* Sheet-totals row: what's flowed in since the upload-day started (last kili1615) */}
+      {sheetTotals && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+          <Card className="border-purple-300">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm text-purple-700">QB Kijichi today (all sources)</CardTitle>
+            </CardHeader>
+            <CardContent className="text-2xl font-bold text-purple-700">
+              {kijichi ? fmt(kijichi.total) : '—'}
+              <div className="text-xs font-normal text-muted-foreground">{kijichi ? kijichi.rows + ' txns' : ''}</div>
+            </CardContent>
+          </Card>
+          {sheetTotals.by_channel.map((c) => (
+            <Card key={c.channel}>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm text-muted-foreground">
+                  {c.channel === 'nmbnew' ? 'NMB sheet' : c.channel === 'bank' ? 'CRDB sheet' : 'iPhone sheet'}
+                  <span className="text-xs"> (since last kili1615)</span>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-2xl font-bold">
+                {fmt(c.total)}
+                <div className="text-xs font-normal text-muted-foreground">{c.rows} rows</div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
       )}
 
       {grand && (

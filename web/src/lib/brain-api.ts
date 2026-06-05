@@ -463,3 +463,27 @@ export async function rebuildOfficerMap(): Promise<{ ok: boolean; customers_mapp
   if (!r.ok) throw new Error(`rebuild-map ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+export interface KijichiToday {
+  account_name: string;
+  account_id: string | null;
+  date: string;
+  rows: number;
+  total: number;
+  note?: string;
+}
+export async function getKijichiToday(): Promise<KijichiToday> {
+  const r = await authed('/api/officer-reports/kijichi-today');
+  if (!r.ok) throw new Error(`kijichi-today ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export interface SheetTotalsUploadDay {
+  upload_day_start: string;
+  by_channel: Array<{ channel: string; rows: number; total: number }>;
+}
+export async function getSheetTotalsUploadDay(): Promise<SheetTotalsUploadDay> {
+  const r = await authed('/api/officer-reports/sheet-totals-uploadday');
+  if (!r.ok) throw new Error(`sheet-totals-uploadday ${r.status}: ${await r.text()}`);
+  return r.json();
+}
