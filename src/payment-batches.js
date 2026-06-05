@@ -1275,6 +1275,74 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/release-all-orphans-today
+  // Bulk version: finds ALL orphaned consumed_transactions rows from batches
+  // created in last 24h (where CT row has no matching PU row), verifies QB
+  // has no live Payment, and releases the lock.
+  app.post('/api/admin/release-all-orphans-today', requireSecretOrJwt, async (req, res) => {
+    try {
+      const orphans = await db().query(
+        `SELECT ct.bank_ref, ct.batch_id, pb.channel, pb.created_at
+           FROM consumed_transactions ct
+           JOIN payment_batches pb ON pb.id = ct.batch_id
+           LEFT JOIN payment_uploads pu
+             ON pu.bank_ref = ct.bank_ref AND pu.batch_id = ct.batch_id
+          WHERE pb.created_at >= (CURRENT_DATE - INTERVAL '1 day')::timestamptz
+            AND pu.id IS NULL
+          ORDER BY pb.created_at`,
+      );
+      const sinceISO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      let released = 0, kept = 0, errors = 0;
+      const releasedRefs = [];
+      const keptRefs = [];
+      for (const o of orphans.rows) {
+        try {
+          const cust = await db().query(
+            `SELECT customer_id FROM payment_uploads
+              WHERE bank_ref = $1 AND customer_id IS NOT NULL
+              LIMIT 1`,
+            [o.bank_ref],
+          );
+          const custId = cust.rows[0]?.customer_id;
+          let hasLive = false;
+          if (custId) {
+            const refBase = o.bank_ref.replace(/[NBP]$/, '');
+            const q = await qbQuery(
+              `SELECT Id, TotalAmt, PrivateNote FROM Payment ` +
+              `WHERE CustomerRef = '${custId}' AND TxnDate >= '${sinceISO}' MAXRESULTS 200`,
+            );
+            const pmts = q.QueryResponse?.Payment || [];
+            for (const p of pmts) {
+              const pn = String(p.PrivateNote || '').trim();
+              if ((pn === o.bank_ref || pn === refBase) && Number(p.TotalAmt || 0) > 0) {
+                hasLive = true; break;
+              }
+            }
+          }
+          if (!hasLive) {
+            await db().query(`DELETE FROM consumed_transactions WHERE bank_ref = $1 AND batch_id = $2`, [o.bank_ref, o.batch_id]);
+            released++;
+            if (releasedRefs.length < 20) releasedRefs.push(o.bank_ref);
+          } else {
+            kept++;
+            if (keptRefs.length < 10) keptRefs.push(o.bank_ref);
+          }
+        } catch (err) {
+          errors++;
+        }
+      }
+      res.json({
+        examined: orphans.rows.length,
+        released, kept, errors,
+        sample_released: releasedRefs,
+        sample_kept: keptRefs,
+      });
+    } catch (err) {
+      console.error('[release-all-orphans-today] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/release-orphan-consumed-refs
   // Finds consumed_transactions rows from recent batches that have NO matching
   // payment_uploads row (meaning preflight caught the ref and it never got pushed).
