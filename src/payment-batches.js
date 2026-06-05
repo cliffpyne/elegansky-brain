@@ -1275,6 +1275,46 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/mark-stuck-as-saasant
+  // Body: { since_iso: "2026-06-04T13:15:00.000Z" } - required
+  // Finds unused PUs (kind='payment' with invoice_no=NULL) that have qb_id=NULL
+  // (= push failed/skipped silently) and updates status to 'needs_saasant' so
+  // they show up in the /api/saasant-pending CSV export for manual processing.
+  // This is the operator-approved policy as of 2026-06-06: anything BRAIN
+  // couldn't push to QB goes to needs_saasant for SaasAnt manual upload.
+  app.post('/api/admin/mark-stuck-as-saasant', requireSecretOrJwt, async (req, res) => {
+    try {
+      const sinceIso = String(req.body?.since_iso || '');
+      if (!sinceIso) return res.status(400).json({ error: 'since_iso required' });
+      const r = await db().query(
+        `UPDATE payment_uploads
+            SET status = 'needs_saasant',
+                failure_reason = COALESCE(failure_reason, 'stuck — customer resolution failed, manual SaasAnt upload required')
+          WHERE kind = 'payment'
+            AND invoice_no IS NULL
+            AND qb_id IS NULL
+            AND status = 'created'
+            AND created_at >= $1::timestamptz
+          RETURNING bank_ref, customer_name, amount, batch_id`,
+        [sinceIso],
+      );
+      const total = r.rows.reduce((s, x) => s + Number(x.amount || 0), 0);
+      res.json({
+        marked: r.rowCount,
+        total_amount: total,
+        sample: r.rows.slice(0, 15).map((x) => ({
+          ref: x.bank_ref,
+          amount: Number(x.amount || 0),
+          customer: x.customer_name,
+          batch: String(x.batch_id).slice(0, 8),
+        })),
+      });
+    } catch (err) {
+      console.error('[mark-stuck-as-saasant] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/release-recalled-batch-cts
   // DELETE every consumed_transactions row whose batch was recalled on/after
   // since_iso. Covers refs with status='needs_saasant', 'failed', or 'voided'
