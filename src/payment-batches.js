@@ -1275,6 +1275,46 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/customer-payment-history?customer_id=11789&days=90
+  // Returns ALL Payments + CreditMemos for that customer in last N days,
+  // showing PrivateNote / CreatedBy / TxnDate so we can see what formats
+  // SaasAnt vs BRAIN vs manual entries actually used.
+  app.get('/api/admin/customer-payment-history', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customerId = String(req.query.customer_id || '');
+      const days = Math.min(Number(req.query.days) || 90, 365);
+      if (!customerId) return res.status(400).json({ error: 'customer_id required' });
+      const sinceISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const out = { customer_id: customerId, since: sinceISO, payments: [], credit_memos: [] };
+      for (const entity of ['Payment', 'CreditMemo']) {
+        const r = await qbQuery(
+          `SELECT Id, TotalAmt, TxnDate, PrivateNote, MetaData ` +
+          `FROM ${entity} WHERE CustomerRef = '${customerId}' AND TxnDate >= '${sinceISO}' MAXRESULTS 100`,
+        );
+        const items = r.QueryResponse?.[entity] || [];
+        const bucket = entity === 'Payment' ? out.payments : out.credit_memos;
+        for (const p of items) {
+          bucket.push({
+            qb_id: p.Id,
+            total: Number(p.TotalAmt || 0),
+            txn_date: p.TxnDate,
+            private_note: p.PrivateNote || '',
+            created_by: p.MetaData?.CreatedBy || null,
+            create_time: p.MetaData?.CreateTime || null,
+            last_updated_by: p.MetaData?.LastUpdatedBy || null,
+            last_updated_time: p.MetaData?.LastUpdatedTime || null,
+          });
+        }
+      }
+      out.payments.sort((a, b) => (b.create_time || '').localeCompare(a.create_time || ''));
+      out.credit_memos.sort((a, b) => (b.create_time || '').localeCompare(a.create_time || ''));
+      res.json(out);
+    } catch (err) {
+      console.error('[customer-payment-history] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/diagnose-refs
   // Body: { refs: ["101AGD126155E3DDN", ...] }
   // For each ref:
