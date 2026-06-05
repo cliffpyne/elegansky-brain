@@ -891,6 +891,23 @@ export function mountPaymentBatchesApi(app, deps) {
         params,
       );
 
+      // Also list the actual batch ids implicated (for surgical recall).
+      const batches = await db().query(
+        `SELECT pb.id, arr.as_of, COUNT(*) AS rows, COALESCE(SUM(pu.amount), 0) AS total,
+                pb.status, pb.finalized_at
+           FROM payment_uploads pu
+           JOIN payment_batches pb              ON pb.id = pu.batch_id
+           JOIN arrears_snapshots arr           ON arr.id = pb.arrears_snapshot_id
+           LEFT JOIN consumed_transactions ct   ON ct.bank_ref = pu.bank_ref
+          WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+            AND (ct.sheet_ts  AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $2
+            AND pu.status = 'created'
+            ${chFilter}
+          GROUP BY pb.id, arr.as_of, pb.status, pb.finalized_at
+          ORDER BY pb.finalized_at`,
+        params,
+      );
+
       res.json({
         pushed_date: pushedDate,
         sheet_date: sheetDate,
@@ -901,6 +918,15 @@ export function mountPaymentBatchesApi(app, deps) {
           rows: Number(row.rows),
           total: Number(row.total),
           correct_asof: row.as_of ? (new Date(row.as_of).toISOString().slice(0,10) === sheetDate) : null,
+        })),
+        batches: batches.rows.map((b) => ({
+          batch_id: b.id,
+          as_of: b.as_of ? new Date(b.as_of).toISOString().slice(0, 10) : null,
+          rows: Number(b.rows),
+          total: Number(b.total),
+          status: b.status,
+          finalized_at: b.finalized_at,
+          correct_asof: b.as_of ? (new Date(b.as_of).toISOString().slice(0,10) === sheetDate) : null,
         })),
       });
     } catch (err) {
