@@ -7,15 +7,30 @@
 // Consumer (the APK) polls GET /api/admin-sms/pending, sends each via
 // SmsManager.sendTextMessage, then POSTs /api/admin-sms/:id/ack.
 
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 
-function requireSharedSecret(req, res, next) {
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_JWKS = SUPABASE_URL
+  ? createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`))
+  : null;
+
+async function requireAuthSecretOrJwt(req, res, next) {
   const expected = process.env.STATEMENT_REPORT_SECRET;
-  if (!expected || req.header('X-Report-Secret') !== expected) {
+  if (expected && req.header('X-Report-Secret') === expected) return next();
+  if (!SUPABASE_JWKS) return res.status(401).json({ error: 'unauthorized' });
+  const auth = req.get('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const { payload } = await jwtVerify(token, SUPABASE_JWKS, { issuer: `${SUPABASE_URL}/auth/v1` });
+    req.user = payload;
+    return next();
+  } catch {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  next();
 }
+const requireSharedSecret = requireAuthSecretOrJwt;
 
 async function getAdminPhones() {
   const r = await db().query(`SELECT value FROM app_settings WHERE key='admin_phones'`);
