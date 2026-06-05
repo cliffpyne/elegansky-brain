@@ -1275,6 +1275,77 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/diagnose-refs
+  // Body: { refs: ["101AGD126155E3DDN", ...] }
+  // For each ref:
+  //  - Find the customer via consumed_transactions/payment_uploads
+  //  - Query QB directly for that customer's Payments matching the ref
+  //  - Return: existing Payments + their MetaData.CreatedBy + PrivateNote
+  //  - Also show what BRAIN's preflight would see for this ref
+  // Use this to figure out WHY duplicates keep getting through preflight.
+  app.post('/api/admin/diagnose-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String) : [];
+      if (!refs.length) return res.status(400).json({ error: 'refs[] required' });
+      const out = [];
+      for (const refRaw of refs) {
+        const refBase = refRaw.replace(/[NBP]$/, '');
+        // 1. Find customer_id from any payment_upload for this ref
+        const pu = await db().query(
+          `SELECT pu.customer_id, pu.customer_name, pu.bank_ref, pu.batch_id, pu.status, pu.qb_id
+             FROM payment_uploads pu
+            WHERE pu.bank_ref LIKE $1
+            ORDER BY pu.created_at DESC LIMIT 5`,
+          [refBase + '%'],
+        );
+        const brainRows = pu.rows;
+        const customerId = brainRows[0]?.customer_id;
+        if (!customerId) {
+          out.push({ ref: refRaw, status: 'no-customer-known', brain_rows: brainRows });
+          continue;
+        }
+        // 2. Query QB for that customer's Payments + filter locally by PrivateNote
+        try {
+          const dateFrom = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+          const r = await qbQuery(
+            `SELECT Id, TotalAmt, TxnDate, PrivateNote, CustomerRef, MetaData ` +
+            `FROM Payment WHERE CustomerRef = '${customerId}' AND TxnDate >= '${dateFrom}' MAXRESULTS 100`,
+          );
+          const allPmts = r.QueryResponse?.Payment || [];
+          const matching = allPmts.filter((p) => {
+            const pn = String(p.PrivateNote || '').trim();
+            return pn === refRaw || pn === refBase;
+          });
+          out.push({
+            ref: refRaw,
+            customer_id: customerId,
+            customer_name: brainRows[0]?.customer_name || null,
+            brain_payment_uploads: brainRows.map((b) => ({
+              status: b.status, batch_id: b.batch_id?.slice(0, 8), qb_id: b.qb_id, bank_ref: b.bank_ref,
+            })),
+            qb_payments_matching_ref: matching.map((p) => ({
+              qb_id: p.Id,
+              total: Number(p.TotalAmt || 0),
+              txn_date: p.TxnDate,
+              private_note: p.PrivateNote,
+              created_by: p.MetaData?.CreatedBy || p.MetaData?.LastUpdatedBy || null,
+              create_time: p.MetaData?.CreateTime || null,
+              last_updated_time: p.MetaData?.LastUpdatedTime || null,
+            })),
+            qb_total_payments_for_customer: allPmts.length,
+            qb_match_count: matching.length,
+          });
+        } catch (err) {
+          out.push({ ref: refRaw, customer_id: customerId, qb_query_error: String(err.message || err).slice(0, 200) });
+        }
+      }
+      res.json({ count: out.length, diagnostics: out });
+    } catch (err) {
+      console.error('[diagnose-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/batch-ref-lookup
   // Body: { refs: ["101AGD...", ...] }
   // Returns status of each ref across consumed_transactions + external_consumed_refs.
