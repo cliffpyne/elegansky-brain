@@ -1296,8 +1296,10 @@ export function mountPaymentBatchesApi(app, deps) {
            FROM payment_uploads WHERE batch_id = $1 ORDER BY kind, customer_name`,
         [fullId],
       );
-      const paid = rows.rows.filter((r) => r.kind === 'payment');
-      const unused = rows.rows.filter((r) => r.kind === 'credit_memo');
+      // "Paid" = Payment applied to a specific invoice (invoice_no is set).
+      // "Unused" = either CreditMemo OR UnappliedPayment (Payment without invoice).
+      const paid = rows.rows.filter((r) => r.kind === 'payment' && r.invoice_no);
+      const unused = rows.rows.filter((r) => r.kind === 'credit_memo' || (r.kind === 'payment' && !r.invoice_no));
       const failed = rows.rows.filter((r) => r.status === 'failed');
       const sum = (arr) => arr.reduce((s, r) => s + Number(r.amount || 0), 0);
       res.json({
