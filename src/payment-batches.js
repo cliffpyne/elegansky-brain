@@ -1275,6 +1275,72 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/cleanup-stale-external-refs
+  // For each external_consumed_refs entry added in last 24h, query QB for
+  // Payments matching that PrivateNote (= bank_ref) for the recorded customer.
+  // If 0 live matches found, the lock is stale (Payment was deleted by recall)
+  // — DELETE the row so the next auto-upload can re-push.
+  app.post('/api/admin/cleanup-stale-external-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT bank_ref, customer_id, qb_id, qb_kind FROM external_consumed_refs
+          WHERE found_at >= (CURRENT_DATE - INTERVAL '1 day')::timestamptz`,
+      );
+      const rows = r.rows;
+      let stale = 0, kept = 0, errors = 0;
+      const staleRefs = [];
+      const sinceISO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      // Group by customer for fewer QB queries
+      const byCust = new Map();
+      for (const row of rows) {
+        if (!byCust.has(row.customer_id)) byCust.set(row.customer_id, []);
+        byCust.get(row.customer_id).push(row);
+      }
+      for (const [custId, list] of byCust.entries()) {
+        try {
+          const q = await qbQuery(
+            `SELECT Id, TotalAmt, PrivateNote FROM Payment ` +
+            `WHERE CustomerRef = '${custId}' AND TxnDate >= '${sinceISO}' MAXRESULTS 500`,
+          );
+          const pmts = q.QueryResponse?.Payment || [];
+          const livePrivateNotes = new Set();
+          for (const p of pmts) {
+            if (Number(p.TotalAmt || 0) > 0 && p.PrivateNote) {
+              livePrivateNotes.add(String(p.PrivateNote).trim());
+            }
+          }
+          for (const row of list) {
+            const refBase = row.bank_ref.replace(/[NBP]$/, '');
+            const found = livePrivateNotes.has(row.bank_ref) || livePrivateNotes.has(refBase);
+            if (!found) {
+              await db().query(
+                `DELETE FROM external_consumed_refs WHERE bank_ref = $1 AND customer_id = $2`,
+                [row.bank_ref, row.customer_id],
+              );
+              stale++;
+              staleRefs.push(row.bank_ref);
+            } else {
+              kept++;
+            }
+          }
+        } catch (err) {
+          errors += list.length;
+          console.warn(`[cleanup-stale-external-refs] customer ${custId} err: ${err.message}`);
+        }
+      }
+      res.json({
+        examined: rows.length,
+        deleted_stale: stale,
+        kept_real: kept,
+        errors,
+        sample_deleted: staleRefs.slice(0, 10),
+      });
+    } catch (err) {
+      console.error('[cleanup-stale-external-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/preflight-catches-today
   // Lists external_consumed_refs added today + each ref's QB Payment provenance
   // (qb_id, total, TxnDate, CreatedBy, CreateTime). Used after a fresh upload
