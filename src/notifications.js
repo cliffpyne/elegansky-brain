@@ -65,15 +65,26 @@ export function mountNotificationsApi(app, { requireSharedSecret, requireSupabas
 
       // Atomically claim up to 50 pending rows. Recipients are managed via
       // the dashboard /admin-sms page which writes to app_settings.admin_phones.
-      // We also fall back to the legacy sms_recipients key for backwards
-      // compatibility with older docs.
+      // The dashboard saves as a plain comma/newline-separated string (NOT
+      // JSON), so we read as text and split. Legacy sms_recipients was a JSON
+      // array — handle both shapes.
       const rcp = await db().query(
-        `SELECT value::jsonb AS list FROM app_settings
+        `SELECT key, value FROM app_settings
           WHERE key IN ('admin_phones', 'sms_recipients')
           ORDER BY CASE key WHEN 'admin_phones' THEN 0 ELSE 1 END
           LIMIT 1`,
       );
-      const recipients = Array.isArray(rcp.rows[0]?.list) ? rcp.rows[0].list : [];
+      let recipients = [];
+      if (rcp.rows.length) {
+        const raw = String(rcp.rows[0].value || '').trim();
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) recipients = parsed.map((p) => String(p).trim()).filter(Boolean);
+        } catch {
+          // Not JSON — treat as comma/whitespace-separated.
+          recipients = raw.split(/[,\s]+/).map((p) => p.trim()).filter(Boolean);
+        }
+      }
 
       const r = await db().query(
         `UPDATE notifications
