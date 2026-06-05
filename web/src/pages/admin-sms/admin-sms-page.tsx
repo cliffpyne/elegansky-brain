@@ -43,10 +43,13 @@ async function fetchMessages(_secret: string) {
 }
 
 async function sendTest(_secret: string, message: string) {
-  const r = await fetch(`${BRAIN_BASE}/api/admin-sms/queue`, {
+  // Use /api/admin/notifications/test — writes to the `notifications` table
+  // which the phone APK actually polls. /api/admin-sms/queue uses a separate
+  // legacy `admin_sms_queue` table the APK never sees.
+  const r = await fetch(`${BRAIN_BASE}/api/admin/notifications/test`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
-    body: JSON.stringify({ message, kind: 'test' }),
+    body: JSON.stringify({ message, severity: 'info' }),
   });
   if (!r.ok) throw new Error(`queue ${r.status}: ${await r.text()}`);
   return r.json();
