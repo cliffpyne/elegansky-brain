@@ -1707,6 +1707,77 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/diag-window-skips
+  // Body: { channel, since_iso, until_iso }
+  // Mirrors prepareAutoUpload's skip logic and reports the EXACT breakdown of
+  // why rows in window are skipped. Critical when BRAIN sees fewer rows than
+  // the sheet truth.
+  app.post('/api/admin/diag-window-skips', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const winStart = new Date(String(req.body?.since_iso || ''));
+      const winEnd = new Date(String(req.body?.until_iso || ''));
+      if (isNaN(+winStart) || isNaN(+winEnd)) return res.status(400).json({ error: 'since_iso/until_iso required' });
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      let maxKRow = 0;
+      let kSamples = [];
+      for (let i = 1; i < sheet.length; i++) {
+        const colK = String(sheet[i][10] || '').trim().toLowerCase();
+        if (colK.startsWith('end of ')) {
+          maxKRow = i + 1;
+          if (kSamples.length < 5) kSamples.push({ row: i + 1, k: sheet[i][10] });
+        }
+      }
+      const inWindow = [];
+      let skippedKBoundary = 0, skippedIJ = 0;
+      let iSet = 0, jSet = 0, bothIJ = 0;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < winStart || ts >= winEnd) continue;
+        const rowNum = i + 1;
+        const colI = String(sheet[i][8] || '').trim();
+        const colJ = String(sheet[i][9] || '').trim();
+        const colK = String(sheet[i][10] || '').trim();
+        const ref = String(sheet[i][7] || '').trim();
+        const amt = sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : 0;
+        let skip = null;
+        if (maxKRow > 0 && rowNum <= maxKRow) { skip = 'K_boundary'; skippedKBoundary++; }
+        else if (colI || colJ) {
+          skip = 'I_or_J_set'; skippedIJ++;
+          if (colI && colJ) bothIJ++;
+          else if (colI) iSet++;
+          else jSet++;
+        }
+        inWindow.push({ row: rowNum, ts: dCell, ref, amount: amt, colI, colJ, colK, skip });
+      }
+      const passedRows = inWindow.filter((r) => !r.skip);
+      const skippedRows = inWindow.filter((r) => r.skip);
+      res.json({
+        channel,
+        window: { since: winStart.toISOString(), until: winEnd.toISOString() },
+        max_k_row: maxKRow,
+        k_samples: kSamples,
+        total_in_window: inWindow.length,
+        passed: passedRows.length,
+        passed_sum: passedRows.reduce((s, r) => s + r.amount, 0),
+        skipped_total: skippedRows.length,
+        skipped_K_boundary: skippedKBoundary,
+        skipped_I_or_J_set: skippedIJ,
+        I_only: iSet, J_only: jSet, both_IJ: bothIJ,
+        skipped_sample: skippedRows.slice(0, 5),
+      });
+    } catch (err) {
+      console.error('[diag-window-skips] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/find-already-consumed-refs-in-window
   // Body: { channel, since_iso, until_iso }
   // Lists sheet refs in the window that are ALREADY in consumed_transactions
