@@ -1677,6 +1677,36 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/release-specific-refs
+  // Body: { refs: [suffixed_ref, ...] }
+  // Deletes them from consumed_transactions + external_consumed_refs so a fresh
+  // dry-run picks them back up. Use ONLY when operator has confirmed those refs
+  // are NOT in QB (orphan CT entries from voided/failed prior batches).
+  app.post('/api/admin/release-specific-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String) : [];
+      if (!refs.length) return res.status(400).json({ error: 'refs[] required' });
+      const ct = await db().query(
+        `DELETE FROM consumed_transactions WHERE bank_ref = ANY($1::text[]) RETURNING bank_ref`,
+        [refs],
+      );
+      const ext = await db().query(
+        `DELETE FROM external_consumed_refs WHERE bank_ref = ANY($1::text[]) RETURNING bank_ref`,
+        [refs],
+      );
+      res.json({
+        requested: refs.length,
+        ct_released: ct.rowCount,
+        ext_released: ext.rowCount,
+        ct_refs: ct.rows.map((r) => r.bank_ref),
+        ext_refs: ext.rows.map((r) => r.bank_ref),
+      });
+    } catch (err) {
+      console.error('[release-specific-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/find-already-consumed-refs-in-window
   // Body: { channel, since_iso, until_iso }
   // Lists sheet refs in the window that are ALREADY in consumed_transactions
