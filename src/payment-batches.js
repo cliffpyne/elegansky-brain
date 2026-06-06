@@ -1677,6 +1677,78 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/find-duplicate-refs-in-window
+  // Body: { channel, since_iso, until_iso }
+  // Reads the channel sheet, finds rows in window, groups by bank_ref
+  // (column H), and returns refs appearing 2+ times with their row
+  // numbers, dates, amounts, customers. Exactly what BRAIN's intra-window
+  // dedup drops.
+  app.post('/api/admin/find-duplicate-refs-in-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = new Date(String(req.body?.since_iso || ''));
+      const untilIso = new Date(String(req.body?.until_iso || ''));
+      if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso and until_iso required' });
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const refMap = new Map(); // ref → [{row, date, amount, customer}]
+      let inWindow = 0;
+      let withRef = 0;
+      let sumInWindow = 0;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < sinceIso || ts >= untilIso) continue;
+        inWindow++;
+        const ref = String(sheet[i][7] || '').trim();
+        if (!ref) continue;
+        withRef++;
+        const amt = sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : 0;
+        sumInWindow += amt;
+        if (!refMap.has(ref)) refMap.set(ref, []);
+        refMap.get(ref).push({
+          sheet_row: i + 1,
+          date: dCell,
+          amount: amt,
+          customer: sheet[i][6] || null,
+        });
+      }
+      const dupes = [];
+      let dupeAmount = 0;
+      for (const [ref, list] of refMap) {
+        if (list.length > 1) {
+          dupes.push({
+            ref,
+            count: list.length,
+            occurrences: list,
+            total_amount_in_dupes: list.reduce((s, r) => s + r.amount, 0),
+            extra_kept_by_drag_drop: list.slice(1).reduce((s, r) => s + r.amount, 0),
+          });
+          dupeAmount += list.slice(1).reduce((s, r) => s + r.amount, 0);
+        }
+      }
+      res.json({
+        channel,
+        window: { since: sinceIso.toISOString(), until: untilIso.toISOString() },
+        rows_in_window: inWindow,
+        rows_with_ref: withRef,
+        unique_refs: refMap.size,
+        duplicate_ref_groups: dupes.length,
+        sheet_sum_with_dupes: sumInWindow,
+        excess_from_dupes: dupeAmount,
+        true_sum_after_dedup: sumInWindow - dupeAmount,
+        duplicates: dupes,
+      });
+    } catch (err) {
+      console.error('[find-duplicate-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/clear-marker-column
   // Body: { channel, column: 'I' | 'J' | 'K' }
   // Wipes the entire column on the channel sheet. Used to clean stray
