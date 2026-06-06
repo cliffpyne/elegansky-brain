@@ -73,6 +73,33 @@ export async function readSheet(spreadsheetId, range) {
   return { range: res.data.range, values: res.data.values || [] };
 }
 
+/**
+ * Batch-write values to specific cells. Used to mark rows as
+ * "Fetched at" (column I) and "QB pushed" (column J) during the
+ * auto-upload flow so the sheet itself records what's been processed.
+ *
+ * updates: [{ range: "PASSED!I12345", value: "..." }, ...]
+ *
+ * Uses values.batchUpdate so all cells go in one API call (rate-limit
+ * friendly for hundreds of writes per batch).
+ */
+export async function writeSheetCells(spreadsheetId, updates) {
+  if (!Array.isArray(updates) || updates.length === 0) return { updatedCells: 0 };
+  const sheets = await sheetsClient();
+  const data = updates.map((u) => ({
+    range: u.range,
+    values: [[u.value]],
+  }));
+  const res = await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: { valueInputOption: 'USER_ENTERED', data },
+  });
+  return {
+    updatedCells: res.data.totalUpdatedCells || 0,
+    updatedRanges: res.data.totalUpdatedRanges || 0,
+  };
+}
+
 export function serviceAccountEmail() {
   return loadCredentials().client_email;
 }
