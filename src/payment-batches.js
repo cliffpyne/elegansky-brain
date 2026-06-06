@@ -3824,24 +3824,37 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   //         after processing so they never run twice.
   //
   //    Window filter only applies to rows with a real parseable timestamp.
-  // Read columns A:J — includes new column I (Fetched at) and J (QB pushed)
-  // markers used to prevent re-pushing rows already in QB.
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+  // Read columns A:K — Column K holds the "end of {tick_name}" purple
+  // marker written at the end of each auto-upload fire. Operator rule
+  // (2026-06-06): rows are always APPENDED at the bottom of the sheet,
+  // never inserted above. So the highest row number with a Column K
+  // marker is the boundary — any row at or below that row is already
+  // processed; anything BELOW it is fresh and eligible.
+  //
+  // I/J markers still get written per-row for observability (audit can
+  // spot silent failures via sheet-lock-audit), but they are NO LONGER
+  // used to gate processing. K is the single source of truth.
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
   const sheet = sheetData.values || sheetData.data || [];
+  // Find the highest row index that has a non-empty Column K marker.
+  // Default to 0 if none — means the whole sheet is unprocessed.
+  let maxKRow = 0;
+  for (let i = 1; i < sheet.length; i++) {
+    const colK = String(sheet[i][10] || '').trim();
+    if (colK) maxKRow = i + 1; // 1-based row number
+  }
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
   for (let i = 1; i < sheet.length; i++) {
+    // Column K boundary: skip every row at or before the last "end of tick"
+    // marker. Rows always get appended at the bottom, so anything <= maxKRow
+    // is by definition already processed by a previous fire.
+    if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
     if (!ts) { skippedBadFormat++; continue; }
     if (ts < winStart || ts >= winEnd) { skippedOutOfWindow++; continue; }
-    // Phase 3+4: skip rows where Column I ("Fetched at", in-flight run) OR
-    // Column J ("QB pushed", completed) is already set. Sheet-side lock that
-    // replaces fragile DB consumed_transactions. Either column = "hands off".
-    const colI = String(sheet[i][8] || '').trim();
-    const colJ = String(sheet[i][9] || '').trim();
-    if (colI || colJ) { skippedAlreadyPushed++; continue; }
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
