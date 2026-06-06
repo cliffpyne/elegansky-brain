@@ -1382,6 +1382,66 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/qb-find-suffixed
+  // Body: { channel, since_date: 'YYYY-MM-DD', until_date: 'YYYY-MM-DD' }
+  // Queries QB for every active Payment with TxnDate in [since_date,
+  // until_date], paginated, and returns those whose PrivateNote ends in
+  // the channel's suffix (N/B/P). Use to find BRAIN-pushed ghosts that
+  // have no payment_uploads row (so qb-active-by-refs can't help).
+  app.post('/api/admin/qb-find-suffixed', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const suffix = { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel];
+      const since = String(req.body?.since_date || '').match(/^\d{4}-\d{2}-\d{2}$/);
+      const until = String(req.body?.until_date || '').match(/^\d{4}-\d{2}-\d{2}$/);
+      if (!since || !until) return res.status(400).json({ error: 'since_date and until_date required (YYYY-MM-DD)' });
+      const sinceDate = since[0], untilDate = until[0];
+      // Paginate. QB MAXRESULTS=1000 max.
+      const PAGE = 1000;
+      let start = 1;
+      const all = [];
+      let pages = 0;
+      while (true) {
+        pages++;
+        const r = await qbQuery(
+          `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM Payment ` +
+          `WHERE TxnDate >= '${sinceDate}' AND TxnDate <= '${untilDate}' ` +
+          `STARTPOSITION ${start} MAXRESULTS ${PAGE}`,
+        );
+        const pmts = r.QueryResponse?.Payment || [];
+        all.push(...pmts);
+        if (pmts.length < PAGE) break;
+        start += PAGE;
+        if (pages > 30) break; // safety: 30k Payments max
+      }
+      // Filter by suffix
+      const matching = all
+        .filter((p) => String(p.PrivateNote || '').endsWith(suffix))
+        .map((p) => ({
+          qb_id: String(p.Id),
+          privateNote: p.PrivateNote,
+          amount: Number(p.TotalAmt),
+          txnDate: p.TxnDate,
+          customerRef: p.CustomerRef?.value,
+          customerName: p.CustomerRef?.name,
+        }));
+      res.json({
+        channel,
+        since_date: sinceDate,
+        until_date: untilDate,
+        pages_fetched: pages,
+        total_payments_in_range: all.length,
+        suffixed_count: matching.length,
+        suffixed_total: matching.reduce((s, p) => s + p.amount, 0),
+        matching,
+      });
+    } catch (err) {
+      console.error('[qb-find-suffixed] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/qb-active-by-refs
   // Body: { channel, refs: [...] }
   // For each ref (suffixed with channel), queries QB for active Payments
