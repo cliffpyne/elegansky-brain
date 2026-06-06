@@ -1275,6 +1275,72 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/kijichi-payments?date=YYYY-MM-DD
+  // Lists every Payment deposited to Kijichi on the given TxnDate with
+  // customer name, amount, private_note. Filters out BRAIN-pushed ones
+  // so the operator can see only the manually-entered baseline.
+  app.get('/api/admin/kijichi-payments', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.query.date || '');
+      if (!date) return res.status(400).json({ error: 'date YYYY-MM-DD required' });
+      const onlyManual = req.query.only_manual !== 'false';
+      // Find Kijichi account id
+      const acctRes = await qbQuery(
+        `SELECT Id, Name FROM Account WHERE Name = 'Kijichi Collection AC'`,
+      );
+      const acct = acctRes.QueryResponse?.Account?.[0];
+      if (!acct) return res.status(404).json({ error: 'Kijichi account not found' });
+      // Pull all Payments for the date
+      const all = [];
+      let start = 1;
+      while (true) {
+        const r = await qbQuery(
+          `SELECT Id, TotalAmt, TxnDate, PrivateNote, CustomerRef, DepositToAccountRef, MetaData ` +
+          `FROM Payment WHERE TxnDate = '${date}' STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const rows = r.QueryResponse?.Payment || [];
+        all.push(...rows);
+        if (rows.length < 1000) break;
+        start += 1000;
+      }
+      const matched = all.filter((p) => String(p.DepositToAccountRef?.value || '') === String(acct.Id));
+      // Get customer names in bulk
+      const custIds = [...new Set(matched.map((p) => p.CustomerRef?.value).filter(Boolean))];
+      const custMap = {};
+      for (let i = 0; i < custIds.length; i += 30) {
+        const chunk = custIds.slice(i, i + 30);
+        const inList = chunk.map((id) => "'" + String(id).replace(/'/g, "''") + "'").join(',');
+        const cr = await qbQuery(`SELECT Id, DisplayName FROM Customer WHERE Id IN (${inList})`);
+        for (const c of (cr.QueryResponse?.Customer || [])) custMap[c.Id] = c.DisplayName;
+      }
+      // Check which Payments are BRAIN-pushed (have a matching payment_uploads with this qb_id)
+      const ids = matched.map((p) => String(p.Id));
+      const pu = await db().query(
+        `SELECT DISTINCT qb_id FROM payment_uploads WHERE qb_id = ANY($1)`,
+        [ids],
+      );
+      const brainIds = new Set(pu.rows.map((r) => String(r.qb_id)));
+      const out = [];
+      for (const p of matched) {
+        const isBrain = brainIds.has(String(p.Id));
+        if (onlyManual && isBrain) continue;
+        out.push({
+          qb_id: p.Id,
+          amount: Number(p.TotalAmt || 0),
+          customer: custMap[p.CustomerRef?.value] || p.CustomerRef?.value || '?',
+          private_note: p.PrivateNote || '',
+          create_time: p.MetaData?.CreateTime,
+          is_brain_pushed: isBrain,
+        });
+      }
+      const total = out.reduce((s, x) => s + x.amount, 0);
+      res.json({ date, only_manual: onlyManual, count: out.length, total, payments: out });
+    } catch (err) {
+      console.error('[kijichi-payments] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/restore-voided-batch
   // Body: { batch_id, txn_date? } — txn_date optional, defaults to 2026-06-05
   // Re-creates QB Payments for each voided PU in the batch using the saved
