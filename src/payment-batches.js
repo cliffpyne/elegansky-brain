@@ -1275,6 +1275,88 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/chart-of-accounts?from=YYYY-MM-DD&to=YYYY-MM-DD&account=Kijichi%20Collection%20AC
+  // Returns one row per Payment line for the date range, matching the structure
+  // of Frank's xlsx chart-of-accounts export:
+  //   txn_date | qb_id | amount | customer | private_note | created_by | brain_pushed
+  // Per-batch verification check #4 (alongside Kijichi-total + inflation + doubles).
+  app.get('/api/admin/chart-of-accounts', requireSecretOrJwt, async (req, res) => {
+    try {
+      const from = String(req.query.from || '');
+      const to = String(req.query.to || from);
+      if (!from) return res.status(400).json({ error: 'from=YYYY-MM-DD required' });
+      const acctName = String(req.query.account || 'Kijichi Collection AC');
+      // Resolve account id
+      const acctRes = await qbQuery(
+        `SELECT Id, Name FROM Account WHERE Name = '${acctName.replace(/'/g, "''")}'`,
+      );
+      const acct = acctRes.QueryResponse?.Account?.[0];
+      if (!acct) return res.status(404).json({ error: `account "${acctName}" not found` });
+      // Pull all Payments in range
+      const all = [];
+      let start = 1;
+      while (true) {
+        const r = await qbQuery(
+          `SELECT Id, TotalAmt, TxnDate, PrivateNote, CustomerRef, DepositToAccountRef, MetaData ` +
+          `FROM Payment WHERE TxnDate >= '${from}' AND TxnDate <= '${to}' ` +
+          `STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const rows = r.QueryResponse?.Payment || [];
+        all.push(...rows);
+        if (rows.length < 1000) break;
+        start += 1000;
+      }
+      // Filter to this account
+      const matched = all.filter((p) => String(p.DepositToAccountRef?.value || '') === String(acct.Id));
+      // Bulk customer lookup
+      const custIds = [...new Set(matched.map((p) => p.CustomerRef?.value).filter(Boolean))];
+      const custMap = {};
+      for (let i = 0; i < custIds.length; i += 30) {
+        const chunk = custIds.slice(i, i + 30);
+        const inList = chunk.map((id) => "'" + String(id).replace(/'/g, "''") + "'").join(',');
+        const cr = await qbQuery(`SELECT Id, DisplayName FROM Customer WHERE Id IN (${inList})`);
+        for (const c of (cr.QueryResponse?.Customer || [])) custMap[c.Id] = c.DisplayName;
+      }
+      // Cross-reference with payment_uploads for BRAIN-pushed flag
+      const ids = matched.map((p) => String(p.Id));
+      const pu = await db().query(
+        `SELECT qb_id FROM payment_uploads WHERE qb_id = ANY($1)`,
+        [ids],
+      );
+      const brainIds = new Set(pu.rows.map((r) => String(r.qb_id)));
+      const rows = matched.map((p) => ({
+        txn_date: p.TxnDate,
+        qb_id: p.Id,
+        amount: Number(p.TotalAmt || 0),
+        customer: custMap[p.CustomerRef?.value] || p.CustomerRef?.value || '?',
+        private_note: p.PrivateNote || '',
+        create_time: p.MetaData?.CreateTime || null,
+        brain_pushed: brainIds.has(String(p.Id)),
+      }));
+      const totalByDate = {};
+      for (const r of rows) {
+        totalByDate[r.txn_date] = totalByDate[r.txn_date] || { count: 0, sum: 0, brain: 0, manual: 0 };
+        totalByDate[r.txn_date].count++;
+        totalByDate[r.txn_date].sum += r.amount;
+        if (r.brain_pushed) totalByDate[r.txn_date].brain += r.amount;
+        else totalByDate[r.txn_date].manual += r.amount;
+      }
+      const grand = rows.reduce((s, r) => s + r.amount, 0);
+      res.json({
+        account: acct.Name,
+        account_id: acct.Id,
+        from, to,
+        count: rows.length,
+        grand_total: grand,
+        by_date: totalByDate,
+        rows,
+      });
+    } catch (err) {
+      console.error('[chart-of-accounts] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/kijichi-payments?date=YYYY-MM-DD
   // Lists every Payment deposited to Kijichi on the given TxnDate with
   // customer name, amount, private_note. Filters out BRAIN-pushed ones
