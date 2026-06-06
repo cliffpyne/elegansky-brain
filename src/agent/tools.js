@@ -284,6 +284,17 @@ export async function dispatch(toolName, input, ctx) {
             batch_id: j.batch_id || null,
             skipped: !!j.skipped,
             skipped_reason: j.skipped ? (j.reason || null) : null,
+            // Surface row-skip diagnostics when the server skipped a window
+            // with no rows — lets the operator see exactly why (K boundary,
+            // out-of-window dates, etc.).
+            skip_diagnostics: j.skipped ? {
+              skipped_no_date: j.skipped_no_date ?? null,
+              skipped_bad_format: j.skipped_bad_format ?? null,
+              skipped_out_of_window: j.skipped_out_of_window ?? null,
+              skipped_already_pushed: j.skipped_already_pushed ?? null,
+              max_k_row: j.max_k_row ?? null,
+              sheet_total_rows: j.sheet_total_rows ?? null,
+            } : null,
             paid_count: j.paid?.length ?? j.paid_count ?? null,
             paid_total: j.paid_total ?? null,
             unused_count: j.unused?.length ?? j.unused_count ?? null,
