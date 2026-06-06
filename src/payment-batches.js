@@ -1447,12 +1447,16 @@ export function mountPaymentBatchesApi(app, deps) {
       }
       // Note: txn_date is NOT stored on payment_batches — it's applied
       // at QB push time from the request body. Surface what we have.
+      // ALSO pull the full snapshot JSON so we can verify the actual
+      // invoices used have DueDate <= snapshot_as_of (operator paranoia
+      // check — "did it actually only use 3rd June invoices?")
       const batchRow = await db().query(
         `SELECT pb.id, pb.channel, pb.status, pb.created_at, pb.finalized_at,
                 pb.failure_reason, pb.idempotency_key,
                 pb.sheet_total, pb.paid_total, pb.unused_total,
                 pb.arrears_snapshot_id,
-                aps.as_of AS snapshot_as_of, aps.created_at AS snapshot_created_at
+                aps.as_of AS snapshot_as_of, aps.created_at AS snapshot_created_at,
+                aps.data AS snapshot_data
            FROM payment_batches pb
            LEFT JOIN arrears_snapshots aps ON aps.id = pb.arrears_snapshot_id
           WHERE pb.id = $1`,
@@ -1501,6 +1505,31 @@ export function mountPaymentBatchesApi(app, deps) {
           customer_name: list[0].customer_name,
         }));
 
+      // Build invoice qb_id → DueDate lookup from the snapshot.
+      const snapData = batch.snapshot_data || [];
+      const invQbToDueDate = new Map();
+      for (const inv of snapData) {
+        if (inv?.qbId) invQbToDueDate.set(String(inv.qbId), inv.date || inv.dueDate || null);
+      }
+      // For the matched paid PUs, look up DueDate. Min/max tells us the
+      // actual range; > snapshot_as_of would be a bug.
+      const usedDueDates = [];
+      for (const p of paid) {
+        if (!p.invoice_qb_id) continue;
+        const d = invQbToDueDate.get(String(p.invoice_qb_id));
+        if (d) usedDueDates.push(d);
+      }
+      usedDueDates.sort();
+      const dueDateAudit = {
+        snapshot_total_invoices: snapData.length,
+        matched_invoices_with_due_date: usedDueDates.length,
+        earliest_due_date: usedDueDates[0] || null,
+        latest_due_date: usedDueDates[usedDueDates.length - 1] || null,
+        violates_as_of: usedDueDates.length > 0
+          ? usedDueDates[usedDueDates.length - 1] > batch.snapshot_as_of
+          : false,
+      };
+
       res.json({
         batch: {
           id: batch.id,
@@ -1515,6 +1544,7 @@ export function mountPaymentBatchesApi(app, deps) {
           stored_paid_total: Number(batch.paid_total || 0),
           stored_unused_total: Number(batch.unused_total || 0),
         },
+        due_date_audit: dueDateAudit,
         totals: {
           paid_count: paid.length,
           paid_total: paidSum,
