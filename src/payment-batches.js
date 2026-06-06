@@ -1275,6 +1275,96 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/restore-voided-batch
+  // Body: { batch_id, txn_date? } — txn_date optional, defaults to 2026-06-05
+  // Re-creates QB Payments for each voided PU in the batch using the saved
+  // customer_id + invoice_qb_id + amount + memo. No IP re-run — exact replay.
+  // Used after an over-aggressive recall to restore the previous state exactly.
+  app.post('/api/admin/restore-voided-batch', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.body?.batch_id || '');
+      const txnDate = String(req.body?.txn_date || '2026-06-05');
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      let fullId = batchId;
+      if (batchId.length < 36) {
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [batchId + '%']);
+        if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = r.rows[0].id;
+      }
+      const r = await db().query(
+        `SELECT id, kind, bank_ref, customer_id, customer_name, invoice_qb_id, invoice_no, amount, memo
+           FROM payment_uploads
+          WHERE batch_id = $1 AND status = 'voided' AND customer_id IS NOT NULL
+          ORDER BY id`,
+        [fullId],
+      );
+      const rows = r.rows;
+      let okCount = 0, failCount = 0;
+      const fails = [];
+      const PAR = 8;
+      let cursor = 0;
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= rows.length) return;
+          const row = rows[i];
+          try {
+            let qb;
+            if (row.invoice_qb_id) {
+              qb = await qbCreatePayment({
+                customerId: row.customer_id,
+                invoiceQbId: row.invoice_qb_id,
+                amount: Number(row.amount),
+                memo: row.memo || row.bank_ref,
+                txnDate,
+              });
+            } else {
+              qb = await qbCreateUnappliedPayment({
+                customerId: row.customer_id,
+                amount: Number(row.amount),
+                memo: row.memo || row.bank_ref,
+                txnDate,
+              });
+            }
+            await db().query(
+              `INSERT INTO payment_uploads (
+                 batch_id, kind, bank_ref, customer_id, customer_name,
+                 invoice_qb_id, invoice_no, amount, memo, qb_id, qb_response, status
+               ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,$9,$10,'created')`,
+              [fullId, row.bank_ref, row.customer_id, row.customer_name,
+               row.invoice_qb_id, row.invoice_no, row.amount, row.memo,
+               qb.id, JSON.stringify(qb.response)],
+            );
+            // Re-insert CT lock
+            await db().query(
+              `INSERT INTO consumed_transactions (bank_ref, batch_id) VALUES ($1, $2)
+               ON CONFLICT (bank_ref) DO NOTHING`,
+              [row.bank_ref, fullId],
+            );
+            okCount++;
+          } catch (err) {
+            failCount++;
+            if (fails.length < 10) {
+              fails.push({ row_id: row.id, bank_ref: row.bank_ref, err: String(err.message || err).slice(0, 200) });
+            }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+      await db().query(`UPDATE payment_batches SET status='finalized', recalled_at=NULL WHERE id=$1`, [fullId]);
+      res.json({
+        batch_id: fullId,
+        scanned: rows.length,
+        restored_ok: okCount,
+        failed: failCount,
+        fails,
+      });
+    } catch (err) {
+      console.error('[restore-voided-batch] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/mark-stuck-as-saasant
   // Body: { since_iso: "2026-06-04T13:15:00.000Z" } - required
   // Finds unused PUs (kind='payment' with invoice_no=NULL) that have qb_id=NULL
