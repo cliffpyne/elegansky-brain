@@ -1585,6 +1585,98 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/find-bad-date-rows
+  // Body: { channel, anchor_iso }  — anchor_iso is any timestamp within
+  // the expected window; we scan a +/- 4h band of rows around its
+  // row-number neighbourhood and flag rows whose Column B is empty or
+  // unparseable. Returns each bad row's sheet_row_number, raw date text,
+  // amount, customer, ref, and the nearest GOOD date above + below.
+  // The operator can then drag-drop the date from a neighbour to fix.
+  app.post('/api/admin/find-bad-date-rows', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const anchorIsoRaw = String(req.body?.anchor_iso || '');
+      if (!anchorIsoRaw) return res.status(400).json({ error: 'anchor_iso required' });
+      const anchorTs = new Date(anchorIsoRaw);
+      if (isNaN(+anchorTs)) return res.status(400).json({ error: 'invalid anchor_iso' });
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      // First pass: find rows whose dates parse, mark their row numbers
+      // and timestamps. Find the index range around the anchor (rows
+      // whose timestamps are within +/- 12 hours of anchor).
+      const bandSec = 12 * 3600;
+      const goodRows = [];
+      const badRowsInBand = [];
+      let lastGoodAbove = null;
+      const bandStart = anchorTs.getTime() - bandSec * 1000;
+      const bandEnd = anchorTs.getTime() + bandSec * 1000;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        const refCell = String(sheet[i][7] || '').trim();
+        const amtCell = sheet[i][4];
+        if (dCell) {
+          const ts = parseTsAny(dCell);
+          if (ts) {
+            goodRows.push({ row: i + 1, ts: ts.getTime(), date_raw: dCell });
+            if (ts.getTime() <= bandEnd) lastGoodAbove = { row: i + 1, date_raw: dCell, ts: ts.toISOString() };
+            continue;
+          }
+        }
+        // Bad row — date is missing or unparseable. Only report if it has
+        // a ref AND amount (= a real transaction) AND is in the band.
+        if (!refCell || !amtCell) continue;
+        // We don't know the timestamp; include it if it sits between
+        // good rows whose timestamps bracket the band. Heuristic: count
+        // the surrounding good rows' band membership.
+        badRowsInBand.push({
+          sheet_row: i + 1,
+          date_raw: dCell || '(empty)',
+          amount: amtCell ? Number(String(amtCell).replace(/,/g, '')) : null,
+          customer: sheet[i][6] || null,
+          ref: refCell,
+          nearest_good_date_above: lastGoodAbove ? {
+            row: lastGoodAbove.row, date: lastGoodAbove.date_raw, ts: lastGoodAbove.ts,
+          } : null,
+        });
+      }
+      // For each bad row, also attach nearest good date BELOW
+      let lastGoodBelow = null;
+      for (let bi = badRowsInBand.length - 1; bi >= 0; bi--) {
+        const bad = badRowsInBand[bi];
+        // Find first good row with row > bad.sheet_row
+        const below = goodRows.find((g) => g.row > bad.sheet_row);
+        if (below) {
+          bad.nearest_good_date_below = {
+            row: below.row, date: String(sheet[below.row - 1][1] || ''),
+            ts: new Date(below.ts).toISOString(),
+          };
+        }
+      }
+      // Filter to bad rows whose neighbour timestamps fall in the band
+      const bandBad = badRowsInBand.filter((b) => {
+        const a = b.nearest_good_date_above?.ts ? new Date(b.nearest_good_date_above.ts).getTime() : null;
+        const z = b.nearest_good_date_below?.ts ? new Date(b.nearest_good_date_below.ts).getTime() : null;
+        return (a != null && a >= bandStart && a <= bandEnd)
+            || (z != null && z >= bandStart && z <= bandEnd);
+      });
+      res.json({
+        channel,
+        sheet_tab: cfg.tab,
+        anchor_iso: anchorTs.toISOString(),
+        band_hours: 12,
+        sheet_total_rows: sheet.length - 1,
+        bad_rows_in_band_count: bandBad.length,
+        bad_rows_total_anywhere: badRowsInBand.length,
+        bad_rows: bandBad.slice(0, 100),
+      });
+    } catch (err) {
+      console.error('[find-bad-date-rows] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/clear-marker-column
   // Body: { channel, column: 'I' | 'J' | 'K' }
   // Wipes the entire column on the channel sheet. Used to clean stray
