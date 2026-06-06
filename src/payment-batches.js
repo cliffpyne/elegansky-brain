@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
 import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -554,6 +554,12 @@ export function mountPaymentBatchesApi(app, deps) {
           qbBatchLookupCustomers,
           qbCreateCreditMemo,
           cfg: result.cfg,
+          // tick_name from request body identifies which scheduler tick
+          // (or button-fired manual run = 'heisenberg') triggered this fire.
+          // Used to paint the last processed sheet row purple + write
+          // "end of {tick}" to Column K so the operator can see visually
+          // where each tick stopped.
+          tickName: String(req.body?.tick_name || 'heisenberg'),
         })
           .catch((err) => {
             console.error('[auto-upload background]', result.batchId, err);
@@ -4098,6 +4104,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   qbBatchLookupCustomers,
   qbCreateCreditMemo,  // kept only for fallback in sweep retry
   cfg,  // { sheetId, tab } — used to write Column I + J markers
+  tickName,  // 'meru0300' / 'kili1615' / 'heisenberg' (manual button) etc.
 }) {
   // ─── Per-payment J-marker state (cumulative across chunks) ────────────
   // rowToQbIds maps sheet_row_number -> [qb_id, qb_id, ...] for that row.
@@ -4449,4 +4456,26 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   // end-of-run flush — operator rule: J reflects PER-PAYMENT QB success,
   // not batch completion. Rows with I set + J empty after this point are
   // genuine failures and surface in the sheet-lock audit endpoint.
+
+  // ─── Column K + purple row marker for tick fire boundary ──────────────
+  // Operator rule: paint the LAST processed sheet row purple (A through
+  // K) and write "end of {tick_name}" into Column K. Lets the operator see
+  // visually on the sheet where each tick stopped. Applies to scheduler
+  // ticks (kili1615, mawenzi1800, etc.) and manual button fires ('heisenberg').
+  try {
+    if (cfg && cfg.sheetId && cfg.tab && tickName) {
+      const allRows = [];
+      for (const p of paid) { if (p.sheet_row_number) allRows.push(p.sheet_row_number); }
+      for (const u of unused) { if (u.sheet_row_number) allRows.push(u.sheet_row_number); }
+      if (allRows.length > 0) {
+        const lastRow = Math.max(...allRows);
+        await paintRowEndMarker(cfg.sheetId, cfg.tab, lastRow, tickName);
+        console.log(`[auto-upload] painted row ${lastRow} purple + K='end of ${tickName}' on ${cfg.tab}`);
+      } else {
+        console.log(`[auto-upload] no rows processed — skipping end-of-tick marker`);
+      }
+    }
+  } catch (err) {
+    console.error('[auto-upload] paint end-of-tick marker failed (non-fatal):', err.message);
+  }
 }

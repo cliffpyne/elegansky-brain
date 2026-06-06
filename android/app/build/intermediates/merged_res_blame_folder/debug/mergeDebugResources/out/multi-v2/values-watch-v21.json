@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.elegansky.smsgateway.app-mergeDebugResources-38:/values-watch-v21/values-watch-v21.xml",
+            "map": [
+                {
+                    "source": "/home/clifforddennis/.gradle/caches/8.9/transforms/40ad8a0b9783f9808d5d4ccfa1ecbe85/transformed/appcompat-1.7.0/res/values-watch-v21/values-watch-v21.xml",
+                    "from": {
+                        "startLines": "2,6,10",
+                        "startColumns": "4,4,4",
+                        "startOffsets": "55,271,499",
+                        "endLines": "5,9,13",
+                        "endColumns": "12,12,12",
+                        "endOffsets": "266,494,724"
+                    }
+                }
+            ]
+        }
+    ]
+}

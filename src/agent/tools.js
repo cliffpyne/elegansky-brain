@@ -160,6 +160,10 @@ export const TOOLS = [
           type: 'string',
           description: 'YYYY-MM-DD — the date written to QB as the Payment TxnDate. Determined by the scheduled tick name: ticks at or before 16:15 EAT → txn_date=execution day; ticks after 16:15 EAT → txn_date=next day. INDEPENDENT from as_of: as_of is when the customer actually paid, txn_date is when the bookkeeper records it. Omit only if you want the wall-clock default (paymentTxnDate() — risky for retries).',
         },
+        tick_name: {
+          type: 'string',
+          description: 'The scheduler tick name that triggered this fire — pull from your trigger_context.tick (e.g. "meru0300", "kili1615", "mawenzi1800"). Used by the auto-upload endpoint to paint the last processed sheet row purple + write "end of {tick_name}" to Column K as a visual end-of-window marker. Defaults to "heisenberg" if omitted (= manual button-fired run).',
+        },
       },
       required: ['channel', 'as_of'],
     },
@@ -260,6 +264,7 @@ export async function dispatch(toolName, input, ctx) {
           as_of: input.as_of,
           txn_date: input.txn_date || null,
           dry_run: ctx.mode === 'plan',
+          tick_name: input.tick_name || 'heisenberg',
         };
         const r = await fetch(`${base}/api/payment-batches/auto-upload/${encodeURIComponent(input.channel)}`, {
           method: 'POST',

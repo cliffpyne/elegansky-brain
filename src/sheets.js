@@ -105,6 +105,81 @@ export function serviceAccountEmail() {
 }
 
 /**
+ * After an auto-upload fire finishes, paint the last processed row purple
+ * (columns A through K) and write "end of {tick_name}" into Column K. This
+ * gives the operator a visual marker on the sheet showing where each tick
+ * stopped. Matches the existing iPhone team's manual "end of [date]" purple
+ * convention but applied automatically per tick fire across all channels.
+ *
+ * tabName is the sheet tab title (e.g. 'PASSED', 'BANK_PASSED'). rowNumber
+ * is 1-based to match Google Sheets row numbering and sheet_row_number we
+ * already carry through prepareAutoUpload.
+ *
+ * Purple chosen to be readable on both light + dark themes: RGB(0.85, 0.7, 0.95)
+ * — light lavender. Adjust here if the iPhone team's existing markers use a
+ * different shade.
+ */
+export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickName) {
+  if (!spreadsheetId || !tabName || !rowNumber || !tickName) {
+    return { painted: false, reason: 'missing arg' };
+  }
+  const sheets = await sheetsClient();
+  // Resolve sheetId from tabName (the numeric id needed by batchUpdate)
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets.properties',
+  });
+  const tab = (meta.data.sheets || []).find(
+    (s) => s.properties?.title === tabName,
+  );
+  if (!tab) {
+    throw new Error(`tab '${tabName}' not found in spreadsheet ${spreadsheetId}`);
+  }
+  const sheetId = tab.properties.sheetId;
+  const row0 = rowNumber - 1; // batchUpdate is 0-based
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        // Paint columns A..K (indices 0..11 exclusive) purple
+        {
+          repeatCell: {
+            range: {
+              sheetId,
+              startRowIndex: row0,
+              endRowIndex: row0 + 1,
+              startColumnIndex: 0,
+              endColumnIndex: 11,
+            },
+            cell: {
+              userEnteredFormat: {
+                backgroundColor: { red: 0.85, green: 0.7, blue: 0.95 },
+              },
+            },
+            fields: 'userEnteredFormat.backgroundColor',
+          },
+        },
+        // Write "end of {tick}" to Column K (index 10)
+        {
+          updateCells: {
+            range: {
+              sheetId,
+              startRowIndex: row0,
+              endRowIndex: row0 + 1,
+              startColumnIndex: 10,
+              endColumnIndex: 11,
+            },
+            rows: [{ values: [{ userEnteredValue: { stringValue: `end of ${tickName}` } }] }],
+            fields: 'userEnteredValue',
+          },
+        },
+      ],
+    },
+  });
+  return { painted: true, row: rowNumber, tick: tickName };
+}
+
+/**
  * Atomic-ish sort of one tab by date column, with backup. Used by the
  * /api/admin/sort-sheet-by-date endpoint after the NMB CSV-order chaos.
  *

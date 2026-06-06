@@ -1,0 +1,389 @@
+[
+  {
+    "id": "47a6e597-ae11-4a4c-9b92-e0bdb9ca4e96",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 1,
+    "total_balance": "1000",
+    "created_at": "2026-05-31T08:57:34.555Z",
+    "created_by": "smoke-test",
+    "notes": null
+  },
+  {
+    "id": "1e64fc5e-7af9-45cc-8e66-c7eb596802e0",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 1,
+    "total_balance": "12500",
+    "created_at": "2026-05-31T09:04:58.231Z",
+    "created_by": "smoke-test",
+    "notes": null
+  },
+  {
+    "id": "b401cfb9-666b-42b2-a9e9-0b79d4f02d79",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14553,
+    "total_balance": "319583767",
+    "created_at": "2026-05-31T11:48:29.399Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "baseline-2026-05-31-pre-saasant"
+  },
+  {
+    "id": "fadb0bb5-6733-45d6-a0fb-762978a68866",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14553,
+    "total_balance": "319583767",
+    "created_at": "2026-05-31T13:13:10.727Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "pre-saasant-fresh-2026-05-31"
+  },
+  {
+    "id": "5f930ca9-32ce-4e00-8483-225a29222b57",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14553,
+    "total_balance": "319583767",
+    "created_at": "2026-05-31T21:12:56.619Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "baseline-before-saasant-vs-brain-test-2026-05-31T21-12-03"
+  },
+  {
+    "id": "fb53abdb-f13f-4152-8d70-e020d111ee8a",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 13587,
+    "total_balance": "309653801",
+    "created_at": "2026-05-31T21:52:33.036Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "post-saasant-2026-05-31T21-51-46"
+  },
+  {
+    "id": "c387e5f4-4203-4cc9-8419-a9ef09644e29",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14553,
+    "total_balance": "319583767",
+    "created_at": "2026-05-31T22:39:26.628Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "post-saasant-undo-2026-05-31T22-38-37"
+  },
+  {
+    "id": "4c40c10b-afb4-4e76-9a45-a30751a63c5a",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 13539,
+    "total_balance": "309426781",
+    "created_at": "2026-05-31T23:16:52.577Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "post-brain-2026-05-31T23-16-08"
+  },
+  {
+    "id": "449f228c-3130-4b6c-b91d-c35186578f49",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 15235,
+    "total_balance": "330620281",
+    "created_at": "2026-06-01T02:47:26.096Z",
+    "created_by": "comparison-harness:clifforddennis",
+    "notes": "post-recall-attempt-02-45-52"
+  },
+  {
+    "id": "c12e68aa-2271-424b-9503-be0dc26f4c67",
+    "as_of": "2026-05-29T21:00:00.000Z",
+    "row_count": 13586,
+    "total_balance": "309641301",
+    "created_at": "2026-06-01T05:01:06.487Z",
+    "created_by": "catch-up-run1-nmb-30may",
+    "notes": "Run 1 — NMB 30.05.2026 16:16→23:54 catch-up; arrears date≤2026-05-30"
+  },
+  {
+    "id": "80eb6ceb-ca79-4207-b5fa-a7b27c827f49",
+    "as_of": "2026-05-29T21:00:00.000Z",
+    "row_count": 13586,
+    "total_balance": "309641301",
+    "created_at": "2026-06-01T05:02:59.713Z",
+    "created_by": "catch-up-run1-nmb-30may",
+    "notes": "Run 1 — NMB 30.05.2026 16:16→23:54 catch-up; arrears date≤2026-05-30"
+  },
+  {
+    "id": "4d65d199-8bd6-486b-a90f-703ff4160c43",
+    "as_of": "2026-05-29T21:00:00.000Z",
+    "row_count": 13244,
+    "total_balance": "306227439",
+    "created_at": "2026-06-01T05:28:22.414Z",
+    "created_by": "catch-up-run1b-crdb-30may",
+    "notes": "Run 1B — BANK CRDB 30.05.2026 16:55→23:59 catch-up; arrears date≤2026-05-30"
+  },
+  {
+    "id": "db35cdb5-7c52-4f53-8f9b-bfd97a210a5b",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14897,
+    "total_balance": "326906939",
+    "created_at": "2026-06-01T05:39:07.478Z",
+    "created_by": "catch-up-run2a-crdb-31may",
+    "notes": "Run 2A — BANK CRDB full 31.05; arrears≤2026-05-31"
+  },
+  {
+    "id": "b78cc0ce-bae2-481b-bcb8-937f300be626",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14894,
+    "total_balance": "326850439",
+    "created_at": "2026-06-01T05:50:55.815Z",
+    "created_by": "catch-up-run2a-crdb-31may",
+    "notes": "Run 2A — BANK CRDB full 31.05; arrears≤2026-05-31"
+  },
+  {
+    "id": "ed914adb-125d-48a1-9d34-fdf821c63a38",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14862,
+    "total_balance": "326465439",
+    "created_at": "2026-06-01T05:55:56.119Z",
+    "created_by": "catch-up-run2b-nmb-31may",
+    "notes": "Run 2B — NMB full 31.05; arrears≤2026-05-31"
+  },
+  {
+    "id": "f4b29e3e-4e57-4647-a9ef-b71b3a5604c1",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14824,
+    "total_balance": "326013939",
+    "created_at": "2026-06-01T06:11:47.028Z",
+    "created_by": "direct-run2b-nmb-31may",
+    "notes": "Run 2B direct-mode — NMB full 31.05; arrears≤2026-05-31"
+  },
+  {
+    "id": "7adc9556-e3ca-4386-9ed8-34d708bebd90",
+    "as_of": "2026-05-30T21:00:00.000Z",
+    "row_count": 14822,
+    "total_balance": "326017439",
+    "created_at": "2026-06-01T06:16:04.355Z",
+    "created_by": "direct-run2b-nmb-31may",
+    "notes": "Run 2B direct-mode — NMB full 31.05; arrears≤2026-05-31"
+  },
+  {
+    "id": "7ee987f0-1f32-4741-bf9f-6265c601281d",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 1000,
+    "total_balance": "11563425",
+    "created_at": "2026-06-01T09:20:18.861Z",
+    "created_by": "run3-bank-01jun",
+    "notes": "Run 3 — bank full 01.06; arrears≤2026-06-01"
+  },
+  {
+    "id": "fcc0f107-159b-4e5b-9a71-5813c1d66ea6",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13835,
+    "total_balance": "314263122",
+    "created_at": "2026-06-01T09:28:49.690Z",
+    "created_by": "run3-bank-01jun",
+    "notes": "Run 3 — bank full 01.06; arrears≤2026-06-01"
+  },
+  {
+    "id": "eb58efe8-4604-453b-b678-b58588e81291",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13835,
+    "total_balance": "314263122",
+    "created_at": "2026-06-01T09:36:50.116Z",
+    "created_by": "run3-bank-01jun",
+    "notes": "Run 3 — bank full 01.06; arrears≤2026-06-01"
+  },
+  {
+    "id": "01b1b98b-49d0-4d35-9da4-0346c6cbcd5d",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13780,
+    "total_balance": "313749122",
+    "created_at": "2026-06-01T09:39:56.602Z",
+    "created_by": "run3-nmbnew-01jun",
+    "notes": "Run 3 — nmbnew full 01.06; arrears≤2026-06-01"
+  },
+  {
+    "id": "b7b5acab-8970-4017-9a85-9acfb3610fe7",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13770,
+    "total_balance": "313617639",
+    "created_at": "2026-06-01T09:41:40.688Z",
+    "created_by": "run3-iphone_bank-01jun",
+    "notes": "Run 3 — iphone_bank full 01.06; arrears≤2026-06-01"
+  },
+  {
+    "id": "f81bd888-b4fc-4d46-8ac3-df8c1cd8bef0",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13706,
+    "total_balance": "312847638",
+    "created_at": "2026-06-01T10:35:13.556Z",
+    "created_by": "auto-upload-bank",
+    "notes": "auto cycle since=2026-06-01T11:33:30.751Z"
+  },
+  {
+    "id": "849c48e6-f716-45e3-ae5f-0158272fe3d8",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13698,
+    "total_balance": "312751438",
+    "created_at": "2026-06-01T10:44:48.906Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T09:35:15.469Z"
+  },
+  {
+    "id": "9bc01811-11e1-4083-8b88-8e4d70288026",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13692,
+    "total_balance": "312676388",
+    "created_at": "2026-06-01T11:15:49.710Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T09:35:15.469Z"
+  },
+  {
+    "id": "01a5d63f-c16b-4904-9468-16ca10209628",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13692,
+    "total_balance": "312676388",
+    "created_at": "2026-06-01T11:17:56.982Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T05:00:00Z"
+  },
+  {
+    "id": "63cee746-7ef2-449b-b5d6-2cead66e8ac7",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13692,
+    "total_balance": "312676388",
+    "created_at": "2026-06-01T11:35:38.955Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T09:35:15.469Z"
+  },
+  {
+    "id": "7c004633-9795-4fa0-af90-30a859cfb701",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13692,
+    "total_balance": "312676388",
+    "created_at": "2026-06-01T11:39:48.763Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T09:35:15.469Z"
+  },
+  {
+    "id": "4cf4ba31-0dca-4ef3-a7e0-f04c84a89037",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13541,
+    "total_balance": "273303848",
+    "created_at": "2026-06-01T11:40:30.936Z",
+    "created_by": "auto-upload-bank",
+    "notes": "auto cycle since=2026-06-01T10:30:16.798Z"
+  },
+  {
+    "id": "69209ab4-a1ae-4a87-8ded-74276ebdf32e",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13358,
+    "total_balance": "309061888",
+    "created_at": "2026-06-01T11:56:31.827Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T00:00:00Z"
+  },
+  {
+    "id": "6ffcd869-732e-43a2-8419-aae019077831",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 13118,
+    "total_balance": "306407788",
+    "created_at": "2026-06-01T12:08:46.245Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T11:39:52Z"
+  },
+  {
+    "id": "d5ed11cb-d76b-422a-b1d2-f49ac686904a",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 12858,
+    "total_balance": "303398694",
+    "created_at": "2026-06-01T12:19:21.621Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T00:00:00Z"
+  },
+  {
+    "id": "2e52a6a4-8cd2-4a65-9edb-66c0388c83d6",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 12858,
+    "total_balance": "303398694",
+    "created_at": "2026-06-01T12:20:38.454Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T00:00:00Z"
+  },
+  {
+    "id": "f850022d-a5e4-4fae-b09a-8f67b5bdf644",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 12848,
+    "total_balance": "303266694",
+    "created_at": "2026-06-01T12:48:15.109Z",
+    "created_by": "4-orphan-rows",
+    "notes": "Recovery of 4 rows with corrupted dates"
+  },
+  {
+    "id": "8c929da9-aaed-4fd8-a000-0d8cea98f6f9",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 12839,
+    "total_balance": "303154194",
+    "created_at": "2026-06-01T12:55:17.304Z",
+    "created_by": "auto-upload-bank",
+    "notes": "auto cycle since=2026-06-01T11:35:36.985Z"
+  },
+  {
+    "id": "d8ce27e9-f398-4b12-ad9c-b2c39615c4e5",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14208,
+    "total_balance": "320597094",
+    "created_at": "2026-06-01T13:21:35.976Z",
+    "created_by": "auto-upload-iphone_bank",
+    "notes": "auto cycle since=2026-06-01T12:43:29.690Z"
+  },
+  {
+    "id": "621254d9-5210-4c0b-85ce-601d76eb9c69",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14196,
+    "total_balance": "320473794",
+    "created_at": "2026-06-01T13:32:06.223Z",
+    "created_by": "auto-upload-bank",
+    "notes": "auto cycle since=2026-06-01T12:50:28.134Z"
+  },
+  {
+    "id": "d73bc60d-3358-4ae3-a264-84685b2b833f",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14187,
+    "total_balance": "320371794",
+    "created_at": "2026-06-01T13:32:53.313Z",
+    "created_by": "auto-upload-iphone_bank",
+    "notes": "auto cycle since=2026-06-01T13:16:40.593Z"
+  },
+  {
+    "id": "76a27a38-fbde-4cc3-8b7f-c8283e45b558",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14186,
+    "total_balance": "320352294",
+    "created_at": "2026-06-01T13:33:13.564Z",
+    "created_by": "auto-upload-iphone_bank",
+    "notes": "auto cycle since=2026-06-01T13:16:40.593Z"
+  },
+  {
+    "id": "2161fe53-ae31-4722-8a15-6162f686e8cb",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14151,
+    "total_balance": "319953544",
+    "created_at": "2026-06-01T14:14:08.555Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T12:43:27.628Z"
+  },
+  {
+    "id": "dfd7468d-d73a-4d84-85ed-2445de84415a",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14131,
+    "total_balance": "319676044",
+    "created_at": "2026-06-01T14:14:55.653Z",
+    "created_by": "auto-upload-bank",
+    "notes": "auto cycle since=2026-06-01T13:27:15.066Z"
+  },
+  {
+    "id": "0844857c-c82f-40b1-8160-851bb1f32e2f",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14129,
+    "total_balance": "319676044",
+    "created_at": "2026-06-01T14:15:33.854Z",
+    "created_by": "auto-upload-iphone_bank",
+    "notes": "auto cycle since=2026-06-01T13:27:57.203Z"
+  },
+  {
+    "id": "4fdca43b-fe10-4a7d-a78a-0fab357df130",
+    "as_of": "2026-05-31T21:00:00.000Z",
+    "row_count": 14127,
+    "total_balance": "319654844",
+    "created_at": "2026-06-01T14:21:22.821Z",
+    "created_by": "auto-upload-nmbnew",
+    "notes": "auto cycle since=2026-06-01T14:09:22.626Z"
+  }
+]

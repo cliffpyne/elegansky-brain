@@ -1,0 +1,11 @@
+R_DEF: Internal format may change without notice
+local
+id btn_save
+id btn_start
+id btn_stop
+id field_device
+id field_key
+id field_url
+id text_status
+layout activity_main
+string app_name
