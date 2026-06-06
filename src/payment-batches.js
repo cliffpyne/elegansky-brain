@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet } from './sheets.js';
+import { readSheet, writeSheetCells } from './sheets.js';
 import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -533,6 +533,7 @@ export function mountPaymentBatchesApi(app, deps) {
           qbBatchCreateUnappliedPayments,
           qbBatchLookupCustomers,
           qbCreateCreditMemo,
+          cfg: result.cfg,
         })
           .catch((err) => {
             console.error('[auto-upload background]', result.batchId, err);
@@ -3244,6 +3245,7 @@ function processInvoicePayments(invoices, transactions) {
           customerName: cur.inv.customerName, invoiceNo: cur.inv.invoiceNumber,
           amount: pay, memo: tx.transactionId, memoWithSuffix: appendSuf(tx.transactionId, tx.channel),
           channel: tx.channel, customerId: cur.inv.customerId, qbId: cur.inv.qbId,
+          sheet_row_number: tx.sheet_row_number,
         };
         out.push(rec); txp.push(rec);
         cur.remainingBalance -= pay; amt -= pay; used = true;
@@ -3259,6 +3261,7 @@ function processInvoicePayments(invoices, transactions) {
     invoiceNo: 'UNUSED', amount: t.amount, transactionAmount: t.amount,
     memo: t.transactionId, memoWithSuffix: appendSuf(t.transactionId, t.channel),
     isUnused: true, channel: t.channel,
+    sheet_row_number: t.sheet_row_number,
   }));
   return out;
 }
@@ -3300,21 +3303,32 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   //         after processing so they never run twice.
   //
   //    Window filter only applies to rows with a real parseable timestamp.
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
+  // Read columns A:J — includes new column I (Fetched at) and J (QB pushed)
+  // markers used to prevent re-pushing rows already in QB.
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
   const sheet = sheetData.values || sheetData.data || [];
   const txns = [];
-  let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0;
+  let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
   for (let i = 1; i < sheet.length; i++) {
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
     if (!ts) { skippedBadFormat++; continue; }
     if (ts < winStart || ts >= winEnd) { skippedOutOfWindow++; continue; }
+    // Phase 3+4: skip rows where Column I ("Fetched at", in-flight run) OR
+    // Column J ("QB pushed", completed) is already set. Sheet-side lock that
+    // replaces fragile DB consumed_transactions. Either column = "hands off".
+    const colI = String(sheet[i][8] || '').trim();
+    const colJ = String(sheet[i][9] || '').trim();
+    if (colI || colJ) { skippedAlreadyPushed++; continue; }
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
       amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
       receivedTimestamp: ts.getTime(), transactionId: sheet[i][7] || null,
+      // Phase 2: track the actual Google Sheets row number (1-based) so we can
+      // write Column I + J back to the right row after processing.
+      sheet_row_number: i + 1,
     });
   }
   // Intra-window dedup: same ref appearing twice in the sheet (operator moves
@@ -3560,7 +3574,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   }
   client.release();
 
-  return { skipped: false, batchId, paid, unused, sheetSum };
+  return { skipped: false, batchId, paid, unused, sheetSum, cfg };
 }
 
 async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
@@ -3568,7 +3582,37 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
   qbBatchLookupCustomers,
   qbCreateCreditMemo,  // kept only for fallback in sweep retry
+  cfg,  // { sheetId, tab } — used to write Column I + J markers
 }) {
+  // ─── Phase 4: write Column I "Fetched at" markers BEFORE QB pushes ─────
+  // Race-condition protection: if a second auto-upload fires while this one
+  // is mid-flight (e.g. operator double-clicks, or two crons overlap), the
+  // second run reads Column I on each row and skips it. Without this, both
+  // runs would push the same Payments to QB.
+  try {
+    if (cfg && cfg.sheetId && cfg.tab) {
+      const fetchedAt = new Date().toISOString();
+      const fetchRows = new Set();
+      for (const p of paid) { if (p.sheet_row_number) fetchRows.add(p.sheet_row_number); }
+      for (const u of unused) { if (u.sheet_row_number) fetchRows.add(u.sheet_row_number); }
+      if (fetchRows.size > 0) {
+        const updates = [];
+        for (const row of fetchRows) {
+          updates.push({
+            range: `${cfg.tab}!I${row}`,
+            value: `Fetched at: ${fetchedAt}`,
+          });
+        }
+        const r = await writeSheetCells(cfg.sheetId, updates);
+        console.log(`[auto-upload] Column I markers written: ${r.updatedCells} cells across ${updates.length} rows in ${cfg.tab}`);
+      }
+    } else {
+      console.log('[auto-upload] no cfg.sheetId/tab passed — skipping Column I pre-write');
+    }
+  } catch (err) {
+    console.error('[auto-upload] Column I pre-write failed (non-fatal, continuing):', err.message);
+  }
+
   // Use QB Batch API: each batch packs up to 30 ops and counts as 1
   // throttle hit, so we can run several batches concurrently for ~100/s
   // effective throughput vs ~5/s with per-record posts. Falls back to
@@ -3827,5 +3871,63 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
       [batchId, `${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason`],
     );
     console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after 3 sweeps.`);
+  }
+
+  // ─── Phase 2: write Column J "QB pushed" markers to the channel sheet ──
+  // Build bank_ref → sheet_row_number map from the in-memory paid+unused
+  // arrays (sheet_row_number was attached in prepareAutoUpload). Then query
+  // all successful payment_uploads for this batch and write
+  //   J{row} = "{qb_id_list} | {iso_timestamp}"
+  // for each row whose ref pushed at least one Payment to QB.
+  //
+  // Uses bank_ref (= memoWithSuffix) as the join key. Multi-invoice splits
+  // produce N PUs sharing one bank_ref → markers list all N qb_ids comma-
+  // separated so audit shows the full split.
+  try {
+    if (!cfg || !cfg.sheetId || !cfg.tab) {
+      console.log('[auto-upload] no cfg.sheetId/tab passed — skipping Column J write');
+    } else {
+      const refToRow = new Map();
+      for (const p of paid) {
+        if (p.memoWithSuffix && p.sheet_row_number) {
+          refToRow.set(p.memoWithSuffix, p.sheet_row_number);
+        }
+      }
+      for (const u of unused) {
+        if (u.memoWithSuffix && u.sheet_row_number) {
+          refToRow.set(u.memoWithSuffix, u.sheet_row_number);
+        }
+      }
+      const { rows: pushed } = await db().query(
+        `SELECT bank_ref, qb_id
+           FROM payment_uploads
+          WHERE batch_id=$1 AND status='created' AND qb_id IS NOT NULL`,
+        [batchId],
+      );
+      // Group qb_ids by sheet_row_number
+      const rowToQbIds = new Map();
+      for (const r of pushed) {
+        const row = refToRow.get(r.bank_ref);
+        if (!row) continue;
+        if (!rowToQbIds.has(row)) rowToQbIds.set(row, []);
+        rowToQbIds.get(row).push(String(r.qb_id));
+      }
+      if (rowToQbIds.size === 0) {
+        console.log('[auto-upload] no successful pushes to mark in sheet');
+      } else {
+        const ts = new Date().toISOString();
+        const updates = [];
+        for (const [row, ids] of rowToQbIds) {
+          updates.push({
+            range: `${cfg.tab}!J${row}`,
+            value: `${ids.join(',')} | ${ts}`,
+          });
+        }
+        const result = await writeSheetCells(cfg.sheetId, updates);
+        console.log(`[auto-upload] Column J markers written: ${result.updatedCells} cells across ${updates.length} rows in ${cfg.tab}`);
+      }
+    }
+  } catch (err) {
+    console.error('[auto-upload] Column J write failed (non-fatal):', err.message);
   }
 }
