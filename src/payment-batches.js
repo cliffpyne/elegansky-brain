@@ -3911,6 +3911,9 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
       skipped_no_date: skippedNoDate,
       skipped_bad_format: skippedBadFormat,
       skipped_out_of_window: skippedOutOfWindow,
+      skipped_already_pushed: skippedAlreadyPushed,
+      max_k_row: maxKRow,
+      sheet_total_rows: sheet.length - 1,
     };
   }
 
