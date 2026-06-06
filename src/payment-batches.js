@@ -27,7 +27,7 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 import { readSheet } from './sheets.js';
-import { qbQuery } from './qb-client.js';
+import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
 
@@ -1271,6 +1271,66 @@ export function mountPaymentBatchesApi(app, deps) {
       res.json({ customer_id: customerId, date, count: payments.length, payments: summary });
     } catch (err) {
       console.error('[qb-payments-for-customer] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/admin/quickreport?from=YYYY-MM-DD&to=YYYY-MM-DD&account=Kijichi%20Collection%20AC
+  // Calls QB's Reports API directly — returns the EXACT same data Frank gets
+  // when exporting the "Account QuickReport" from the QB UI (including invoice
+  // splits, multi-line Payments, reversal entries like "DOUBLE", etc).
+  app.get('/api/admin/quickreport', requireSecretOrJwt, async (req, res) => {
+    try {
+      const from = String(req.query.from || '');
+      const to = String(req.query.to || from);
+      if (!from) return res.status(400).json({ error: 'from=YYYY-MM-DD required' });
+      const acctName = String(req.query.account || 'Kijichi Collection AC');
+      const acctRes = await qbQuery(
+        `SELECT Id, Name FROM Account WHERE Name = '${acctName.replace(/'/g, "''")}'`,
+      );
+      const acct = acctRes.QueryResponse?.Account?.[0];
+      if (!acct) return res.status(404).json({ error: `account "${acctName}" not found` });
+      // Call QB Reports API — TransactionList filtered by account
+      const report = await qbReport('TransactionList', {
+        start_date: from,
+        end_date: to,
+        accounts: acct.Id,
+      });
+      // Parse the report rows into a flat structure
+      const rowsOut = [];
+      function walkRows(rows) {
+        for (const row of rows) {
+          if (row.type === 'Section' && row.Rows?.Row) {
+            walkRows(row.Rows.Row);
+          } else if (row.type === 'Data' && row.ColData) {
+            rowsOut.push(row.ColData.map((c) => c.value || ''));
+          }
+        }
+      }
+      walkRows(report.Rows?.Row || []);
+      // Try to identify the Amount column
+      const cols = report.Columns?.Column?.map((c) => c.ColTitle || c.ColType) || [];
+      const amtIdx = cols.findIndex((c) => /amount/i.test(c));
+      let total = 0;
+      if (amtIdx >= 0) {
+        for (const row of rowsOut) {
+          const v = String(row[amtIdx] || '').replace(/[,]/g, '');
+          const n = parseFloat(v);
+          if (!isNaN(n)) total += n;
+        }
+      }
+      res.json({
+        account: acct.Name,
+        account_id: acct.Id,
+        from, to,
+        columns: cols,
+        row_count: rowsOut.length,
+        amount_col_index: amtIdx,
+        total,
+        rows: rowsOut,
+      });
+    } catch (err) {
+      console.error('[quickreport] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });

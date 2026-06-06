@@ -134,6 +134,18 @@ export async function qbPost(path, body) {
   return call('POST', path, body);
 }
 
+// Reports API: returns same data as QB UI reports (TransactionList,
+// GeneralLedger, etc). Use this when matching QB's Account QuickReport
+// exports byte-for-byte is required.
+export async function qbReport(reportName, params = {}) {
+  const qs = Object.entries(params)
+    .filter(([_, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+    .join('&');
+  const path = `reports/${reportName}${qs ? '?' + qs : ''}`;
+  return call('GET', path);
+}
+
 export async function qbBatch(operations) {
   // operations: [{ bId, operation, entityType, entity }]
   // QBO format: BatchItemRequest[] with the entityType as the property key.
