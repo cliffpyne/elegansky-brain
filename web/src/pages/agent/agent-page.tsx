@@ -62,6 +62,21 @@ function todayEat(): string {
 function nowIso(): string {
   return new Date().toISOString();
 }
+function nowEat(): string {
+  // EAT wall-clock "YYYY-MM-DDTHH:mm:ss" (no Z, no offset)
+  return new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 19);
+}
+function eatToUtcIso(eatLocal: string): string {
+  // Operator enters time in EAT wall clock (e.g. "2026-06-03T16:48:57" or
+  // "2026-06-03 16:48:57"). Treat the input as EAT (UTC+3) and convert
+  // to UTC ISO before sending to the API.
+  const cleaned = eatLocal.trim().replace(' ', 'T').replace(/Z$/i, '');
+  // Strip any pre-existing offset the user may have pasted in.
+  const sansOffset = cleaned.replace(/[+-]\d{2}:?\d{2}$/, '');
+  const d = new Date(sansOffset + '+03:00');
+  if (isNaN(d.getTime())) throw new Error('Invalid EAT date: ' + eatLocal);
+  return d.toISOString();
+}
 function pastCutoffEat(): boolean {
   const eat = new Date(Date.now() + 3 * 3600_000);
   const h = eat.getUTCHours();
@@ -77,7 +92,7 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
   const [channel, setChannel] = useState<'nmbnew' | 'bank' | 'iphone_bank'>('nmbnew');
   const [windowMode, setWindowMode] = useState<'from_last' | 'explicit'>('from_last');
   const [sinceIso, setSinceIso] = useState<string>('');
-  const [untilIso, setUntilIso] = useState<string>(nowIso());
+  const [untilIso, setUntilIso] = useState<string>(nowEat());
   const [asOf, setAsOf] = useState<string>(todayEat());
   const [txnDate, setTxnDate] = useState<string>(pastCutoffEat() ? tomorrowEat() : todayEat());
   const [mode, setMode] = useState<'plan' | 'execute'>('plan');
@@ -96,8 +111,9 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
         txn_date: txnDate,
       };
       if (windowMode === 'explicit') {
-        win.since_iso = new Date(sinceIso).toISOString();
-        win.until_iso = new Date(untilIso).toISOString();
+        // Inputs are EAT wall-clock; convert to UTC ISO for the API.
+        win.since_iso = eatToUtcIso(sinceIso);
+        win.until_iso = eatToUtcIso(untilIso);
       } // else omit — server defaults to "since last finalized batch"
       const r = await fireAgent({
         trigger: 'heisenberg',
@@ -152,12 +168,12 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
         {windowMode === 'explicit' && (
           <div className="grid grid-cols-2 gap-3">
             <label className="space-y-1">
-              <span className="text-sm font-medium">Since (ISO 8601 UTC)</span>
-              <Input value={sinceIso} onChange={(e) => setSinceIso(e.target.value)} placeholder="2026-06-03T13:47:00Z" />
+              <span className="text-sm font-medium">Since (EAT — UTC+3)</span>
+              <Input value={sinceIso} onChange={(e) => setSinceIso(e.target.value)} placeholder="2026-06-03T16:48:57" />
             </label>
             <label className="space-y-1">
-              <span className="text-sm font-medium">Until (ISO 8601 UTC)</span>
-              <Input value={untilIso} onChange={(e) => setUntilIso(e.target.value)} placeholder="2026-06-03T20:55:52Z" />
+              <span className="text-sm font-medium">Until (EAT — UTC+3)</span>
+              <Input value={untilIso} onChange={(e) => setUntilIso(e.target.value)} placeholder="2026-06-03T23:59:59" />
             </label>
           </div>
         )}
