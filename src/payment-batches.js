@@ -1291,12 +1291,23 @@ export function mountPaymentBatchesApi(app, deps) {
         if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
         fullId = r.rows[0].id;
       }
+      // Optional before_iso filter: only scan PUs created before this time.
+      // Prevents re-processing PUs created by THIS very endpoint (which would
+      // double-create Payments in QB on retry).
+      const beforeIso = req.body?.before_iso ? String(req.body.before_iso) : null;
+      const sqlArgs = [fullId];
+      let sqlExtra = '';
+      if (beforeIso) {
+        sqlArgs.push(beforeIso);
+        sqlExtra = `AND created_at < $${sqlArgs.length}::timestamptz`;
+      }
       const r = await db().query(
         `SELECT id, kind, bank_ref, customer_id, customer_name, invoice_qb_id, invoice_no, amount, memo
            FROM payment_uploads
           WHERE batch_id = $1 AND status = 'voided' AND customer_id IS NOT NULL
+            ${sqlExtra}
           ORDER BY id`,
-        [fullId],
+        sqlArgs,
       );
       const rows = r.rows;
       let okCount = 0, failCount = 0;
