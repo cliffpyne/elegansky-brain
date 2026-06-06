@@ -352,6 +352,26 @@ export function mountPaymentBatchesApi(app, deps) {
     if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
       return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
     }
+    // ─── HARD KILL SWITCH ──────────────────────────────────────────────
+    // app_settings.auto_upload_enabled = 'false' blocks every caller of
+    // this endpoint: cron-scheduled agent sessions, agent tool calls,
+    // manual curls, dashboard buttons. Use during incidents where any
+    // QB push must be impossible until operator re-enables. Default is
+    // 'true' (or missing key) — backwards compatible.
+    try {
+      const r = await db().query(
+        `SELECT value FROM app_settings WHERE key = 'auto_upload_enabled'`,
+      );
+      const v = r.rows[0]?.value;
+      if (v && String(v).toLowerCase() === 'false') {
+        return res.status(503).json({
+          error: 'auto-upload disabled via app_settings.auto_upload_enabled=false',
+          remedy: 'set app_settings.auto_upload_enabled=true to re-enable',
+        });
+      }
+    } catch (err) {
+      console.error('[auto-upload kill-switch check failed — failing OPEN]:', err.message);
+    }
     const dryRun = req.body?.dry_run === true || process.env.AUTO_UPLOAD_DRY_RUN === 'true';
     const maxPaid = Number(process.env.AUTO_UPLOAD_MAX_PAID || 200);
 

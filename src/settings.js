@@ -22,6 +22,7 @@ const ALLOWED_KEYS = new Set([
   'admin_phones',              // SMS recipient list (dashboard /admin-sms page)
   'sms_recipients',            // legacy key for the same thing
   'agent_scheduler_enabled',   // BRAIN agent scheduler toggle
+  'auto_upload_enabled',       // hard kill switch on /api/payment-batches/auto-upload/:channel
 ]);
 
 export function mountSettingsApi(app) {
