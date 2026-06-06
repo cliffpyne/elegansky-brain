@@ -1303,9 +1303,17 @@ export function mountPaymentBatchesApi(app, deps) {
       }
       const r = await db().query(
         `SELECT id, kind, bank_ref, customer_id, customer_name, invoice_qb_id, invoice_no, amount, memo
-           FROM payment_uploads
+           FROM payment_uploads pu
           WHERE batch_id = $1 AND status = 'voided' AND customer_id IS NOT NULL
             ${sqlExtra}
+            AND NOT EXISTS (
+              SELECT 1 FROM payment_uploads pu2
+               WHERE pu2.batch_id = pu.batch_id
+                 AND pu2.bank_ref = pu.bank_ref
+                 AND pu2.invoice_qb_id IS NOT DISTINCT FROM pu.invoice_qb_id
+                 AND pu2.status = 'created'
+                 AND pu2.qb_id IS NOT NULL
+            )
           ORDER BY id`,
         sqlArgs,
       );
@@ -1346,7 +1354,13 @@ export function mountPaymentBatchesApi(app, deps) {
                row.invoice_qb_id, row.invoice_no, row.amount, row.memo,
                qb.id, JSON.stringify(qb.response)],
             );
-            // Re-insert CT lock
+            // Mark source PU as 'restored' so re-running the endpoint
+            // (eg to retry rate-limit failures) does NOT re-process this row
+            // and create a duplicate Payment in QB.
+            await db().query(
+              `UPDATE payment_uploads SET status='restored' WHERE id=$1`,
+              [row.id],
+            );
             await db().query(
               `INSERT INTO consumed_transactions (bank_ref, batch_id) VALUES ($1, $2)
                ON CONFLICT (bank_ref) DO NOTHING`,
