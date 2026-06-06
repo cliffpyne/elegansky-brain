@@ -1362,6 +1362,77 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/sheet-lock-audit?channel=nmbnew[&since_iso=...&until_iso=...]
+  // Reads the channel sheet (cols A:J) and reports each row's I/J state.
+  // The four buckets:
+  //   - pushed_ok:    I set + J set    (normal — payment landed)
+  //   - in_flight:    I set + J empty AND I timestamp < 10 min ago (run still running, leave alone)
+  //   - silent_fail:  I set + J empty AND I timestamp ≥ 10 min ago  (FAILURE — payment never made it)
+  //   - untouched:    I empty + J empty (in window, never processed)
+  //   - anomaly:      I empty + J set   (shouldn't happen — manual edit?)
+  // Frank's audit rule: silent_fail rows MUST be re-fired or the books won't balance.
+  app.get('/api/admin/sheet-lock-audit', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.query.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = req.query.since_iso ? new Date(String(req.query.since_iso)) : null;
+      const untilIso = req.query.until_iso ? new Date(String(req.query.until_iso)) : null;
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const rows = sheetData.values || sheetData.data || [];
+      const now = Date.now();
+      const STALE_MS = 10 * 60 * 1000;
+      const pushed_ok = [];
+      const in_flight = [];
+      const silent_fail = [];
+      const anomaly = [];
+      let untouched_in_window = 0;
+      for (let i = 1; i < rows.length; i++) {
+        const dCell = String(rows[i][1] || '').trim();
+        if (!dCell) continue; // empty-date skip rows
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (sinceIso && ts < sinceIso) continue;
+        if (untilIso && ts >= untilIso) continue;
+        const ref = String(rows[i][7] || '').trim();
+        const amount = rows[i][4] ? Number(String(rows[i][4]).replace(/,/g, '')) : null;
+        const colI = String(rows[i][8] || '').trim();
+        const colJ = String(rows[i][9] || '').trim();
+        const rec = {
+          sheet_row: i + 1, sheet_ts: ts.toISOString(), bank_ref: ref,
+          amount, col_i: colI || null, col_j: colJ || null,
+        };
+        if (colI && colJ) { pushed_ok.push(rec); continue; }
+        if (!colI && !colJ) { untouched_in_window++; continue; }
+        if (!colI && colJ) { anomaly.push(rec); continue; }
+        // colI set, colJ empty
+        const m = colI.match(/Fetched at:\s*(\S+)/);
+        const fetchedTs = m ? new Date(m[1]).getTime() : 0;
+        if (fetchedTs && now - fetchedTs < STALE_MS) in_flight.push(rec);
+        else silent_fail.push(rec);
+      }
+      res.json({
+        channel,
+        sheet_tab: cfg.tab,
+        window: { since_iso: sinceIso?.toISOString() || null, until_iso: untilIso?.toISOString() || null },
+        summary: {
+          pushed_ok: pushed_ok.length,
+          in_flight: in_flight.length,
+          silent_fail: silent_fail.length,
+          anomaly: anomaly.length,
+          untouched_in_window,
+        },
+        silent_fail,
+        in_flight,
+        anomaly,
+        pushed_ok_sample: pushed_ok.slice(0, 5),
+      });
+    } catch (err) {
+      console.error('[sheet-lock-audit] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/audit-batch-pushes
   // Body: { batch_id }
   // Per-Payment audit of a batch's pushes. For each PU with status='created'
@@ -3584,6 +3655,45 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   qbCreateCreditMemo,  // kept only for fallback in sweep retry
   cfg,  // { sheetId, tab } — used to write Column I + J markers
 }) {
+  // ─── Per-payment J-marker state (cumulative across chunks) ────────────
+  // rowToQbIds maps sheet_row_number -> [qb_id, qb_id, ...] for that row.
+  // Multi-invoice splits accumulate IDs as their Payments land. Each chunk
+  // worker, after processing its slice, flushes the FULL cumulative list
+  // for each affected row. This is crash-safe at chunk granularity and
+  // converges to the right value regardless of worker interleaving.
+  const rowToQbIds = new Map();
+  const refToRow = new Map();
+  for (const p of paid) {
+    if (p.memoWithSuffix && p.sheet_row_number) refToRow.set(p.memoWithSuffix, p.sheet_row_number);
+  }
+  for (const u of unused) {
+    if (u.memoWithSuffix && u.sheet_row_number) refToRow.set(u.memoWithSuffix, u.sheet_row_number);
+  }
+  async function flushJForRows(affectedRows) {
+    if (!cfg || !cfg.sheetId || !cfg.tab || affectedRows.size === 0) return;
+    const updates = [];
+    const ts = new Date().toISOString();
+    for (const row of affectedRows) {
+      const ids = rowToQbIds.get(row) || [];
+      if (ids.length === 0) continue;
+      updates.push({
+        range: `${cfg.tab}!J${row}`,
+        value: `${ids.join(',')} | ${ts}`,
+      });
+    }
+    if (updates.length === 0) return;
+    try {
+      await writeSheetCells(cfg.sheetId, updates);
+    } catch (err) {
+      console.error('[auto-upload] Column J chunk-flush failed (non-fatal):', err.message);
+    }
+  }
+  function recordJ(sheet_row_number, qb_id) {
+    if (!sheet_row_number || !qb_id) return;
+    if (!rowToQbIds.has(sheet_row_number)) rowToQbIds.set(sheet_row_number, []);
+    rowToQbIds.get(sheet_row_number).push(String(qb_id));
+  }
+
   // ─── Phase 4: write Column I "Fetched at" markers BEFORE QB pushes ─────
   // Race-condition protection: if a second auto-upload fires while this one
   // is mid-flight (e.g. operator double-clicks, or two crons overlap), the
@@ -3642,6 +3752,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
           // whole batch hard-failed (after retries) — mark all as failed
           results = items.map(() => ({ ok: false, id: null, response: null, error: String(err.message || err).slice(0, 500) }));
         }
+        const affectedRows = new Set();
         for (let i = 0; i < chunk.length; i++) {
           const p = chunk[i]; const r = results[i];
           if (r.ok) {
@@ -3654,6 +3765,8 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
                p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
                r.id, JSON.stringify(r.response)],
             );
+            recordJ(p.sheet_row_number, r.id);
+            if (p.sheet_row_number) affectedRows.add(p.sheet_row_number);
           } else {
             failed++;
             await db().query(
@@ -3667,6 +3780,9 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
             );
           }
         }
+        // Per-chunk J flush — only rows whose Payment actually landed in QB
+        // get marked. Failed rows leave J empty so the audit can spot them.
+        await flushJForRows(affectedRows);
       }
     };
     await Promise.all(Array.from({ length: PARALLEL_BATCHES }, () => worker()));
@@ -3694,6 +3810,8 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
              p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix,
              qb.id, JSON.stringify(qb.response)],
           );
+          recordJ(p.sheet_row_number, qb.id);
+          if (p.sheet_row_number) await flushJForRows(new Set([p.sheet_row_number]));
         } catch (err) {
           failed++;
           await db().query(
@@ -3757,6 +3875,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
           catch (err) {
             results = items.map(() => ({ ok: false, id: null, response: null, error: String(err.message || err).slice(0, 500) }));
           }
+          const affectedRowsU = new Set();
           for (let i = 0; i < chunk.length; i++) {
             const u = chunk[i]; const r = results[i];
             if (r.ok) {
@@ -3768,6 +3887,8 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
                 [batchId, u.memoWithSuffix, u.customerId, u.customerName,
                  round2(u.transactionAmount), u.memoWithSuffix, r.id, JSON.stringify(r.response)],
               );
+              recordJ(u.sheet_row_number, r.id);
+              if (u.sheet_row_number) affectedRowsU.add(u.sheet_row_number);
             } else {
               failed++;
               await db().query(
@@ -3781,6 +3902,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
               );
             }
           }
+          await flushJForRows(affectedRowsU);
         }
       };
       await Promise.all(Array.from({ length: UPAR }, () => uworker()));
@@ -3849,6 +3971,12 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
             [u.id, qb.id, JSON.stringify(qb.response)],
           );
           failed--;
+          // Sweep-recovered PU: map bank_ref → sheet_row_number and mark J.
+          const sheetRow = refToRow.get(u.bank_ref);
+          if (sheetRow) {
+            recordJ(sheetRow, qb.id);
+            await flushJForRows(new Set([sheetRow]));
+          }
         } catch (err) {
           await db().query(
             `UPDATE payment_uploads SET failure_reason=$2 WHERE id=$1`,
@@ -3873,61 +4001,8 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
     console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after 3 sweeps.`);
   }
 
-  // ─── Phase 2: write Column J "QB pushed" markers to the channel sheet ──
-  // Build bank_ref → sheet_row_number map from the in-memory paid+unused
-  // arrays (sheet_row_number was attached in prepareAutoUpload). Then query
-  // all successful payment_uploads for this batch and write
-  //   J{row} = "{qb_id_list} | {iso_timestamp}"
-  // for each row whose ref pushed at least one Payment to QB.
-  //
-  // Uses bank_ref (= memoWithSuffix) as the join key. Multi-invoice splits
-  // produce N PUs sharing one bank_ref → markers list all N qb_ids comma-
-  // separated so audit shows the full split.
-  try {
-    if (!cfg || !cfg.sheetId || !cfg.tab) {
-      console.log('[auto-upload] no cfg.sheetId/tab passed — skipping Column J write');
-    } else {
-      const refToRow = new Map();
-      for (const p of paid) {
-        if (p.memoWithSuffix && p.sheet_row_number) {
-          refToRow.set(p.memoWithSuffix, p.sheet_row_number);
-        }
-      }
-      for (const u of unused) {
-        if (u.memoWithSuffix && u.sheet_row_number) {
-          refToRow.set(u.memoWithSuffix, u.sheet_row_number);
-        }
-      }
-      const { rows: pushed } = await db().query(
-        `SELECT bank_ref, qb_id
-           FROM payment_uploads
-          WHERE batch_id=$1 AND status='created' AND qb_id IS NOT NULL`,
-        [batchId],
-      );
-      // Group qb_ids by sheet_row_number
-      const rowToQbIds = new Map();
-      for (const r of pushed) {
-        const row = refToRow.get(r.bank_ref);
-        if (!row) continue;
-        if (!rowToQbIds.has(row)) rowToQbIds.set(row, []);
-        rowToQbIds.get(row).push(String(r.qb_id));
-      }
-      if (rowToQbIds.size === 0) {
-        console.log('[auto-upload] no successful pushes to mark in sheet');
-      } else {
-        const ts = new Date().toISOString();
-        const updates = [];
-        for (const [row, ids] of rowToQbIds) {
-          updates.push({
-            range: `${cfg.tab}!J${row}`,
-            value: `${ids.join(',')} | ${ts}`,
-          });
-        }
-        const result = await writeSheetCells(cfg.sheetId, updates);
-        console.log(`[auto-upload] Column J markers written: ${result.updatedCells} cells across ${updates.length} rows in ${cfg.tab}`);
-      }
-    }
-  } catch (err) {
-    console.error('[auto-upload] Column J write failed (non-fatal):', err.message);
-  }
+  // J markers are flushed per-chunk (and per sweep success) above. No
+  // end-of-run flush — operator rule: J reflects PER-PAYMENT QB success,
+  // not batch completion. Rows with I set + J empty after this point are
+  // genuine failures and surface in the sheet-lock audit endpoint.
 }
