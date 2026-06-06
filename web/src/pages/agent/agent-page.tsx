@@ -67,13 +67,24 @@ function nowEat(): string {
   return new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 19);
 }
 function eatToUtcIso(eatLocal: string): string {
-  // Operator enters time in EAT wall clock (e.g. "2026-06-03T16:48:57" or
-  // "2026-06-03 16:48:57"). Treat the input as EAT (UTC+3) and convert
-  // to UTC ISO before sending to the API.
-  const cleaned = eatLocal.trim().replace(' ', 'T').replace(/Z$/i, '');
-  // Strip any pre-existing offset the user may have pasted in.
-  const sansOffset = cleaned.replace(/[+-]\d{2}:?\d{2}$/, '');
-  const d = new Date(sansOffset + '+03:00');
+  // Operator enters time in EAT wall clock. Accept both formats:
+  //   - ISO:       "2026-06-03T16:48:57" or "2026-06-03 16:48:57"
+  //   - European:  "03.06.2026T16:48:57" or "03.06.2026 16:48:57"
+  //                (matches the bank statement format operators copy from)
+  // Treat the input as EAT (UTC+3) and convert to UTC ISO.
+  let s = eatLocal.trim().replace(/Z$/i, '');
+  // Normalize whitespace/T separator
+  s = s.replace(' ', 'T');
+  // Strip any pre-existing offset the user may have pasted in
+  s = s.replace(/[+-]\d{2}:?\d{2}$/, '');
+  // If the date part is DD.MM.YYYY, swap to ISO YYYY-MM-DD
+  const euMatch = s.match(/^(\d{2})\.(\d{2})\.(\d{4})(.*)$/);
+  if (euMatch) {
+    s = `${euMatch[3]}-${euMatch[2]}-${euMatch[1]}${euMatch[4]}`;
+  }
+  // Default to start-of-day if no time given
+  if (!/T\d{2}/.test(s)) s = s + 'T00:00:00';
+  const d = new Date(s + '+03:00');
   if (isNaN(d.getTime())) throw new Error('Invalid EAT date: ' + eatLocal);
   return d.toISOString();
 }
@@ -169,11 +180,11 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
           <div className="grid grid-cols-2 gap-3">
             <label className="space-y-1">
               <span className="text-sm font-medium">Since (EAT — UTC+3)</span>
-              <Input value={sinceIso} onChange={(e) => setSinceIso(e.target.value)} placeholder="2026-06-03T16:48:57" />
+              <Input value={sinceIso} onChange={(e) => setSinceIso(e.target.value)} placeholder="03.06.2026T16:48:57 or 2026-06-03T16:48:57" />
             </label>
             <label className="space-y-1">
               <span className="text-sm font-medium">Until (EAT — UTC+3)</span>
-              <Input value={untilIso} onChange={(e) => setUntilIso(e.target.value)} placeholder="2026-06-03T23:59:59" />
+              <Input value={untilIso} onChange={(e) => setUntilIso(e.target.value)} placeholder="03.06.2026T23:59:59 or 2026-06-03T23:59:59" />
             </label>
           </div>
         )}
