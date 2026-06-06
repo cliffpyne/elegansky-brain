@@ -1677,6 +1677,71 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/find-already-consumed-refs-in-window
+  // Body: { channel, since_iso, until_iso }
+  // Lists sheet refs in the window that are ALREADY in consumed_transactions
+  // or external_consumed_refs — these are what BRAIN's dry-run drops, causing
+  // a sheet_sum smaller than the drag-drop total.
+  app.post('/api/admin/find-already-consumed-refs-in-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = new Date(String(req.body?.since_iso || ''));
+      const untilIso = new Date(String(req.body?.until_iso || ''));
+      if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso and until_iso required' });
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const rowsInWindow = [];
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < sinceIso || ts >= untilIso) continue;
+        const ref = String(sheet[i][7] || '').trim();
+        if (!ref) continue;
+        const suffixed = appendSuf(ref, channel);
+        rowsInWindow.push({
+          sheet_row: i + 1,
+          date: dCell,
+          amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : 0,
+          customer: sheet[i][6] || null,
+          ref,
+          suffixed,
+        });
+      }
+      const suffixedRefs = rowsInWindow.map((r) => r.suffixed);
+      // Find which of these are in consumed_transactions
+      const consumed = await db().query(
+        `SELECT bank_ref, batch_id FROM consumed_transactions WHERE bank_ref = ANY($1::text[])`,
+        [suffixedRefs],
+      );
+      const external = await db().query(
+        `SELECT bank_ref FROM external_consumed_refs WHERE bank_ref = ANY($1::text[])`,
+        [suffixedRefs],
+      );
+      const consumedMap = new Map(consumed.rows.map((r) => [r.bank_ref, String(r.batch_id).slice(0, 8)]));
+      const externalSet = new Set(external.rows.map((r) => r.bank_ref));
+      const blocked = rowsInWindow.filter((r) => consumedMap.has(r.suffixed) || externalSet.has(r.suffixed));
+      const blockedAmount = blocked.reduce((s, r) => s + r.amount, 0);
+      res.json({
+        channel,
+        window: { since: sinceIso.toISOString(), until: untilIso.toISOString() },
+        rows_in_window: rowsInWindow.length,
+        blocked_count: blocked.length,
+        blocked_total_amount: blockedAmount,
+        blocked_rows: blocked.map((r) => ({
+          ...r,
+          source: consumedMap.has(r.suffixed) ? `consumed_transactions (batch ${consumedMap.get(r.suffixed)})` : 'external_consumed_refs',
+        })),
+      });
+    } catch (err) {
+      console.error('[find-already-consumed-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/find-duplicate-refs-in-window
   // Body: { channel, since_iso, until_iso }
   // Reads the channel sheet, finds rows in window, groups by bank_ref
