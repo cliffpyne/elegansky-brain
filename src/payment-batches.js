@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns } from './sheets.js';
 import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -1384,6 +1384,25 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[scan-double-pushes] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/protect-marker-columns
+  // Body: { channel } — locks columns I/J/K on the channel sheet so only
+  // the BRAIN service account can edit them. Operators with edit access
+  // can still touch A-H normally but can't accidentally wipe the
+  // Fetched-at / QB-pushed / end-of-tick markers. Run once per channel
+  // sheet during setup. Idempotent (returns alreadyExists if re-run).
+  app.post('/api/admin/protect-marker-columns', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const r = await protectMarkerColumns(cfg.sheetId, cfg.tab);
+      res.json({ channel, sheet_tab: cfg.tab, ...r });
+    } catch (err) {
+      console.error('[protect-marker-columns] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -3846,10 +3865,18 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
   for (let i = 1; i < sheet.length; i++) {
-    // Column K boundary: skip every row at or before the last "end of tick"
-    // marker. Rows always get appended at the bottom, so anything <= maxKRow
-    // is by definition already processed by a previous fire.
+    // Belt + suspenders: skip if ANY of three signals says "already processed"
+    //   (a) Row is at or below the last Column K "end of tick" marker
+    //       (= prior fire's boundary; rows are appended at bottom only)
+    //   (b) Column I (Fetched at) is set on this row
+    //   (c) Column J (QB pushed) is set on this row
+    // K is the primary fast check, I/J are per-row safety nets in case the
+    // K marker got deleted (operator error or malicious). Only way to defeat
+    // all three: delete I, J, AND K from the same row.
     if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
+    const colI = String(sheet[i][8] || '').trim();
+    const colJ = String(sheet[i][9] || '').trim();
+    if (colI || colJ) { skippedAlreadyPushed++; continue; }
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);

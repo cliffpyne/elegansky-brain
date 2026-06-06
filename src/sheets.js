@@ -105,6 +105,64 @@ export function serviceAccountEmail() {
 }
 
 /**
+ * Lock columns I, J, K on the named tab so ONLY the service account can
+ * edit them. Operators with edit access to the sheet can still touch
+ * A-H normally but can't accidentally (or maliciously) wipe the
+ * fetched-at / qb-pushed / end-of-tick markers that BRAIN relies on as
+ * its sheet-side locks. Run this once per channel sheet during setup.
+ *
+ * Idempotent: if a protection already exists on the same range, returns
+ * existing without creating a duplicate.
+ */
+export async function protectMarkerColumns(spreadsheetId, tabName) {
+  const sheets = await sheetsClient();
+  const saEmail = serviceAccountEmail();
+  // Resolve sheetId from tabName
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets.properties,sheets.protectedRanges',
+  });
+  const tab = (meta.data.sheets || []).find((s) => s.properties?.title === tabName);
+  if (!tab) throw new Error(`tab '${tabName}' not found in spreadsheet ${spreadsheetId}`);
+  const sheetId = tab.properties.sheetId;
+  // Check for existing protection on cols I-K (indices 8..11)
+  const existing = (tab.protectedRanges || []).find((p) => {
+    const r = p.range || {};
+    return r.sheetId === sheetId && r.startColumnIndex === 8 && r.endColumnIndex === 11;
+  });
+  if (existing) {
+    return { created: false, alreadyExists: true, protectionId: existing.protectedRangeId };
+  }
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          addProtectedRange: {
+            protectedRange: {
+              range: {
+                sheetId,
+                startColumnIndex: 8,  // column I
+                endColumnIndex: 11,    // column K exclusive
+                // No row bounds = whole column protected
+              },
+              description: 'BRAIN markers (I=Fetched, J=QB pushed, K=end of tick) — do not edit',
+              warningOnly: false,
+              editors: { users: [saEmail] },
+            },
+          },
+        },
+      ],
+    },
+  });
+  return {
+    created: true,
+    protectionId: res.data.replies?.[0]?.addProtectedRange?.protectedRange?.protectedRangeId || null,
+    service_account: saEmail,
+  };
+}
+
+/**
  * After an auto-upload fire finishes, paint the last processed row purple
  * (columns A through K) and write "end of {tick_name}" into Column K. This
  * gives the operator a visual marker on the sheet showing where each tick
