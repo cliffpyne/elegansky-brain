@@ -3885,12 +3885,16 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // used to gate processing. K is the single source of truth.
   const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
   const sheet = sheetData.values || sheetData.data || [];
-  // Find the highest row index that has a non-empty Column K marker.
-  // Default to 0 if none — means the whole sheet is unprocessed.
+  // Find the highest row index whose Column K holds a BRAIN end-of-tick
+  // marker. Only values that start with "end of " are treated as
+  // boundaries — that's BRAIN's exact write format from paintRowEndMarker
+  // ("end of meru0300" / "end of heisenberg" / etc). Other stray K data
+  // (legacy operator notes, accidental text) is ignored so it can't
+  // wedge the entire sheet.
   let maxKRow = 0;
   for (let i = 1; i < sheet.length; i++) {
-    const colK = String(sheet[i][10] || '').trim();
-    if (colK) maxKRow = i + 1; // 1-based row number
+    const colK = String(sheet[i][10] || '').trim().toLowerCase();
+    if (colK.startsWith('end of ')) maxKRow = i + 1; // 1-based row number
   }
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
