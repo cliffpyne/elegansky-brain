@@ -1382,36 +1382,48 @@ export function mountPaymentBatchesApi(app, deps) {
       const suffix = { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel];
       // Normalize: ensure we have both bare and suffixed forms
       const suffixedRefs = refs.map((r) => (suffix && r.endsWith(suffix)) ? r : appendSuf(r, channel));
-      // Query QB for active Payments with these PrivateNotes
-      // QB doesn't support IN on PrivateNote, so query one ref at a time
-      const qbHits = new Map(); // suffixedRef → [{qb_id, amount, txnDate, customerRef}]
-      for (const sref of suffixedRefs) {
-        try {
-          const r = await qbQuery(
-            `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM Payment WHERE PrivateNote = '${sref.replace(/'/g, "''")}' MAXRESULTS 100`,
-          );
-          const pmts = r.QueryResponse?.Payment || [];
-          qbHits.set(sref, pmts.map((p) => ({
-            qb_id: String(p.Id),
-            amount: Number(p.TotalAmt),
-            txnDate: p.TxnDate,
-            customerRef: p.CustomerRef?.value,
-            customerName: p.CustomerRef?.name,
-          })));
-        } catch (err) {
-          qbHits.set(sref, { error: String(err.message || err).slice(0, 200) });
-        }
-      }
-      // Look up DB records for all suffixed refs
+      // Look up DB records first — we need customer_id per ref to query QB by customer
       const pus = await db().query(
-        `SELECT bank_ref, qb_id, status FROM payment_uploads
+        `SELECT bank_ref, customer_id, qb_id, status FROM payment_uploads
           WHERE bank_ref = ANY($1::text[]) AND qb_id IS NOT NULL`,
         [suffixedRefs],
       );
       const dbByRef = new Map();
+      const customerByRef = new Map();
       for (const r of pus.rows) {
         if (!dbByRef.has(r.bank_ref)) dbByRef.set(r.bank_ref, []);
         dbByRef.get(r.bank_ref).push({ qb_id: String(r.qb_id), status: r.status });
+        if (r.customer_id) customerByRef.set(r.bank_ref, String(r.customer_id));
+      }
+      // Query QB: PrivateNote is not directly queryable. Instead query
+      // Payment WHERE CustomerRef = X AND TxnDate >= '2026-06-04', then
+      // filter results by PrivateNote in code.
+      const qbHits = new Map();
+      const dateFrom = '2026-06-03';
+      for (const sref of suffixedRefs) {
+        const customerId = customerByRef.get(sref);
+        if (!customerId) {
+          qbHits.set(sref, { error: 'no customer_id in payment_uploads — cannot query QB' });
+          continue;
+        }
+        try {
+          const r = await qbQuery(
+            `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM Payment WHERE CustomerRef = '${customerId}' AND TxnDate >= '${dateFrom}' MAXRESULTS 1000`,
+          );
+          const pmts = r.QueryResponse?.Payment || [];
+          // Filter client-side by PrivateNote
+          const matching = pmts.filter((p) => String(p.PrivateNote || '') === sref).map((p) => ({
+            qb_id: String(p.Id),
+            privateNote: p.PrivateNote,
+            amount: Number(p.TotalAmt),
+            txnDate: p.TxnDate,
+            customerRef: p.CustomerRef?.value,
+            customerName: p.CustomerRef?.name,
+          }));
+          qbHits.set(sref, matching);
+        } catch (err) {
+          qbHits.set(sref, { error: String(err.message || err).slice(0, 200) });
+        }
       }
       // Assemble per-ref diagnosis
       const results = [];
