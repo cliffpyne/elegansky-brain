@@ -1433,6 +1433,166 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/void-by-sheet-window
+  // Body: { channel, since_iso, until_iso, dry_run, reason }
+  // Recall window: reads the channel sheet, finds every row whose sheet_ts
+  // falls in [since_iso, until_iso), maps each row's bank_ref → matching PUs
+  // in DB (status='created', qb_id set), and:
+  //   - dry_run=true:  returns the plan (count, total amount, sample refs)
+  //                    without voiding anything
+  //   - dry_run=false: voids each PU in QB, marks status='voided', clears
+  //                    Column I and J on the affected sheet rows so the next
+  //                    fresh fire reprocesses them
+  // SAFETY: ONLY touches PUs we pushed (qb_id set, batch_id set). Manual
+  // invoices in QB are never voided because they have no payment_uploads row.
+  app.post('/api/admin/void-by-sheet-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = req.body?.since_iso ? new Date(String(req.body.since_iso)) : null;
+      const untilIso = req.body?.until_iso ? new Date(String(req.body.until_iso)) : null;
+      if (!sinceIso || !untilIso || isNaN(+sinceIso) || isNaN(+untilIso)) {
+        return res.status(400).json({ error: 'since_iso and until_iso required (ISO 8601)' });
+      }
+      const dryRun = req.body?.dry_run !== false; // default to dry_run for safety
+      const reason = String(req.body?.reason || 'operator window recall via void-by-sheet-window');
+
+      // 1. Read sheet and collect (sheet_row, bank_ref_with_suffix) for rows in window
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const refToRow = new Map();           // bank_ref_with_suffix → sheet_row_number
+      const rowAmounts = new Map();         // sheet_row_number → amount (for display)
+      const rowTs = new Map();              // sheet_row_number → sheet_ts (for display)
+      let scannedRows = 0;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < sinceIso || ts >= untilIso) continue;
+        scannedRows++;
+        const rawRef = String(sheet[i][7] || '').trim();
+        if (!rawRef) continue;
+        const bankRef = appendSuf(rawRef, channel);
+        if (!bankRef) continue;
+        const sheetRow = i + 1;
+        refToRow.set(bankRef, sheetRow);
+        rowAmounts.set(sheetRow, sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null);
+        rowTs.set(sheetRow, ts.toISOString());
+      }
+      const bankRefs = [...refToRow.keys()];
+
+      // 2. Find matching PUs in DB (only BRAIN pushes with qb_id)
+      let pus = { rows: [] };
+      if (bankRefs.length > 0) {
+        pus = await db().query(
+          `SELECT id, batch_id, bank_ref, customer_id, customer_name,
+                  invoice_qb_id, invoice_no, amount, qb_id, status, created_at
+             FROM payment_uploads
+            WHERE bank_ref = ANY($1::text[])
+              AND status = 'created'
+              AND qb_id IS NOT NULL
+            ORDER BY bank_ref, id`,
+          [bankRefs],
+        );
+      }
+      const totalAmount = pus.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+      const uniqueRefsHit = new Set(pus.rows.map((r) => r.bank_ref)).size;
+      const sheetRowsAffected = new Set();
+      for (const r of pus.rows) {
+        const row = refToRow.get(r.bank_ref);
+        if (row) sheetRowsAffected.add(row);
+      }
+
+      if (dryRun) {
+        return res.json({
+          dry_run: true,
+          channel,
+          window: { since_iso: sinceIso.toISOString(), until_iso: untilIso.toISOString() },
+          scanned_sheet_rows: scannedRows,
+          unique_bank_refs_in_window: bankRefs.length,
+          unique_bank_refs_with_pus: uniqueRefsHit,
+          total_pus_to_void: pus.rows.length,
+          total_amount: totalAmount,
+          sheet_rows_to_clear: sheetRowsAffected.size,
+          sample_pus: pus.rows.slice(0, 10).map((r) => ({
+            bank_ref: r.bank_ref, customer_name: r.customer_name,
+            amount: Number(r.amount), qb_id: r.qb_id,
+            batch_id: String(r.batch_id).slice(0, 8),
+          })),
+        });
+      }
+
+      // 3. REAL RUN — void each PU in QB (parallel, conservative concurrency)
+      let voided = 0, voidFailed = 0;
+      const failures = [];
+      const PAR = 6;
+      let cursor = 0;
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= pus.rows.length) return;
+          const u = pus.rows[i];
+          try {
+            const r = await qbVoid({ kind: 'payment', qbId: u.qb_id });
+            const ok = !!r && (r.ok !== false);
+            if (ok) {
+              await db().query(
+                `UPDATE payment_uploads SET status='voided', voided_at=now() WHERE id=$1 AND status='created'`,
+                [u.id],
+              );
+              voided++;
+            } else {
+              voidFailed++;
+              failures.push({ qb_id: u.qb_id, bank_ref: u.bank_ref, error: r?.error || 'unknown' });
+            }
+          } catch (err) {
+            voidFailed++;
+            failures.push({ qb_id: u.qb_id, bank_ref: u.bank_ref, error: String(err.message || err).slice(0, 200) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+
+      // 4. Clear Column I + J on every affected sheet row so the next fresh
+      // fire treats them as untouched and re-pushes them under the new locks.
+      let cellsCleared = 0;
+      try {
+        if (sheetRowsAffected.size > 0) {
+          const updates = [];
+          for (const row of sheetRowsAffected) {
+            updates.push({ range: `${cfg.tab}!I${row}`, value: '' });
+            updates.push({ range: `${cfg.tab}!J${row}`, value: '' });
+          }
+          const r = await writeSheetCells(cfg.sheetId, updates);
+          cellsCleared = r.updatedCells || 0;
+        }
+      } catch (err) {
+        console.error('[void-by-sheet-window] clear I/J failed (non-fatal):', err.message);
+      }
+
+      res.json({
+        dry_run: false,
+        channel,
+        reason,
+        window: { since_iso: sinceIso.toISOString(), until_iso: untilIso.toISOString() },
+        scanned_sheet_rows: scannedRows,
+        unique_bank_refs_in_window: bankRefs.length,
+        attempted_void: pus.rows.length,
+        voided,
+        void_failed: voidFailed,
+        total_amount_voided: pus.rows.filter((_, i) => i < voided).reduce((s, r) => s + Number(r.amount || 0), 0),
+        sheet_rows_cleared: sheetRowsAffected.size,
+        sheet_cells_cleared: cellsCleared,
+        sample_failures: failures.slice(0, 10),
+      });
+    } catch (err) {
+      console.error('[void-by-sheet-window] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/audit-batch-pushes
   // Body: { batch_id }
   // Per-Payment audit of a batch's pushes. For each PU with status='created'
