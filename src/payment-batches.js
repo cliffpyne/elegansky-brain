@@ -27,7 +27,7 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange } from './sheets.js';
-import { qbQuery, qbReport } from './qb-client.js';
+import { qbQuery, qbReport, qbPatchPaymentTxnDate } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
 
@@ -1673,6 +1673,60 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[find-bad-date-rows] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/patch-batch-txndate
+  // Body: { batch_id, new_txn_date }
+  // Walks all created PUs in the batch and PATCHes each QB Payment's TxnDate
+  // to new_txn_date via QBO sparse update. Repairs heisenberg fires that
+  // got wrong TxnDate from wall-clock paymentTxnDate() fallback.
+  app.post('/api/admin/patch-batch-txndate', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.body?.batch_id || '');
+      const newDate = String(req.body?.new_txn_date || '');
+      if (!batchId || !/^\d{4}-\d{2}-\d{2}$/.test(newDate)) {
+        return res.status(400).json({ error: 'batch_id + new_txn_date (YYYY-MM-DD) required' });
+      }
+      const ups = await db().query(
+        `SELECT id, qb_id, amount FROM payment_uploads
+          WHERE batch_id = $1 AND status = 'created' AND qb_id IS NOT NULL`,
+        [batchId],
+      );
+      const rows = ups.rows;
+      const results = [];
+      const PAR = 10;
+      let idx = 0;
+      const worker = async () => {
+        while (true) {
+          const i = idx++;
+          if (i >= rows.length) return;
+          const u = rows[i];
+          try {
+            const r = await qbPatchPaymentTxnDate(u.qb_id, newDate);
+            results.push({ pu_id: u.id, qb_id: u.qb_id, amount: u.amount, ...r });
+          } catch (err) {
+            results.push({ pu_id: u.id, qb_id: u.qb_id, amount: u.amount, ok: false, err: String(err.message || err).slice(0, 200) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+      const ok = results.filter((r) => r.ok).length;
+      const fail = results.filter((r) => !r.ok).length;
+      const already = results.filter((r) => r.skipped === 'already_correct').length;
+      const missing = results.filter((r) => r.skipped === 'payment_not_found').length;
+      res.json({
+        batch_id: batchId,
+        new_txn_date: newDate,
+        total: rows.length,
+        ok, fail,
+        already_correct: already,
+        not_found: missing,
+        failures: results.filter((r) => !r.ok).slice(0, 20),
+      });
+    } catch (err) {
+      console.error('[patch-batch-txndate] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });

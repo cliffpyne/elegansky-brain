@@ -134,6 +134,23 @@ export async function qbPost(path, body) {
   return call('POST', path, body);
 }
 
+/**
+ * Sparse-update a Payment's TxnDate. Repair tool for Payments whose
+ * TxnDate was set wrong by the wall-clock paymentTxnDate() fallback
+ * (heisenberg fires that bypassed the per-row sheet_ts logic).
+ *
+ * Returns { ok, qbId, old_txn_date?, new_txn_date?, skipped? }.
+ */
+export async function qbPatchPaymentTxnDate(qbId, newTxnDate) {
+  const q = await qbQuery(`SELECT * FROM Payment WHERE Id = '${qbId}'`);
+  const p = q.QueryResponse?.Payment?.[0];
+  if (!p) return { ok: false, qbId, skipped: 'payment_not_found' };
+  if (p.TxnDate === newTxnDate) return { ok: true, qbId, skipped: 'already_correct', txn_date: p.TxnDate };
+  const body = { Id: p.Id, SyncToken: p.SyncToken, sparse: true, TxnDate: newTxnDate };
+  await qbPost('payment', body);
+  return { ok: true, qbId, old_txn_date: p.TxnDate, new_txn_date: newTxnDate };
+}
+
 // Reports API: returns same data as QB UI reports (TransactionList,
 // GeneralLedger, etc). Use this when matching QB's Account QuickReport
 // exports byte-for-byte is required.
