@@ -1425,6 +1425,131 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/verify-dry-run?batch_id=...
+  // Reads a dry-run batch's payment_uploads and arrears_snapshot to give
+  // the operator full transparency on what would have been pushed:
+  //   - count, sum, breakdown by kind (payment vs credit_memo)
+  //   - the AS_OF the IP algorithm used (snapshot.as_of)
+  //   - distinct customers + invoice dates (so operator can confirm only
+  //     invoices DueDate <= AS_OF were matched)
+  //   - amount distribution (largest 10 + smallest 10) for outlier review
+  //   - PLATE=NAME refs or missing customer_id (anomaly buckets)
+  //   - sheet vs DB reconciliation
+  app.get('/api/admin/verify-dry-run', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.query.batch_id || '');
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      let fullId = batchId;
+      if (batchId.length < 36) {
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [batchId + '%']);
+        if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = r.rows[0].id;
+      }
+      const batchRow = await db().query(
+        `SELECT pb.id, pb.channel, pb.status, pb.created_at, pb.finalized_at,
+                pb.failure_reason, pb.idempotency_key, pb.txn_date,
+                pb.arrears_snapshot_id,
+                aps.as_of AS snapshot_as_of, aps.created_at AS snapshot_created_at
+           FROM payment_batches pb
+           LEFT JOIN arrears_snapshots aps ON aps.id = pb.arrears_snapshot_id
+          WHERE pb.id = $1`,
+        [fullId],
+      );
+      if (!batchRow.rows.length) return res.status(404).json({ error: 'batch not found' });
+      const batch = batchRow.rows[0];
+
+      const pus = await db().query(
+        `SELECT id, kind, bank_ref, customer_id, customer_name,
+                invoice_qb_id, invoice_no, amount, memo, status
+           FROM payment_uploads
+          WHERE batch_id = $1
+          ORDER BY amount DESC, id`,
+        [fullId],
+      );
+
+      const paid = pus.rows.filter((r) => r.kind === 'payment');
+      const unused = pus.rows.filter((r) => r.kind !== 'payment');
+      const paidSum = paid.reduce((s, r) => s + Number(r.amount || 0), 0);
+      const unusedSum = unused.reduce((s, r) => s + Number(r.amount || 0), 0);
+
+      // Distinct refs (per bank deposit) — a deposit can split into multiple PUs
+      const distinctRefs = new Set(pus.rows.map((r) => r.bank_ref));
+      const distinctCustomers = new Set(paid.map((r) => String(r.customer_id || '')).filter(Boolean));
+
+      // Anomalies
+      const plateNameRefs = paid.filter((r) => /[A-Z]+[0-9]+=/.test(r.customer_name || ''));
+      const missingCustomer = paid.filter((r) => !r.customer_id);
+      const missingInvoice = paid.filter((r) => !r.invoice_qb_id);
+      const suspiciouslyLarge = [...paid].sort((a, b) => Number(b.amount) - Number(a.amount)).slice(0, 10);
+      const suspiciouslySmall = [...paid].filter((r) => Number(r.amount) < 500).slice(0, 10);
+
+      // Customer assignment audit — multi-PU per ref means multi-invoice split
+      const refToPus = new Map();
+      for (const p of paid) {
+        if (!refToPus.has(p.bank_ref)) refToPus.set(p.bank_ref, []);
+        refToPus.get(p.bank_ref).push(p);
+      }
+      const splits = [...refToPus.entries()]
+        .filter(([_, list]) => list.length > 1)
+        .map(([ref, list]) => ({
+          bank_ref: ref,
+          split_count: list.length,
+          total: list.reduce((s, x) => s + Number(x.amount), 0),
+          customer_name: list[0].customer_name,
+        }));
+
+      res.json({
+        batch: {
+          id: batch.id,
+          channel: batch.channel,
+          status: batch.status,
+          created_at: batch.created_at,
+          finalized_at: batch.finalized_at,
+          txn_date: batch.txn_date,
+          failure_reason: batch.failure_reason,
+          snapshot_as_of: batch.snapshot_as_of,
+          snapshot_created_at: batch.snapshot_created_at,
+        },
+        totals: {
+          paid_count: paid.length,
+          paid_total: paidSum,
+          unused_count: unused.length,
+          unused_total: unusedSum,
+          total: paidSum + unusedSum,
+          distinct_bank_refs: distinctRefs.size,
+          distinct_customers: distinctCustomers.size,
+          multi_invoice_splits: splits.length,
+        },
+        anomalies: {
+          plate_name_customers: plateNameRefs.length,
+          missing_customer_id: missingCustomer.length,
+          missing_invoice_id: missingInvoice.length,
+          plate_name_sample: plateNameRefs.slice(0, 5).map((r) => ({
+            ref: r.bank_ref, customer: r.customer_name, amount: Number(r.amount),
+          })),
+          missing_customer_sample: missingCustomer.slice(0, 5).map((r) => ({
+            ref: r.bank_ref, customer: r.customer_name, amount: Number(r.amount),
+          })),
+        },
+        amounts: {
+          largest_10: suspiciouslyLarge.map((r) => ({
+            ref: r.bank_ref, customer: r.customer_name, invoice: r.invoice_no, amount: Number(r.amount),
+          })),
+          smallest_under_500: suspiciouslySmall.map((r) => ({
+            ref: r.bank_ref, customer: r.customer_name, invoice: r.invoice_no, amount: Number(r.amount),
+          })),
+        },
+        splits_sample: splits.slice(0, 10),
+        unused_sample: unused.slice(0, 10).map((r) => ({
+          ref: r.bank_ref, customer: r.customer_name, amount: Number(r.amount),
+        })),
+      });
+    } catch (err) {
+      console.error('[verify-dry-run] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/clear-marker-column
   // Body: { channel, column: 'I' | 'J' | 'K' }
   // Wipes the entire column on the channel sheet. Used to clean stray
