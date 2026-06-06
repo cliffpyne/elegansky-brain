@@ -1275,6 +1275,111 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/audit-batch-pushes
+  // Body: { batch_id }
+  // Per-Payment audit of a batch's pushes. For each PU with status='created'
+  // and qb_id set: verifies (1) Payment exists in QB, (2) amount matches,
+  // (3) no other Payment exists for the same (customer, PrivateNote),
+  // (4) deposit account is Kijichi. Returns pass/fail per PU.
+  app.post('/api/admin/audit-batch-pushes', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.body?.batch_id || '');
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      let fullId = batchId;
+      if (batchId.length < 36) {
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [batchId + '%']);
+        if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = r.rows[0].id;
+      }
+      const r = await db().query(
+        `SELECT id, bank_ref, customer_id, customer_name, invoice_qb_id, amount, qb_id
+           FROM payment_uploads
+          WHERE batch_id = $1 AND status = 'created' AND qb_id IS NOT NULL`,
+        [fullId],
+      );
+      const rows = r.rows;
+      // Get Kijichi account id
+      const acctRes = await qbQuery(`SELECT Id FROM Account WHERE Name = 'Kijichi Collection AC'`);
+      const kijichiId = acctRes.QueryResponse?.Account?.[0]?.Id;
+      // Bulk-query QB for each customer's recent Payments (so we can detect dupes)
+      const byCust = new Map();
+      for (const row of rows) {
+        if (!byCust.has(row.customer_id)) byCust.set(row.customer_id, []);
+        byCust.get(row.customer_id).push(row);
+      }
+      const sinceISO = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const failures = [];
+      let passCount = 0;
+      const PAR = 4;
+      let cursor = 0;
+      const custList = [...byCust.entries()];
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= custList.length) return;
+          const [custId, custRows] = custList[i];
+          try {
+            const q = await qbQuery(
+              `SELECT Id, TotalAmt, PrivateNote, DepositToAccountRef ` +
+              `FROM Payment WHERE CustomerRef = '${custId}' AND TxnDate >= '${sinceISO}' MAXRESULTS 1000`,
+            );
+            const allCustPmts = q.QueryResponse?.Payment || [];
+            // Index by PrivateNote
+            const byNote = new Map();
+            for (const p of allCustPmts) {
+              const note = String(p.PrivateNote || '').trim();
+              if (!note) continue;
+              if (!byNote.has(note)) byNote.set(note, []);
+              byNote.get(note).push(p);
+            }
+            for (const row of custRows) {
+              const note = row.bank_ref;
+              const matches = byNote.get(note) || [];
+              const livePmts = matches.filter((p) => Number(p.TotalAmt || 0) > 0);
+              if (livePmts.length === 0) {
+                failures.push({ qb_id: row.qb_id, bank_ref: note, reason: 'no live Payment found in QB' });
+              } else if (livePmts.length > 1) {
+                failures.push({
+                  qb_id: row.qb_id, bank_ref: note,
+                  reason: `duplicate: ${livePmts.length} Payments found in QB`,
+                  duplicate_ids: livePmts.map((p) => p.Id),
+                });
+              } else {
+                const p = livePmts[0];
+                if (Number(p.TotalAmt || 0) !== Number(row.amount || 0)) {
+                  failures.push({
+                    qb_id: row.qb_id, bank_ref: note,
+                    reason: `amount mismatch: QB=${p.TotalAmt} vs PU=${row.amount}`,
+                  });
+                } else if (kijichiId && String(p.DepositToAccountRef?.value || '') !== String(kijichiId)) {
+                  failures.push({
+                    qb_id: row.qb_id, bank_ref: note,
+                    reason: `wrong deposit account: ${p.DepositToAccountRef?.value} (not Kijichi)`,
+                  });
+                } else {
+                  passCount++;
+                }
+              }
+            }
+          } catch (err) {
+            for (const row of custRows) failures.push({ qb_id: row.qb_id, bank_ref: row.bank_ref, reason: 'qb query error: ' + String(err.message || err).slice(0, 100) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+      res.json({
+        batch_id: fullId,
+        total_pushed: rows.length,
+        pass: passCount,
+        fail: failures.length,
+        failures: failures.slice(0, 50),
+      });
+    } catch (err) {
+      console.error('[audit-batch-pushes] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/quickreport?from=YYYY-MM-DD&to=YYYY-MM-DD&account=Kijichi%20Collection%20AC
   // Calls QB's Reports API directly — returns the EXACT same data Frank gets
   // when exporting the "Account QuickReport" from the QB UI (including invoice
