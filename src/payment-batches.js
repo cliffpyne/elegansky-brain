@@ -1362,6 +1362,106 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/find-refs-in-sheet
+  // Body: { channel, refs: [...] }
+  // For each ref, returns: sheet row, sheet_ts, amount, customer_name,
+  // Column I, Column J, and matching payment_uploads rows (status, qb_id,
+  // batch_id). Diagnostic for understanding why a QB Payment exists when
+  // the void-by-sheet-window claimed clean. Refs are matched both bare and
+  // with channel suffix (e.g. NMB ref + 'N').
+  app.post('/api/admin/find-refs-in-sheet', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      const cfg = CHANNEL_SHEETS[channel];
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String) : [];
+      if (refs.length === 0) return res.status(400).json({ error: 'refs[] required' });
+      // Build lookup: bare ref → original input ref (so we can also match suffixed form)
+      const refSet = new Set();
+      const refOrig = new Map();
+      for (const r of refs) {
+        const trimmed = r.trim();
+        if (!trimmed) continue;
+        refSet.add(trimmed);
+        refOrig.set(trimmed, trimmed);
+        // also strip the channel suffix if user passed the suffixed version
+        const suf = { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel];
+        if (suf && trimmed.endsWith(suf)) {
+          const bare = trimmed.slice(0, -1);
+          refSet.add(bare);
+          refOrig.set(bare, trimmed);
+        }
+      }
+      // 1. Scan the sheet
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const sheetHits = new Map(); // bareRef → row info
+      for (let i = 1; i < sheet.length; i++) {
+        const rawRef = String(sheet[i][7] || '').trim();
+        if (!rawRef) continue;
+        if (refSet.has(rawRef)) {
+          const dCell = String(sheet[i][1] || '').trim();
+          const ts = parseTsAny(dCell);
+          if (!sheetHits.has(rawRef)) sheetHits.set(rawRef, []);
+          sheetHits.get(rawRef).push({
+            sheet_row: i + 1,
+            sheet_ts: ts ? ts.toISOString() : null,
+            sheet_ts_raw: dCell,
+            amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
+            customer_name: sheet[i][6] || null,
+            col_i: String(sheet[i][8] || '').trim() || null,
+            col_j: String(sheet[i][9] || '').trim() || null,
+          });
+        }
+      }
+      // 2. Look up payment_uploads (with channel suffix)
+      const suffixedRefs = [...refSet].map((r) => appendSuf(r, channel));
+      const pus = await db().query(
+        `SELECT id, batch_id, bank_ref, customer_id, customer_name,
+                invoice_qb_id, invoice_no, amount, qb_id, status, created_at,
+                voided_at, failure_reason
+           FROM payment_uploads
+          WHERE bank_ref = ANY($1::text[])
+          ORDER BY bank_ref, id`,
+        [suffixedRefs],
+      );
+      const pusByRef = new Map();
+      for (const r of pus.rows) {
+        const bare = r.bank_ref.endsWith({ bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel])
+          ? r.bank_ref.slice(0, -1) : r.bank_ref;
+        if (!pusByRef.has(bare)) pusByRef.set(bare, []);
+        pusByRef.get(bare).push({
+          id: r.id,
+          batch_id: String(r.batch_id).slice(0, 8),
+          status: r.status,
+          qb_id: r.qb_id,
+          amount: Number(r.amount),
+          customer_name: r.customer_name,
+          created_at: r.created_at,
+          voided_at: r.voided_at,
+          failure_reason: r.failure_reason ? String(r.failure_reason).slice(0, 150) : null,
+        });
+      }
+      // 3. Assemble per-ref report
+      const results = [];
+      for (const ref of refs) {
+        const trimmed = ref.trim();
+        const bare = trimmed.endsWith({ bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel])
+          ? trimmed.slice(0, -1) : trimmed;
+        results.push({
+          ref_input: trimmed,
+          bare_ref: bare,
+          sheet_hits: sheetHits.get(bare) || [],
+          payment_uploads: pusByRef.get(bare) || [],
+        });
+      }
+      res.json({ channel, sheet_tab: cfg.tab, results });
+    } catch (err) {
+      console.error('[find-refs-in-sheet] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/sheet-lock-audit?channel=nmbnew[&since_iso=...&until_iso=...]
   // Reads the channel sheet (cols A:J) and reports each row's I/J state.
   // The four buckets:
