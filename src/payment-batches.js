@@ -1707,6 +1707,51 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/dump-sheet-rows-in-window
+  // Body: { channel, since_iso, until_iso }
+  // Returns every sheet row in the window — row#, timestamp, amount, ref,
+  // customer. Used to reconcile against operator's drag-drop totals.
+  app.post('/api/admin/dump-sheet-rows-in-window', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const cfg = CHANNEL_SHEETS[channel];
+      const winStart = new Date(String(req.body?.since_iso || ''));
+      const winEnd = new Date(String(req.body?.until_iso || ''));
+      if (isNaN(+winStart) || isNaN(+winEnd)) return res.status(400).json({ error: 'since_iso/until_iso required' });
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const rows = [];
+      let total = 0;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < winStart || ts >= winEnd) continue;
+        const amt = sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : 0;
+        total += amt;
+        rows.push({
+          row: i + 1,
+          ts: dCell,
+          amount: amt,
+          customer: sheet[i][6] || null,
+          ref: sheet[i][7] || null,
+        });
+      }
+      res.json({
+        channel,
+        window: { since: winStart.toISOString(), until: winEnd.toISOString() },
+        row_count: rows.length,
+        total,
+        rows,
+      });
+    } catch (err) {
+      console.error('[dump-sheet-rows-in-window] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/diag-window-skips
   // Body: { channel, since_iso, until_iso }
   // Mirrors prepareAutoUpload's skip logic and reports the EXACT breakdown of
