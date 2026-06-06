@@ -1445,9 +1445,12 @@ export function mountPaymentBatchesApi(app, deps) {
         if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
         fullId = r.rows[0].id;
       }
+      // Note: txn_date is NOT stored on payment_batches — it's applied
+      // at QB push time from the request body. Surface what we have.
       const batchRow = await db().query(
         `SELECT pb.id, pb.channel, pb.status, pb.created_at, pb.finalized_at,
-                pb.failure_reason, pb.idempotency_key, pb.txn_date,
+                pb.failure_reason, pb.idempotency_key,
+                pb.sheet_total, pb.paid_total, pb.unused_total,
                 pb.arrears_snapshot_id,
                 aps.as_of AS snapshot_as_of, aps.created_at AS snapshot_created_at
            FROM payment_batches pb
@@ -1505,10 +1508,12 @@ export function mountPaymentBatchesApi(app, deps) {
           status: batch.status,
           created_at: batch.created_at,
           finalized_at: batch.finalized_at,
-          txn_date: batch.txn_date,
           failure_reason: batch.failure_reason,
           snapshot_as_of: batch.snapshot_as_of,
           snapshot_created_at: batch.snapshot_created_at,
+          stored_sheet_total: Number(batch.sheet_total || 0),
+          stored_paid_total: Number(batch.paid_total || 0),
+          stored_unused_total: Number(batch.unused_total || 0),
         },
         totals: {
           paid_count: paid.length,
