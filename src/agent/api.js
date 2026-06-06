@@ -154,6 +154,44 @@ export function mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, re
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  // POST /api/admin/abort-running-agents
+  // Body: { older_than_seconds? }  default 60
+  // Marks any agent_sessions row in status='running' that was started more
+  // than {older_than_seconds} ago as 'aborted'. Use to clean stuck sessions
+  // from the dashboard list when an upload hung. The actual Node process
+  // running runSession may still be in flight in memory but won't be able
+  // to update DB once we mark aborted — and the lock release happens in
+  // the auto-upload endpoint's release path regardless.
+  app.post('/api/admin/abort-running-agents', requireSupabaseJwt, async (req, res) => {
+    try {
+      const olderThanSeconds = Number(req.body?.older_than_seconds || 60);
+      const result = await db().query(
+        `UPDATE agent_sessions
+            SET status='aborted',
+                ended_at=now(),
+                error_text=COALESCE(error_text,'')
+                  || ' [admin abort: stuck >' || $1 || 's]'
+          WHERE status='running'
+            AND started_at < now() - ($1 || ' seconds')::interval
+          RETURNING id, trigger, started_at`,
+        [String(olderThanSeconds)],
+      );
+      res.json({
+        ok: true,
+        aborted_count: result.rowCount,
+        threshold_seconds: olderThanSeconds,
+        sample: result.rows.slice(0, 10).map((r) => ({
+          id: String(r.id).slice(0, 8),
+          trigger: r.trigger,
+          started: r.started_at,
+        })),
+      });
+    } catch (err) {
+      console.error('[abort-running-agents] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/agent/scheduler', requireSupabaseJwt, async (req, res) => {
     try {
       const value = req.body?.enabled === true ? 'true' : 'false';

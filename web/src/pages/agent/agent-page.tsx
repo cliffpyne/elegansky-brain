@@ -138,11 +138,13 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
       });
       setResult(`Spawned. Session id (seed): ${r.seed_session_id.slice(0, 8)}… — watch the list below.`);
       setTimeout(onFired, 3000);
-      // Cooldown — keep the button disabled for 20s after fire so an
+      // Cooldown — keep the button disabled for 90s after fire so an
       // impatient operator can't spawn a second agent while the first
-      // is still mid-flight (acquired the channel lock). 20s comfortably
-      // covers a typical dry-run (~4–10s) plus lock release lag.
-      setTimeout(() => setFiring(false), 20_000);
+      // is still mid-flight (acquired the channel lock). 90s comfortably
+      // covers a slow cold-cache run (the /arrears pull alone can take
+      // ~3 minutes on first call). The button label will show "Firing…"
+      // throughout so the operator knows the session is in progress.
+      setTimeout(() => setFiring(false), 90_000);
       return; // skip the finally re-enable below
     } catch (e) {
       setError((e as Error).message);

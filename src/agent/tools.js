@@ -277,6 +277,9 @@ export async function dispatch(toolName, input, ctx) {
           result = { error: `auto-upload ${r.status}`, detail: j };
         } else {
           // Summarise so the model doesn't blow context on raw response.
+          // The server uses different field names for dry-run vs real-run:
+          //   dry-run:  paid_planned, unused_planned, sheet_sum
+          //   real-run: paid_count, unused_count (eventually finalized)
           result = {
             mode: ctx.mode,
             channel: input.channel,
@@ -284,6 +287,14 @@ export async function dispatch(toolName, input, ctx) {
             batch_id: j.batch_id || null,
             skipped: !!j.skipped,
             skipped_reason: j.skipped ? (j.reason || null) : null,
+            // Read both shapes — server is inconsistent. Dry-run uses
+            // *_planned fields and sheet_sum; finalized real-runs use
+            // *_count / *_total.
+            paid_count: j.paid_planned ?? j.paid?.length ?? j.paid_count ?? null,
+            paid_total: j.paid_total ?? null,
+            unused_count: j.unused_planned ?? j.unused?.length ?? j.unused_count ?? null,
+            unused_total: j.unused_total ?? null,
+            sheet_total: j.sheet_sum ?? j.sheet_total ?? null,
             // Surface row-skip diagnostics when the server skipped a window
             // with no rows — lets the operator see exactly why (K boundary,
             // out-of-window dates, etc.).
@@ -295,13 +306,8 @@ export async function dispatch(toolName, input, ctx) {
               max_k_row: j.max_k_row ?? null,
               sheet_total_rows: j.sheet_total_rows ?? null,
             } : null,
-            paid_count: j.paid?.length ?? j.paid_count ?? null,
-            paid_total: j.paid_total ?? null,
-            unused_count: j.unused?.length ?? j.unused_count ?? null,
-            unused_total: j.unused_total ?? null,
-            sheet_total: j.sheet_total ?? null,
-            reconciles: j.sheet_total != null && j.paid_total != null && j.unused_total != null
-              ? Math.abs(Number(j.sheet_total) - (Number(j.paid_total) + Number(j.unused_total))) < 0.01
+            reconciles: (j.sheet_sum ?? j.sheet_total) != null && j.paid_total != null && j.unused_total != null
+              ? Math.abs(Number(j.sheet_sum ?? j.sheet_total) - (Number(j.paid_total) + Number(j.unused_total))) < 0.01
               : null,
           };
         }
