@@ -352,18 +352,27 @@ export function mountPaymentBatchesApi(app, deps) {
     if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
       return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
     }
-    // ─── KILL SWITCH (scheduler/agent only) ──────────────────────────
+    // ─── KILL SWITCH (scheduled-tick automation only) ─────────────────
     // app_settings.auto_upload_enabled = 'false' blocks AUTOMATION
-    // callers (shared-secret auth = cron-scheduled agent, internal
-    // tools). Dashboard operators authed via Supabase JWT (req.user
-    // populated by requireSecretOrJwt) always pass through — clicking
-    // the dashboard button is an explicit operator action and shouldn't
-    // be gated by the same flag that holds back automation.
+    // callers — cron-scheduled agent sessions firing scheduled ticks
+    // (meru0300, hanang0700, kili1615, etc).
+    //
+    // Two bypass paths for operator-initiated fires:
+    //   (1) req.user populated by requireSecretOrJwt = direct dashboard
+    //       call with Supabase JWT
+    //   (2) tick_name === 'heisenberg' = operator-initiated heisenberg
+    //       agent session (dashboard → /fire-agent → agent →
+    //       run_upload_window tool → here, via shared secret). The
+    //       agent's tool layer always passes tick_name=heisenberg for
+    //       these so we can recognise the operator-initiated path.
     //
     // Operator policy (2026-06-06): auto_upload_enabled stays FALSE in
-    // production. Dashboard remains the only legitimate way to fire an
-    // upload until the scheduler architecture is ready for re-enable.
-    if (!req.user) {
+    // production until the scheduler architecture is hardened. Manual
+    // heisenberg fires from the dashboard remain the only legitimate
+    // upload path.
+    const tickName = String(req.body?.tick_name || '').toLowerCase();
+    const isManualHeisenberg = tickName === 'heisenberg';
+    if (!req.user && !isManualHeisenberg) {
       try {
         const r = await db().query(
           `SELECT value FROM app_settings WHERE key = 'auto_upload_enabled'`,
@@ -371,8 +380,8 @@ export function mountPaymentBatchesApi(app, deps) {
         const v = r.rows[0]?.value;
         if (v && String(v).toLowerCase() === 'false') {
           return res.status(503).json({
-            error: 'auto-upload disabled for automation callers (app_settings.auto_upload_enabled=false). Dashboard operators bypass this.',
-            remedy: 'fire from dashboard (Supabase JWT auth) or set auto_upload_enabled=true',
+            error: `auto-upload disabled for scheduled-tick automation (app_settings.auto_upload_enabled=false). tick_name='${tickName || 'none'}'.`,
+            remedy: 'fire from dashboard (Supabase JWT) or via heisenberg agent session, or set auto_upload_enabled=true',
           });
         }
       } catch (err) {
