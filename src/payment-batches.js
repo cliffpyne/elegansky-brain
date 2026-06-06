@@ -469,7 +469,14 @@ export function mountPaymentBatchesApi(app, deps) {
       // carries its identity's date even when execution is delayed. See
       // BRAIN_BRAIN.md "TxnDate by batch identity".
       const txnDateOverride = req.body?.txn_date || null;
-      const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup });
+      // Skip the qbPreflightDedup QB-side dup check for dry-runs — it costs
+      // 10–30 QB queries (Payment + CreditMemo paginated per chunk of 50
+      // customers) and adds 1–3 minutes to a dry-run that isn't going to
+      // write anything anyway. Real runs still get the full safety net.
+      const result = await prepareAutoUpload({
+        channel, sinceIso, untilIso, asOf,
+        qbPreflightDedup: dryRun ? null : qbPreflightDedup,
+      });
       if (result.skipped) {
         await releaseLock();
         return res.json({
