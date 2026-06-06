@@ -472,7 +472,21 @@ export function mountPaymentBatchesApi(app, deps) {
       const result = await prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup });
       if (result.skipped) {
         await releaseLock();
-        return res.json({ skipped: true, reason: result.reason, since_iso: sinceIso, until_iso: untilIso });
+        return res.json({
+          skipped: true,
+          reason: result.reason,
+          since_iso: sinceIso,
+          until_iso: untilIso,
+          // Pass through skip diagnostics from prepareAutoUpload so the
+          // operator can see why a window came back empty (K boundary,
+          // dates, etc.).
+          ...(result.max_k_row != null ? { max_k_row: result.max_k_row } : {}),
+          ...(result.sheet_total_rows != null ? { sheet_total_rows: result.sheet_total_rows } : {}),
+          ...(result.skipped_already_pushed != null ? { skipped_already_pushed: result.skipped_already_pushed } : {}),
+          ...(result.skipped_no_date != null ? { skipped_no_date: result.skipped_no_date } : {}),
+          ...(result.skipped_bad_format != null ? { skipped_bad_format: result.skipped_bad_format } : {}),
+          ...(result.skipped_out_of_window != null ? { skipped_out_of_window: result.skipped_out_of_window } : {}),
+        });
       }
       if (result.aborted) {
         await releaseLock();
