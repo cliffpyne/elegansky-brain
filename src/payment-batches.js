@@ -347,7 +347,7 @@ export function mountPaymentBatchesApi(app, deps) {
   //
   // Body (optional):
   //   { since_iso?: ISO8601, until_iso?: ISO8601 }   — defaults: last 24h
-  app.post('/api/payment-batches/auto-upload/:channel', requireSharedSecret, async (req, res) => {
+  app.post('/api/payment-batches/auto-upload/:channel', requireSecretOrJwt, async (req, res) => {
     const channel = req.params.channel;
     if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
       return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
