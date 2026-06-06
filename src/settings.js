@@ -83,6 +83,32 @@ export function mountSettingsApi(app) {
     }
   });
 
+  // Emergency operator-toggle via shared secret (no JWT needed).
+  // Body: { key, value } where key is in ALLOWED_KEYS.
+  // Use case: scheduler is firing prematurely and operator needs to kill it
+  // without going through dashboard auth flow.
+  app.post('/api/settings/emergency-set', requireReportSecret, async (req, res) => {
+    try {
+      const key = String(req.body?.key || '');
+      const value = String(req.body?.value ?? '');
+      if (!ALLOWED_KEYS.has(key)) return res.status(404).json({ error: 'unknown setting key' });
+      const r = await db().query(
+        `INSERT INTO app_settings (key, value, updated_by)
+         VALUES ($1, $2, 'emergency-shared-secret')
+         ON CONFLICT (key) DO UPDATE
+           SET value = EXCLUDED.value,
+               updated_at = now(),
+               updated_by = EXCLUDED.updated_by
+         RETURNING key, value, updated_at, updated_by`,
+        [key, value],
+      );
+      res.json({ ok: true, setting: r.rows[0] });
+    } catch (err) {
+      console.error('[POST /api/settings/emergency-set]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Worker also POSTs here when retries exhaust — auto-disables the loop.
   // Uses the shared X-Report-Secret so the worker can self-toggle without a
   // human JWT. The body is { reason: "..." }.
