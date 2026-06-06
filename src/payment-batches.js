@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn } from './sheets.js';
 import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -1414,6 +1414,30 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[scan-double-pushes] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/clear-marker-column
+  // Body: { channel, column: 'I' | 'J' | 'K' }
+  // Wipes the entire column on the channel sheet. Used to clean stray
+  // operator legacy data from marker columns before BRAIN starts using
+  // them as locks (e.g. NMB row 66857 had a pre-existing K value
+  // blocking the K-boundary check). Protected ranges mean only the
+  // service account can do this.
+  app.post('/api/admin/clear-marker-column', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const column = String(req.body?.column || '').toUpperCase();
+      if (!['I', 'J', 'K'].includes(column)) {
+        return res.status(400).json({ error: 'column must be I, J, or K' });
+      }
+      const cfg = CHANNEL_SHEETS[channel];
+      const r = await clearSheetColumn(cfg.sheetId, cfg.tab, column);
+      res.json({ channel, sheet_tab: cfg.tab, column, ...r });
+    } catch (err) {
+      console.error('[clear-marker-column] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });

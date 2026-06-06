@@ -105,6 +105,21 @@ export function serviceAccountEmail() {
 }
 
 /**
+ * Wipe a column on the named tab — used to clear stray operator data
+ * from the marker columns (I/J/K) before BRAIN starts using them as
+ * locks. Returns the number of cells the API reported as cleared.
+ */
+export async function clearSheetColumn(spreadsheetId, tabName, columnLetter) {
+  const sheets = await sheetsClient();
+  const range = `${tabName}!${columnLetter}:${columnLetter}`;
+  const res = await sheets.spreadsheets.values.clear({
+    spreadsheetId,
+    range,
+  });
+  return { clearedRange: res.data.clearedRange || range };
+}
+
+/**
  * Lock columns I, J, K on the named tab so ONLY the service account can
  * edit them. Operators with edit access to the sheet can still touch
  * A-H normally but can't accidentally (or maliciously) wipe the
