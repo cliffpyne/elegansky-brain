@@ -110,8 +110,26 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
   const [firing, setFiring] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Track the last successful dry-run so we can offer a "Push to QB"
+  // shortcut that fires the same window in execute mode without the
+  // operator having to flip the dropdown + re-click. Captures every
+  // form value at the moment of the dry-run so any subsequent edits to
+  // the form don't bleed into the push.
+  const [lastDryRun, setLastDryRun] = useState<{
+    channel: 'nmbnew' | 'bank' | 'iphone_bank';
+    windowMode: 'from_last' | 'explicit';
+    sinceIso: string;
+    untilIso: string;
+    asOf: string;
+    txnDate: string;
+    firedAt: number;
+  } | null>(null);
 
-  const fire = async () => {
+  // Shared push helper — same code path whether triggered from the main
+  // Fire button or the Push-to-QB shortcut. forceMode lets the shortcut
+  // override the dropdown.
+  const doFire = async (forceMode?: 'plan' | 'execute') => {
+    const effectiveMode = forceMode || mode;
     setFiring(true);
     setResult(null);
     setError(null);
@@ -132,24 +150,53 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
           tick: 'heisenberg',
           mode_label: windowMode,
           windows: [win],
-          note: `Heisenberg ${windowMode}-mode fired from dashboard.`,
+          note: `Heisenberg ${windowMode}-mode fired from dashboard (${effectiveMode}).`,
         },
-        mode,
+        mode: effectiveMode,
       });
-      setResult(`Spawned. Session id (seed): ${r.seed_session_id.slice(0, 8)}… — watch the list below.`);
+      setResult(`Spawned (${effectiveMode}). Session id (seed): ${r.seed_session_id.slice(0, 8)}… — watch the list below.`);
+      // Remember the form values from a dry-run so the Push-to-QB
+      // shortcut can replay them. We snapshot rather than passing
+      // refs so subsequent form edits don't change the pushed window.
+      if (effectiveMode === 'plan') {
+        setLastDryRun({
+          channel, windowMode, sinceIso, untilIso, asOf, txnDate,
+          firedAt: Date.now(),
+        });
+      }
       setTimeout(onFired, 3000);
       // Cooldown — keep the button disabled for 90s after fire so an
       // impatient operator can't spawn a second agent while the first
-      // is still mid-flight (acquired the channel lock). 90s comfortably
-      // covers a slow cold-cache run (the /arrears pull alone can take
-      // ~3 minutes on first call). The button label will show "Firing…"
-      // throughout so the operator knows the session is in progress.
+      // is still mid-flight (acquired the channel lock).
       setTimeout(() => setFiring(false), 90_000);
-      return; // skip the finally re-enable below
+      return;
     } catch (e) {
       setError((e as Error).message);
     }
     setFiring(false);
+  };
+  const fire = () => doFire();
+
+  // Push-to-QB shortcut: same form values as the last dry-run, mode
+  // forced to execute. Confirm before firing — this writes real QB.
+  const pushToQb = async () => {
+    if (!lastDryRun) return;
+    // Restore the form to the dry-run's values so the operator sees
+    // exactly what's about to push.
+    setChannel(lastDryRun.channel);
+    setWindowMode(lastDryRun.windowMode);
+    setSinceIso(lastDryRun.sinceIso);
+    setUntilIso(lastDryRun.untilIso);
+    setAsOf(lastDryRun.asOf);
+    setTxnDate(lastDryRun.txnDate);
+    const msg = `PUSH TO QB — real writes\n\n` +
+      `Channel: ${lastDryRun.channel}\n` +
+      `Window: ${lastDryRun.windowMode === 'explicit' ? `${lastDryRun.sinceIso} → ${lastDryRun.untilIso} EAT` : 'from-last-consumed → now'}\n` +
+      `AS_OF: ${lastDryRun.asOf}\n` +
+      `TxnDate: ${lastDryRun.txnDate}\n\n` +
+      `This will create real QB Payments. Continue?`;
+    if (!window.confirm(msg)) return;
+    await doFire('execute');
   };
 
   return (
@@ -228,9 +275,26 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
         </div>
         {result && <div className="text-sm text-emerald-600">{result}</div>}
         {error && <div className="text-sm text-red-600">{error}</div>}
-        <Button onClick={fire} disabled={firing} className={mode === 'execute' ? 'bg-red-600 hover:bg-red-700' : ''}>
-          {firing ? 'Firing…' : mode === 'execute' ? 'Fire (REAL WRITES)' : 'Fire (plan-only)'}
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={fire} disabled={firing} className={mode === 'execute' ? 'bg-red-600 hover:bg-red-700' : ''}>
+            {firing ? 'Firing…' : mode === 'execute' ? 'Fire (REAL WRITES)' : 'Fire (plan-only)'}
+          </Button>
+          {lastDryRun && (
+            <Button
+              onClick={pushToQb}
+              disabled={firing}
+              className="bg-emerald-600 hover:bg-emerald-700"
+              title={`Replay the dry-run from ${new Date(lastDryRun.firedAt).toLocaleTimeString()} as a real QB push (same channel, window, AS_OF, TxnDate).`}
+            >
+              {firing ? 'Firing…' : '▶ Push to QB (replay dry-run)'}
+            </Button>
+          )}
+        </div>
+        {lastDryRun && !firing && (
+          <div className="text-xs text-muted-foreground">
+            Last dry-run: <code>{lastDryRun.channel}</code> · {lastDryRun.windowMode === 'explicit' ? `${lastDryRun.sinceIso} → ${lastDryRun.untilIso}` : 'from_last'} · AS_OF=<code>{lastDryRun.asOf}</code> · TxnDate=<code>{lastDryRun.txnDate}</code>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
