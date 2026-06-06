@@ -1415,9 +1415,14 @@ export function mountPaymentBatchesApi(app, deps) {
         start += PAGE;
         if (pages > 30) break; // safety: 30k Payments max
       }
-      // Filter by suffix
+      // Filter by suffix — case-insensitive so a stray lowercase suffix
+      // (e.g. operator copy-pasted 'p' instead of 'P') still gets caught.
+      const sufLower = suffix.toLowerCase();
       const matching = all
-        .filter((p) => String(p.PrivateNote || '').endsWith(suffix))
+        .filter((p) => {
+          const pn = String(p.PrivateNote || '');
+          return pn.length > 0 && pn.charAt(pn.length - 1).toLowerCase() === sufLower;
+        })
         .map((p) => ({
           qb_id: String(p.Id),
           privateNote: p.PrivateNote,
