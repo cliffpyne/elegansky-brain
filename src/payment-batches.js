@@ -1275,6 +1275,92 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/brain-upload-timeline
+  // Shows when BRAIN started doing real auto-uploads + activity by date.
+  app.get('/api/admin/brain-upload-timeline', requireSecretOrJwt, async (req, res) => {
+    try {
+      const first = await db().query(
+        `SELECT MIN(created_at) AS first_pu, COUNT(*) AS total_pus
+           FROM payment_uploads WHERE qb_id IS NOT NULL`,
+      );
+      const byDate = await db().query(
+        `SELECT DATE(created_at AT TIME ZONE 'Africa/Dar_es_Salaam') AS d,
+                COUNT(*) AS rows,
+                COUNT(*) FILTER (WHERE status='created') AS created_rows,
+                COUNT(*) FILTER (WHERE status='voided') AS voided_rows,
+                COUNT(DISTINCT batch_id) AS batches
+           FROM payment_uploads
+          WHERE qb_id IS NOT NULL
+          GROUP BY 1 ORDER BY 1 ASC`,
+      );
+      const firstBatch = await db().query(
+        `SELECT MIN(created_at) AS first_batch, COUNT(*) AS total_batches
+           FROM payment_batches WHERE status IN ('finalized', 'recalled')`,
+      );
+      res.json({
+        first_pu_created_at: first.rows[0]?.first_pu,
+        total_pus_ever: Number(first.rows[0]?.total_pus || 0),
+        first_batch_created_at: firstBatch.rows[0]?.first_batch,
+        total_batches_ever: Number(firstBatch.rows[0]?.total_batches || 0),
+        by_eat_date: byDate.rows.map((r) => ({
+          eat_date: r.d,
+          rows: Number(r.rows),
+          created: Number(r.created_rows),
+          voided: Number(r.voided_rows),
+          batches: Number(r.batches),
+        })),
+      });
+    } catch (err) {
+      console.error('[brain-upload-timeline] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/admin/scan-double-pushes
+  // Across all time, finds (customer, bank_ref) combinations where BRAIN
+  // has 2+ payment_uploads rows with status='created' qb_id set.
+  // = candidates for duplicate Payments in QB.
+  app.get('/api/admin/scan-double-pushes', requireSecretOrJwt, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT customer_id, bank_ref, COUNT(*) AS dup_count,
+                ARRAY_AGG(qb_id) AS qb_ids,
+                ARRAY_AGG(amount) AS amounts,
+                ARRAY_AGG(batch_id) AS batch_ids,
+                MAX(customer_name) AS customer_name
+           FROM payment_uploads
+          WHERE status = 'created' AND qb_id IS NOT NULL
+          GROUP BY customer_id, bank_ref
+         HAVING COUNT(*) >= 2
+          ORDER BY COUNT(*) DESC
+          LIMIT 200`,
+      );
+      const total_dup_amount = r.rows.reduce((s, x) => {
+        const amts = x.amounts || [];
+        if (amts.length > 1) {
+          for (let i = 1; i < amts.length; i++) s += Number(amts[i] || 0);
+        }
+        return s;
+      }, 0);
+      res.json({
+        duplicate_groups: r.rows.length,
+        approx_excess_amount: total_dup_amount,
+        groups: r.rows.map((x) => ({
+          customer_id: x.customer_id,
+          customer_name: x.customer_name,
+          bank_ref: x.bank_ref,
+          duplicate_count: Number(x.dup_count),
+          qb_ids: x.qb_ids,
+          amounts: x.amounts.map(Number),
+          batch_ids: (x.batch_ids || []).map((b) => String(b).slice(0, 8)),
+        })),
+      });
+    } catch (err) {
+      console.error('[scan-double-pushes] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/audit-batch-pushes
   // Body: { batch_id }
   // Per-Payment audit of a batch's pushes. For each PU with status='created'
