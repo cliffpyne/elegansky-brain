@@ -16,6 +16,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { initQbClient } from './qb-client.js';
 import { mountAgentApi } from './agent/api.js';
 import { mountOfficerReportsApi } from './officer-reports.js';
+import { mountMegaReportApi } from './mega-report.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 
@@ -576,6 +577,7 @@ mountNotificationsApi(app, { requireSharedSecret, requireSupabaseJwt, requirePho
 mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey });
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
 mountOfficerReportsApi(app, { requireSecretOrJwt });
+mountMegaReportApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
