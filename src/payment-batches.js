@@ -1362,6 +1362,93 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/qb-active-by-refs
+  // Body: { channel, refs: [...] }
+  // For each ref (suffixed with channel), queries QB for active Payments
+  // whose PrivateNote matches, then cross-references with payment_uploads.
+  // Returns per ref:
+  //   - qb_active: list of {qb_id, amount, txnDate, customerRef} from QB
+  //   - db_voided: list of qb_ids our DB thinks we voided
+  //   - silent_void_failures: qb_ids active in QB AND status='voided' in DB
+  //                           (= qbVoid said ok but Payment is still alive)
+  //   - untracked: qb_ids active in QB but no payment_uploads record
+  //                (= manual SaasAnt upload OR untracked BRAIN push)
+  app.post('/api/admin/qb-active-by-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String).filter(Boolean) : [];
+      if (refs.length === 0) return res.status(400).json({ error: 'refs[] required' });
+      const suffix = { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[channel];
+      // Normalize: ensure we have both bare and suffixed forms
+      const suffixedRefs = refs.map((r) => (suffix && r.endsWith(suffix)) ? r : appendSuf(r, channel));
+      // Query QB for active Payments with these PrivateNotes
+      // QB doesn't support IN on PrivateNote, so query one ref at a time
+      const qbHits = new Map(); // suffixedRef → [{qb_id, amount, txnDate, customerRef}]
+      for (const sref of suffixedRefs) {
+        try {
+          const r = await qbQuery(
+            `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM Payment WHERE PrivateNote = '${sref.replace(/'/g, "''")}' MAXRESULTS 100`,
+          );
+          const pmts = r.QueryResponse?.Payment || [];
+          qbHits.set(sref, pmts.map((p) => ({
+            qb_id: String(p.Id),
+            amount: Number(p.TotalAmt),
+            txnDate: p.TxnDate,
+            customerRef: p.CustomerRef?.value,
+            customerName: p.CustomerRef?.name,
+          })));
+        } catch (err) {
+          qbHits.set(sref, { error: String(err.message || err).slice(0, 200) });
+        }
+      }
+      // Look up DB records for all suffixed refs
+      const pus = await db().query(
+        `SELECT bank_ref, qb_id, status FROM payment_uploads
+          WHERE bank_ref = ANY($1::text[]) AND qb_id IS NOT NULL`,
+        [suffixedRefs],
+      );
+      const dbByRef = new Map();
+      for (const r of pus.rows) {
+        if (!dbByRef.has(r.bank_ref)) dbByRef.set(r.bank_ref, []);
+        dbByRef.get(r.bank_ref).push({ qb_id: String(r.qb_id), status: r.status });
+      }
+      // Assemble per-ref diagnosis
+      const results = [];
+      for (let i = 0; i < refs.length; i++) {
+        const sref = suffixedRefs[i];
+        const qb = qbHits.get(sref);
+        if (Array.isArray(qb)) {
+          const dbRows = dbByRef.get(sref) || [];
+          const dbVoidedIds = new Set(dbRows.filter((r) => r.status === 'voided').map((r) => r.qb_id));
+          const dbCreatedIds = new Set(dbRows.filter((r) => r.status === 'created').map((r) => r.qb_id));
+          const dbAllIds = new Set(dbRows.map((r) => r.qb_id));
+          const activeIds = new Set(qb.map((p) => p.qb_id));
+          const silentVoidFailures = qb.filter((p) => dbVoidedIds.has(p.qb_id));
+          const stillCreated = qb.filter((p) => dbCreatedIds.has(p.qb_id));
+          const untracked = qb.filter((p) => !dbAllIds.has(p.qb_id));
+          results.push({
+            ref: refs[i],
+            suffixed_ref: sref,
+            qb_active_count: qb.length,
+            qb_active: qb,
+            db_voided_count: dbVoidedIds.size,
+            db_created_count: dbCreatedIds.size,
+            silent_void_failures: silentVoidFailures,
+            still_in_created_state: stillCreated,
+            untracked,
+          });
+        } else {
+          results.push({ ref: refs[i], suffixed_ref: sref, error: qb?.error || 'qb query failed' });
+        }
+      }
+      res.json({ channel, results });
+    } catch (err) {
+      console.error('[qb-active-by-refs] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/find-refs-in-sheet
   // Body: { channel, refs: [...] }
   // For each ref, returns: sheet row, sheet_ts, amount, customer_name,
