@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange } from './sheets.js';
 import { qbQuery, qbReport } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -1673,6 +1673,31 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[find-bad-date-rows] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/clear-marker-rows
+  // Body: { channel, from_row, to_row }
+  // Wipes I/J/K marker columns for the given row range on the channel sheet.
+  // Use after recalling a batch when the recall left stale "already pushed"
+  // markers behind (recall voids QB Payments + releases CT but does NOT
+  // touch the sheet's per-row I/J markers or "end of tick" K markers).
+  // Without this, the next fire silently skips those rows.
+  app.post('/api/admin/clear-marker-rows', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: 'bad channel' });
+      const fromRow = Number(req.body?.from_row);
+      const toRow = Number(req.body?.to_row);
+      if (!Number.isInteger(fromRow) || !Number.isInteger(toRow) || fromRow < 2 || toRow < fromRow) {
+        return res.status(400).json({ error: 'from_row, to_row required (integers ≥2, to≥from)' });
+      }
+      const cfg = CHANNEL_SHEETS[channel];
+      const result = await clearMarkerRowRange(cfg.sheetId, cfg.tab, fromRow, toRow);
+      res.json({ channel, from_row: fromRow, to_row: toRow, ...result });
+    } catch (err) {
+      console.error('[clear-marker-rows] failed:', err);
       res.status(500).json({ error: err.message });
     }
   });

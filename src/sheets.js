@@ -109,6 +109,20 @@ export function serviceAccountEmail() {
  * from the marker columns (I/J/K) before BRAIN starts using them as
  * locks. Returns the number of cells the API reported as cleared.
  */
+/**
+ * Clear specific cells in columns I/J/K for a row range. Used by recall
+ * recovery to wipe stale "already pushed" markers left behind when QB
+ * Payments were voided but sheet markers were not refreshed.
+ *
+ * fromRow / toRow are 1-based inclusive sheet row numbers.
+ */
+export async function clearMarkerRowRange(spreadsheetId, tabName, fromRow, toRow) {
+  const sheets = await sheetsClient();
+  const range = `${tabName}!I${fromRow}:K${toRow}`;
+  const res = await sheets.spreadsheets.values.clear({ spreadsheetId, range });
+  return { clearedRange: res.data.clearedRange || range };
+}
+
 export async function clearSheetColumn(spreadsheetId, tabName, columnLetter) {
   const sheets = await sheetsClient();
   const range = `${tabName}!${columnLetter}:${columnLetter}`;
