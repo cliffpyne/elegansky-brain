@@ -352,25 +352,32 @@ export function mountPaymentBatchesApi(app, deps) {
     if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
       return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
     }
-    // ─── HARD KILL SWITCH ──────────────────────────────────────────────
-    // app_settings.auto_upload_enabled = 'false' blocks every caller of
-    // this endpoint: cron-scheduled agent sessions, agent tool calls,
-    // manual curls, dashboard buttons. Use during incidents where any
-    // QB push must be impossible until operator re-enables. Default is
-    // 'true' (or missing key) — backwards compatible.
-    try {
-      const r = await db().query(
-        `SELECT value FROM app_settings WHERE key = 'auto_upload_enabled'`,
-      );
-      const v = r.rows[0]?.value;
-      if (v && String(v).toLowerCase() === 'false') {
-        return res.status(503).json({
-          error: 'auto-upload disabled via app_settings.auto_upload_enabled=false',
-          remedy: 'set app_settings.auto_upload_enabled=true to re-enable',
-        });
+    // ─── KILL SWITCH (scheduler/agent only) ──────────────────────────
+    // app_settings.auto_upload_enabled = 'false' blocks AUTOMATION
+    // callers (shared-secret auth = cron-scheduled agent, internal
+    // tools). Dashboard operators authed via Supabase JWT (req.user
+    // populated by requireSecretOrJwt) always pass through — clicking
+    // the dashboard button is an explicit operator action and shouldn't
+    // be gated by the same flag that holds back automation.
+    //
+    // Operator policy (2026-06-06): auto_upload_enabled stays FALSE in
+    // production. Dashboard remains the only legitimate way to fire an
+    // upload until the scheduler architecture is ready for re-enable.
+    if (!req.user) {
+      try {
+        const r = await db().query(
+          `SELECT value FROM app_settings WHERE key = 'auto_upload_enabled'`,
+        );
+        const v = r.rows[0]?.value;
+        if (v && String(v).toLowerCase() === 'false') {
+          return res.status(503).json({
+            error: 'auto-upload disabled for automation callers (app_settings.auto_upload_enabled=false). Dashboard operators bypass this.',
+            remedy: 'fire from dashboard (Supabase JWT auth) or set auto_upload_enabled=true',
+          });
+        }
+      } catch (err) {
+        console.error('[auto-upload kill-switch check failed — failing OPEN]:', err.message);
       }
-    } catch (err) {
-      console.error('[auto-upload kill-switch check failed — failing OPEN]:', err.message);
     }
     const dryRun = req.body?.dry_run === true || process.env.AUTO_UPLOAD_DRY_RUN === 'true';
     const maxPaid = Number(process.env.AUTO_UPLOAD_MAX_PAID || 200);
