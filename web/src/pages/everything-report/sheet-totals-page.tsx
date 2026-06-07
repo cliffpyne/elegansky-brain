@@ -6,6 +6,7 @@ import {
   fmt, useDefaultFilter, useReportComparison,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
+import { TrendCell } from './trend-cell';
 
 export function SheetTotalsPage() {
   const [state, setState] = useDefaultFilter();
@@ -70,16 +71,19 @@ export function SheetTotalsPage() {
             <TableBody>
               {b && Object.entries(b.by_channel).map(([ch, v]) => (
                 <TableRow key={ch}>
-                  <TableCell className="font-medium">
-                    {ch}
-                    {v.extra_tabs.length > 0 && <span className="text-xs text-muted-foreground ml-1">(+{v.extra_tabs.join(',')})</span>}
+                  <TableCell className="font-medium">{ch}</TableCell>
+                  <TableCell className="text-right">{fmt(v.passed.rows)}</TableCell>
+                  <TableCell className="text-right">
+                    <TrendCell label={`${ch} PASSED total`} value={v.passed.total} extractor={(d) => d.sheets?.by_channel?.[ch]?.passed_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
                   </TableCell>
-                  <TableCell className="text-right">{fmt(v.passed.rows + v.extra.rows)}</TableCell>
-                  <TableCell className="text-right font-mono">{fmt(v.passed.total + v.extra.total)}</TableCell>
                   <TableCell className="text-right">{fmt(v.failed.rows)}</TableCell>
-                  <TableCell className="text-right font-mono">{fmt(v.failed.total)}</TableCell>
+                  <TableCell className="text-right">
+                    <TrendCell label={`${ch} FAILED total`} value={v.failed.total} invertDirection extractor={(d) => d.sheets?.by_channel?.[ch]?.failed_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                  </TableCell>
                   <TableCell className="text-right">{fmt(v.unused.total_rows)}</TableCell>
-                  <TableCell className="text-right font-mono">{fmt(v.unused.total_amount)}</TableCell>
+                  <TableCell className="text-right">
+                    <TrendCell label={`${ch} UNUSED total`} value={v.unused.total_amount} invertDirection extractor={(d) => d.sheets?.by_channel?.[ch]?.unused_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                  </TableCell>
                 </TableRow>
               ))}
               {b && (

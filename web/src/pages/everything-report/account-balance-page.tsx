@@ -6,6 +6,7 @@ import {
   fmt, fmt2, useDefaultFilter, useReportComparison,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
+import { TrendCell } from './trend-cell';
 
 export function AccountBalancePage() {
   const [state, setState] = useDefaultFilter();
@@ -73,27 +74,37 @@ export function AccountBalancePage() {
             <TableBody>
               <TableRow>
                 <TableCell>Beginning balance ({a?.opening_as_of?.slice(5) || '—'})</TableCell>
-                <TableCell className="text-right font-mono">{fmt2(a?.opening_balance)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Beginning balance" value={a?.opening_balance ?? null} formatter={fmt2} extractor={(d) => d.account?.opening_balance ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-xs text-muted-foreground">{a?.parent_account} + {a?.sub_accounts?.join(', ') || '—'} sub</TableCell>
               </TableRow>
               <TableRow>
                 <TableCell className="text-green-700">+ Payments (credits)</TableCell>
-                <TableCell className="text-right font-mono text-green-700">{fmt(a?.payments_in_window.total)}</TableCell>
+                <TableCell className="text-right text-green-700">
+                  <TrendCell label="Payments (credits)" value={a?.payments_in_window.total ?? null} extractor={(d) => d.account?.payments_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-xs text-muted-foreground">{fmt(a?.payments_in_window.count)} txns</TableCell>
               </TableRow>
               <TableRow>
                 <TableCell className="text-red-700">− Expenses (debits)</TableCell>
-                <TableCell className="text-right font-mono text-red-700">{fmt(a?.expenses_in_window.total)}</TableCell>
+                <TableCell className="text-right text-red-700">
+                  <TrendCell label="Expenses (debits)" value={a?.expenses_in_window.total ?? null} invertDirection extractor={(d) => d.account?.expenses_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-xs text-muted-foreground">{fmt(a?.expenses_in_window.count)} txns</TableCell>
               </TableRow>
               <TableRow className="bg-muted/30">
                 <TableCell className="font-semibold">= Net movement</TableCell>
-                <TableCell className="text-right font-mono font-semibold">{fmt(a?.net_movement)} ✓</TableCell>
+                <TableCell className="text-right font-semibold">
+                  <TrendCell label="Net movement" value={a?.net_movement ?? null} extractor={(d) => d.account?.net_movement ?? null} anchor={state.anchor} officerId={state.officerId || undefined} /> ✓
+                </TableCell>
                 <TableCell className="text-xs text-muted-foreground">Matches Account QuickReport TOTAL row</TableCell>
               </TableRow>
               <TableRow>
                 <TableCell>Live balance now</TableCell>
-                <TableCell className="text-right font-mono">{fmt2(a?.closing_live)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Live balance" value={a?.closing_live ?? null} formatter={fmt2} extractor={(d) => d.account?.closing_live ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-xs text-muted-foreground">parent + sub</TableCell>
               </TableRow>
             </TableBody>
@@ -113,20 +124,32 @@ export function AccountBalancePage() {
             <TableBody>
               <TableRow>
                 <TableCell>Payments (credits)</TableCell>
-                <TableCell className="text-right font-mono">{fmt(a?.payments_in_window.total)}</TableCell>
-                <TableCell className="text-right font-mono">{fmt(ap?.payments_in_window.total)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Payments (cur)" value={a?.payments_in_window.total ?? null} extractor={(d) => d.account?.payments_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Payments (prev)" value={ap?.payments_in_window.total ?? null} extractor={(d) => d.account?.payments_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-right font-mono">{fmt((a?.payments_in_window.total || 0) - (ap?.payments_in_window.total || 0))}</TableCell>
               </TableRow>
               <TableRow>
                 <TableCell>Expenses (debits)</TableCell>
-                <TableCell className="text-right font-mono">{fmt(a?.expenses_in_window.total)}</TableCell>
-                <TableCell className="text-right font-mono">{fmt(ap?.expenses_in_window.total)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Expenses (cur)" value={a?.expenses_in_window.total ?? null} invertDirection extractor={(d) => d.account?.expenses_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Expenses (prev)" value={ap?.expenses_in_window.total ?? null} invertDirection extractor={(d) => d.account?.expenses_total ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-right font-mono">{fmt((a?.expenses_in_window.total || 0) - (ap?.expenses_in_window.total || 0))}</TableCell>
               </TableRow>
               <TableRow className="bg-muted/30 font-semibold">
                 <TableCell>Net movement</TableCell>
-                <TableCell className="text-right font-mono">{fmt(a?.net_movement)}</TableCell>
-                <TableCell className="text-right font-mono">{fmt(ap?.net_movement)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Net (cur)" value={a?.net_movement ?? null} extractor={(d) => d.account?.net_movement ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Net (prev)" value={ap?.net_movement ?? null} extractor={(d) => d.account?.net_movement ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
                 <TableCell className="text-right font-mono">{fmt((a?.net_movement || 0) - (ap?.net_movement || 0))}</TableCell>
               </TableRow>
             </TableBody>

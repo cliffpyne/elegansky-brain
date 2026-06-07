@@ -7,6 +7,7 @@ import {
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
+import { TrendCell } from './trend-cell';
 
 export function OpenInvoicesPage() {
   const [state, setState] = useDefaultFilter();
@@ -98,13 +99,21 @@ export function OpenInvoicesPage() {
                 {c && (
                   <TableRow className="bg-muted/30 font-semibold">
                     <TableCell>TOTAL</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.total_invoice_amount)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.today_balance_remain)}</TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total invoice amt" value={c.grand.total_invoice_amount} extractor={(d) => d.officers?.total_invoice_amount ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total balance remain" value={c.grand.today_balance_remain} invertDirection extractor={(d) => d.officers?.today_balance_remain ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
                     <TableCell className="text-right">{fmt(c.grand.motos_office)}</TableCell>
                     <TableCell className="text-right">{fmt(c.grand.motos_police)}</TableCell>
                     <TableCell className="text-right font-mono">{fmt(c.grand.adjustment)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.open)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.collected)}</TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total open" value={c.grand.open} extractor={(d) => d.officers?.open ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total collected" value={c.grand.collected} extractor={(d) => d.officers?.collected ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
                     <TableCell className="text-right">{fmtPct(c.grand.pct_collected)}</TableCell>
                   </TableRow>
                 )}

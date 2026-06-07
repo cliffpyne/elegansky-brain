@@ -7,6 +7,7 @@ import {
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
+import { TrendCell } from './trend-cell';
 
 export function ArrearsPage() {
   const [state, setState] = useDefaultFilter();
@@ -91,9 +92,15 @@ export function ArrearsPage() {
                 {c && (
                   <TableRow className="bg-muted/30 font-semibold">
                     <TableCell>TOTAL</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.arrears_morning)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.arrears_realtime)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(c.grand.arrear_collected)}</TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total arrears morning" value={c.grand.arrears_morning} invertDirection extractor={(d) => d.officers?.arrears_morning ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total arrears now" value={c.grand.arrears_realtime} invertDirection extractor={(d) => d.officers?.arrears_realtime ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <TrendCell label="Total arrear collected" value={c.grand.arrear_collected} extractor={(d) => d.officers?.arrear_collected ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                    </TableCell>
                     <TableCell className="text-right">{fmtPct(c.grand.arrear_pct_collected)}</TableCell>
                   </TableRow>
                 )}

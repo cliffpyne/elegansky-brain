@@ -8,6 +8,7 @@ import {
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
+import { TrendCell } from './trend-cell';
 
 export function ArrearTrendPage() {
   const [state, setState] = useDefaultFilter();
@@ -77,12 +78,16 @@ export function ArrearTrendPage() {
               <TableRow>
                 <TableCell>Current</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{windows.current.from} → {windows.current.to}</TableCell>
-                <TableCell className="text-right font-mono">{fmt(cur)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Arrears current" value={cur} invertDirection extractor={(d) => d.officers?.arrears_realtime ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
               </TableRow>
               <TableRow>
                 <TableCell>Previous (same length)</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{windows.previous.from} → {windows.previous.to}</TableCell>
-                <TableCell className="text-right font-mono">{fmt(prev)}</TableCell>
+                <TableCell className="text-right">
+                  <TrendCell label="Arrears prev" value={prev} invertDirection extractor={(d) => d.officers?.arrears_realtime ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                </TableCell>
               </TableRow>
               <TableRow className="bg-muted/30 font-semibold">
                 <TableCell>Δ</TableCell>
