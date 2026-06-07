@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers } from './sheets.js';
 import { qbQuery, qbReport, qbPatchPaymentTxnDate } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -563,6 +563,37 @@ export function mountPaymentBatchesApi(app, deps) {
             [result.batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix],
           );
         }
+
+        // Dry-run sheet markers (Frank 2026-06-07): write I/J/K with a
+        // " (DRY_RUN)" suffix so the operator can SEE the plan in the
+        // sheet before committing. The next REAL upload's skip checks
+        // ignore "(DRY_RUN)" markers so they don't accidentally lock
+        // rows. An Erase button (eraseDryRunMarkers) wipes them.
+        try {
+          const tickName = String(req.body?.tick_name || 'heisenberg');
+          if (result.cfg && result.cfg.sheetId && result.cfg.tab) {
+            const fetchedAt = new Date().toISOString();
+            const fetchRows = new Set();
+            for (const p of result.paid) { if (p.sheet_row_number) fetchRows.add(p.sheet_row_number); }
+            for (const u of result.unused) { if (u.sheet_row_number) fetchRows.add(u.sheet_row_number); }
+            if (fetchRows.size > 0) {
+              const updates = [];
+              for (const row of fetchRows) {
+                updates.push({ range: `${result.cfg.tab}!I${row}`, value: `Fetched at: ${fetchedAt} (DRY_RUN)` });
+                updates.push({ range: `${result.cfg.tab}!J${row}`, value: `DRY_RUN — would push (DRY_RUN)` });
+              }
+              const r = await writeSheetCells(result.cfg.sheetId, updates);
+              console.log(`[dry-run] Column I+J markers written: ${r.updatedCells} cells across ${fetchRows.size} rows in ${result.cfg.tab}`);
+              // Paint K marker (yellow row + "end of <tick> (DRY_RUN)") at last row
+              const lastRow = Math.max(...fetchRows);
+              await paintRowEndMarker(result.cfg.sheetId, result.cfg.tab, lastRow, tickName, { dryRun: true });
+              console.log(`[dry-run] Column K end marker painted at row ${lastRow} in ${result.cfg.tab}`);
+            }
+          }
+        } catch (err) {
+          console.error('[dry-run] sheet marker write failed (non-fatal):', err.message);
+        }
+
         await releaseLock();
         return res.status(202).json({
           dry_run: true,
@@ -742,6 +773,44 @@ export function mountPaymentBatchesApi(app, deps) {
       });
     } catch (err) {
       console.error('[POST /api/payment-batches/:id/rerun]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── POST /api/payment-batches/:id/erase-dry-run-markers ─────────────────
+  // Wipe every "(DRY_RUN)" marker BRAIN painted on this batch's sheet tab.
+  // Use after operator reviews a dry-run plan visually and either commits
+  // (then the real push paints over them) or abandons. Real (non-dry-run)
+  // markers — purple rows + plain "end of <tick>" K text — are untouched.
+  app.post('/api/payment-batches/:id/erase-dry-run-markers', requireSupabaseJwt, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT sheet_id, sheet_tab FROM payment_batches WHERE id = $1`,
+        [req.params.id],
+      );
+      if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+      const { sheet_id, sheet_tab } = r.rows[0];
+      const result = await eraseDryRunMarkers(sheet_id, sheet_tab);
+      res.json({ erased: true, ...result });
+    } catch (err) {
+      console.error('[POST /api/payment-batches/:id/erase-dry-run-markers]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── POST /api/admin/erase-dry-run-markers/:channel ──────────────────────
+  // Standalone form — wipes dry-run markers across the whole channel tab,
+  // independent of which batch painted them. Useful when operator wants to
+  // clean up before re-running with different params, without going batch
+  // by batch.
+  app.post('/api/admin/erase-dry-run-markers/:channel', requireSupabaseJwt, async (req, res) => {
+    try {
+      const cfg = CHANNEL_SHEETS[req.params.channel];
+      if (!cfg) return res.status(400).json({ error: 'bad channel' });
+      const result = await eraseDryRunMarkers(cfg.sheetId, cfg.tab);
+      res.json({ erased: true, channel: req.params.channel, ...result });
+    } catch (err) {
+      console.error('[POST /api/admin/erase-dry-run-markers/:channel]', err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -4585,7 +4654,9 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   let maxKRow = 0;
   for (let i = 1; i < sheet.length; i++) {
     const colK = String(sheet[i][10] || '').trim().toLowerCase();
-    if (colK.startsWith('end of ')) maxKRow = i + 1; // 1-based row number
+    // Ignore "(dry_run)" markers — those are provisional from a dry-run
+    // preview, not real boundaries. They get cleared by the Erase button.
+    if (colK.startsWith('end of ') && !colK.includes('(dry_run)')) maxKRow = i + 1; // 1-based row number
   }
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
@@ -4601,12 +4672,23 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
     const colI = String(sheet[i][8] || '').trim();
     const colJ = String(sheet[i][9] || '').trim();
-    if (colI || colJ) { skippedAlreadyPushed++; continue; }
+    // Dry-run markers ("(DRY_RUN)" suffix) are provisional — ignore them
+    // so a dry-run preview doesn't lock rows from the next real upload.
+    const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
+    const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
+    if (colIReal || colJReal) { skippedAlreadyPushed++; continue; }
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
     if (!ts) { skippedBadFormat++; continue; }
-    if (ts < winStart || ts >= winEnd) { skippedOutOfWindow++; continue; }
+    // Upper bound only — keep out future-dated test data. Lower bound
+    // dropped 2026-06-07: late-arriving rows (sheet_ts BEFORE the cursor
+    // because they were added to the sheet AFTER the cursor batch closed)
+    // would silently skip with the old `ts < winStart` check, even though
+    // K marker tells us they're fresh. Trust the K marker for "not yet
+    // processed". Pairs with the QB dup-check (next phase) so refs that
+    // are old AND already in QB get marked instead of re-pushed.
+    if (ts >= winEnd) { skippedOutOfWindow++; continue; }
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,

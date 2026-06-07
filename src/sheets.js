@@ -134,6 +134,73 @@ export async function clearSheetColumn(spreadsheetId, tabName, columnLetter) {
 }
 
 /**
+ * Wipe every dry-run marker BRAIN previously painted on a tab. A row is
+ * "dry-run-marked" if any of columns I/J/K contains the literal substring
+ * "(DRY_RUN)". For every such row we:
+ *   - clear cells I, J, K
+ *   - reset row background (cols A..K) to white so the yellow paint goes away
+ *
+ * Real (non-dry-run) markers — purple rows + plain "end of <tick>" K text —
+ * are untouched. Safe to call repeatedly; idempotent.
+ */
+export async function eraseDryRunMarkers(spreadsheetId, tabName) {
+  const sheets = await sheetsClient();
+  // Resolve sheetId from tabName (needed for repeatCell backgroundColor reset)
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets.properties',
+  });
+  const tab = (meta.data.sheets || []).find((s) => s.properties?.title === tabName);
+  if (!tab) throw new Error(`tab '${tabName}' not found in ${spreadsheetId}`);
+  const sheetId = tab.properties.sheetId;
+
+  // Find rows with any (DRY_RUN) marker in I/J/K
+  const data = await readSheet(spreadsheetId, `${tabName}!A1:K80000`);
+  const rows = data.values || data.data || [];
+  const dryRunRows = []; // 1-based row numbers
+  for (let i = 0; i < rows.length; i++) {
+    const colI = String(rows[i][8] || '');
+    const colJ = String(rows[i][9] || '');
+    const colK = String(rows[i][10] || '');
+    if (colI.includes('(DRY_RUN)') || colJ.includes('(DRY_RUN)') || colK.includes('(DRY_RUN)')) {
+      dryRunRows.push(i + 1);
+    }
+  }
+  if (dryRunRows.length === 0) return { cleared: 0, rows: [] };
+
+  // Build a batchUpdate that (a) blanks I/J/K cells, (b) resets A..K backgrounds
+  // to white on those rows. Use one batchUpdate per row to keep payload simple.
+  const requests = [];
+  for (const r of dryRunRows) {
+    const row0 = r - 1;
+    requests.push({
+      updateCells: {
+        range: { sheetId, startRowIndex: row0, endRowIndex: row0 + 1, startColumnIndex: 8, endColumnIndex: 11 },
+        rows: [{ values: [{ userEnteredValue: { stringValue: '' } }, { userEnteredValue: { stringValue: '' } }, { userEnteredValue: { stringValue: '' } }] }],
+        fields: 'userEnteredValue',
+      },
+    });
+    requests.push({
+      repeatCell: {
+        range: { sheetId, startRowIndex: row0, endRowIndex: row0 + 1, startColumnIndex: 0, endColumnIndex: 11 },
+        cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+        fields: 'userEnteredFormat.backgroundColor',
+      },
+    });
+  }
+
+  // Google's batchUpdate rejects >10MB payloads; chunk at 200 requests/call.
+  const CH = 200;
+  for (let i = 0; i < requests.length; i += CH) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: requests.slice(i, i + CH) },
+    });
+  }
+  return { cleared: dryRunRows.length, rows: dryRunRows };
+}
+
+/**
  * Lock columns I, J, K on the named tab so ONLY the service account can
  * edit them. Operators with edit access to the sheet can still touch
  * A-H normally but can't accidentally (or maliciously) wipe the
@@ -206,10 +273,19 @@ export async function protectMarkerColumns(spreadsheetId, tabName) {
  * — light lavender. Adjust here if the iPhone team's existing markers use a
  * different shade.
  */
-export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickName) {
+export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickName, options = {}) {
   if (!spreadsheetId || !tabName || !rowNumber || !tickName) {
     return { painted: false, reason: 'missing arg' };
   }
+  const { dryRun = false } = options;
+  // Dry-run renders yellow row + " (DRY_RUN)" text suffix, so the operator
+  // can tell at a glance which markers are provisional. Real runs stay
+  // purple. The "(DRY_RUN)" suffix is ALSO how prepareAutoUpload's skip
+  // checks ignore dry-run markers — see the K/I/J boundary logic there.
+  const bg = dryRun
+    ? { red: 1.0, green: 0.93, blue: 0.6 }    // yellow
+    : { red: 0.85, green: 0.7, blue: 0.95 };  // purple
+  const kText = dryRun ? `end of ${tickName} (DRY_RUN)` : `end of ${tickName}`;
   const sheets = await sheetsClient();
   // Resolve sheetId from tabName (the numeric id needed by batchUpdate)
   const meta = await sheets.spreadsheets.get({
@@ -228,7 +304,7 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
     spreadsheetId,
     requestBody: {
       requests: [
-        // Paint columns A..K (indices 0..11 exclusive) purple
+        // Paint columns A..K (indices 0..11 exclusive)
         {
           repeatCell: {
             range: {
@@ -240,13 +316,13 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
             },
             cell: {
               userEnteredFormat: {
-                backgroundColor: { red: 0.85, green: 0.7, blue: 0.95 },
+                backgroundColor: bg,
               },
             },
             fields: 'userEnteredFormat.backgroundColor',
           },
         },
-        // Write "end of {tick}" to Column K (index 10)
+        // Write "end of {tick}" (or " (DRY_RUN)" variant) to Column K
         {
           updateCells: {
             range: {
@@ -256,14 +332,14 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
               startColumnIndex: 10,
               endColumnIndex: 11,
             },
-            rows: [{ values: [{ userEnteredValue: { stringValue: `end of ${tickName}` } }] }],
+            rows: [{ values: [{ userEnteredValue: { stringValue: kText } }] }],
             fields: 'userEnteredValue',
           },
         },
       ],
     },
   });
-  return { painted: true, row: rowNumber, tick: tickName };
+  return { painted: true, row: rowNumber, tick: tickName, dryRun };
 }
 
 /**
