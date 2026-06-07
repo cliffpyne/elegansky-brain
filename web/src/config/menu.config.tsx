@@ -1,15 +1,19 @@
 import {
   Activity,
+  AlertCircle,
   Bell,
   Bot,
   CircleHelp,
   FileSpreadsheet,
+  FileText,
   Landmark,
   LayoutGrid,
   LineChart,
   ScrollText,
   Settings,
   Shield,
+  TrendingUp,
+  Wallet,
   Webhook,
 } from 'lucide-react';
 import { type MenuConfig } from './types';
@@ -46,7 +50,17 @@ export const MENU_SIDEBAR: MenuConfig = [
   { title: 'Agent', icon: Bot, path: '/agent' },
   { heading: 'Insights' },
   { title: 'Officer collections', icon: LineChart, path: '/officer-reports' },
-  { title: 'Everything report', icon: LineChart, path: '/everything-report' },
+  {
+    title: 'Everything report',
+    icon: LineChart,
+    children: [
+      { title: 'A · Account balance', path: '/everything-report/account-balance', icon: Wallet },
+      { title: 'B · Sheet totals',    path: '/everything-report/sheet-totals',    icon: FileSpreadsheet },
+      { title: 'C · Open invoices',   path: '/everything-report/open-invoices',   icon: FileText },
+      { title: 'D · Arrears',         path: '/everything-report/arrears',         icon: AlertCircle },
+      { title: 'E · Arrear trend',    path: '/everything-report/arrear-trend',    icon: TrendingUp },
+    ],
+  },
   { title: 'Activity', icon: ScrollText, path: '/coming-soon', disabled: true },
   { heading: 'System' },
   { title: 'Admin notifications', icon: Bell, path: '/admin-sms' },
