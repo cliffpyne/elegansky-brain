@@ -63,6 +63,43 @@ async function isRuntimeEnabled() {
   }
 }
 
+/**
+ * Did the NMB scraper report OK within the last `maxAgeMin` minutes?
+ * Used by meru0300 as a precondition — if NMB isn't fresh, the whole
+ * day's catchup is bogus and the scheduler should be killed instead
+ * of compounding the gap.
+ *
+ * Returns { ok: boolean, reason: string }.
+ * The reason string is human-readable and gets surfaced in the admin
+ * notification so the operator knows what to investigate.
+ */
+async function checkNmbScrapedRecently(maxAgeMin) {
+  try {
+    const r = await db().query(
+      `SELECT status, reported_at FROM statement_cycles
+        WHERE bank = 'NMB'
+        ORDER BY reported_at DESC LIMIT 1`,
+    );
+    if (!r.rows.length) {
+      return { ok: false, reason: 'no NMB scrape report has ever been received' };
+    }
+    const row = r.rows[0];
+    const ageMin = Math.floor((Date.now() - new Date(row.reported_at).getTime()) / 60_000);
+    if (row.status !== 'ok') {
+      return { ok: false, reason: `latest NMB scrape status=${row.status} (reported ${ageMin} min ago)` };
+    }
+    if (ageMin >= maxAgeMin) {
+      return { ok: false, reason: `latest NMB OK is ${ageMin} min old (cutoff = ${maxAgeMin} min — scraper may have stopped firing)` };
+    }
+    return { ok: true, reason: `latest NMB status=ok, reported ${ageMin} min ago` };
+  } catch (err) {
+    // Fail CLOSED — if we can't read the DB, we don't know NMB succeeded,
+    // so abort meru0300 conservatively. Better safe than sorry on the
+    // most critical tick of the day.
+    return { ok: false, reason: `DB read failed: ${err.message}` };
+  }
+}
+
 function buildTriggerContext(sched) {
   const now = new Date();
   const eatNow = new Date(now.getTime() + 3 * 3600_000);
@@ -151,6 +188,41 @@ async function fireTick(sched) {
     console.log(`[scheduler] ${sched.name} suppressed — app_settings.agent_scheduler_enabled = false`);
     return;
   }
+
+  // Meru0300 NMB precondition (Frank 2026-06-07): the 03:00 catchup
+  // tick represents yesterday-evening + today-pre-dawn books. NMB is
+  // the main bank — if its scraper didn't report OK recently, the whole
+  // day's data is corrupt and continuing to fire later ticks would
+  // compound the gap. So we ABORT this tick AND kill the whole
+  // scheduler for the day (admin re-enables manually after fixing the
+  // scraper). CRDB-only failures don't trigger this — only NMB.
+  if (sched.name === 'meru0300') {
+    const ok = await checkNmbScrapedRecently(30);
+    if (!ok.ok) {
+      console.error(`[scheduler] ${sched.name} ABORT — NMB precondition failed: ${ok.reason}. Killing whole scheduler.`);
+      try {
+        await db().query(
+          `INSERT INTO app_settings (key, value, updated_by)
+           VALUES ('agent_scheduler_enabled', 'false', $1)
+           ON CONFLICT (key) DO UPDATE SET
+             value = 'false',
+             updated_at = now(),
+             updated_by = EXCLUDED.updated_by`,
+          [`auto:meru0300:nmb-precondition-failed`],
+        );
+      } catch (e) {
+        console.error('[scheduler] failed to flip kill switch:', e.message);
+      }
+      notifyAdmin({
+        message: `BRAIN ${sched.name} ABORTED + scheduler DISABLED — ${ok.reason}. No further ticks will run today. Fix NMB scraper, then re-enable agent_scheduler_enabled in the dashboard.`,
+        severity: 'critical',
+        source: 'agent:scheduler:meru0300',
+      });
+      return;
+    }
+    console.log(`[scheduler] ${sched.name} NMB precondition OK: ${ok.reason}`);
+  }
+
   const triggerContext = buildTriggerContext(sched);
   const label = 'cron:' + sched.name;
   console.log(`[scheduler] firing ${sched.name} (eat=${sched.eat}, kind=${sched.kind}, txn_date=${triggerContext.txn_date})`);
