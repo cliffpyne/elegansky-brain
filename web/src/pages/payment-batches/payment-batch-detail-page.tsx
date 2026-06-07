@@ -255,14 +255,14 @@ export function PaymentBatchDetailPage() {
 
         {batch && (
           <Card className="mb-4">
-            <CardHeader>
+            <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
               <CardTitle className="flex items-center gap-3">
                 Batch <code className="text-sm font-mono">{batch.id.slice(0, 8)}</code>
                 <Badge variant={statusVariant(batch.status)}>{batch.status}</Badge>
               </CardTitle>
               <CardDescription>{batch.channel} · sheet tab {batch.sheet_tab}</CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="p-6 space-y-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div><div className="text-muted-foreground">Paid total</div><div className="font-medium text-lg tabular-nums">{fmt(batch.paid_total)} TZS</div></div>
                 <div><div className="text-muted-foreground">Unused total</div><div className="font-medium text-lg tabular-nums">{fmt(batch.unused_total)} TZS</div></div>
@@ -297,7 +297,7 @@ export function PaymentBatchDetailPage() {
 
         {snapshot && (
           <Card className="mb-4">
-            <CardHeader>
+            <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <CardTitle className="flex items-center gap-2">
@@ -316,7 +316,7 @@ export function PaymentBatchDetailPage() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="p-6 space-y-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div><div className="text-muted-foreground">Snapshot id</div><div className="font-mono text-xs">{snapshot.id.slice(0, 8)}</div></div>
                 <div><div className="text-muted-foreground">As of</div><div className="font-medium">{snapshot.as_of}</div></div>
@@ -329,7 +329,7 @@ export function PaymentBatchDetailPage() {
 
         {invoiceSnapshot && (
           <Card className="mb-4 border-blue-500/30">
-            <CardHeader>
+            <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <div>
                   <CardTitle className="flex items-center gap-2">
@@ -351,7 +351,7 @@ export function PaymentBatchDetailPage() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="p-6 space-y-4">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div>
                   <div className="text-muted-foreground">Invoices in snapshot</div>
@@ -375,7 +375,7 @@ export function PaymentBatchDetailPage() {
         )}
 
         <Card className="mb-4">
-          <CardHeader>
+          <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <CardTitle>Paid invoices ({paid.length})</CardTitle>
@@ -392,7 +392,7 @@ export function PaymentBatchDetailPage() {
               )}
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0 pt-3">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -424,7 +424,7 @@ export function PaymentBatchDetailPage() {
         </Card>
 
         <Card className="mb-4">
-          <CardHeader>
+          <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <CardTitle>Credit memos created ({creditsMatched.length})</CardTitle>
@@ -443,7 +443,7 @@ export function PaymentBatchDetailPage() {
               )}
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0 pt-3">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -477,7 +477,7 @@ export function PaymentBatchDetailPage() {
         </Card>
 
         <Card className="border-amber-500/40">
-          <CardHeader>
+          <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <CardTitle className="text-amber-700 dark:text-amber-300">Unmatched — needs officer review ({unmatched.length})</CardTitle>
@@ -496,7 +496,7 @@ export function PaymentBatchDetailPage() {
               )}
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0 pt-3">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -529,7 +529,7 @@ export function PaymentBatchDetailPage() {
         </Card>
 
         <Card className="mb-4 border-slate-400/40">
-          <CardHeader>
+          <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <CardTitle className="flex items-center gap-2">
@@ -569,7 +569,7 @@ export function PaymentBatchDetailPage() {
               )}
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0 pt-3">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -610,7 +610,7 @@ export function PaymentBatchDetailPage() {
         </Card>
 
         <Card className="mb-4">
-          <CardHeader>
+          <CardHeader className="border-b flex-col items-stretch gap-2 px-6 py-5">
             <CardTitle className="flex items-center gap-2">
               <History className="size-4 text-muted-foreground" />
               Batch logs ({logs.length})
@@ -619,7 +619,7 @@ export function PaymentBatchDetailPage() {
               Structured trail of everything BRAIN did during this batch — start, dup-check result, each chunk's outcome, every sweep retry, finalize. Use this to debug if something looks off.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0 pt-3">
             {logs.length === 0 ? (
               <div className="text-sm text-muted-foreground py-6 text-center">No logs recorded for this batch.</div>
             ) : (
