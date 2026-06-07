@@ -12,9 +12,15 @@ export interface ToolbarHeadingProps {
 }
 
 function Toolbar({ children }: { children?: ReactNode }) {
+  // Wrap in the same Container constraints (max-w-[1320px], px-4/lg:6) as the
+  // page body so the title row aligns horizontally with the cards below.
+  // Tightened pb-7.5 → pb-5 to remove dead vertical space the operator
+  // flagged.
   return (
-    <div className="flex flex-wrap items-center justify-between gap-5 pb-7.5">
-      {children}
+    <div className="w-full mx-auto px-4 lg:px-6 max-w-[1320px]">
+      <div className="flex flex-wrap items-center justify-between gap-5 pb-5">
+        {children}
+      </div>
     </div>
   );
 }

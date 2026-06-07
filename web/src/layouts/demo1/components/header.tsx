@@ -113,14 +113,10 @@ export function Header() {
           </div>
         </div>
 
-        {/* Main Content — sidebar is the canonical BRAIN nav; mega menu just
-            duplicates it so we keep the top header minimal. The breadcrumb
-            still appears for /account flows since they need it. */}
-        {pathname.startsWith('/account') ? (
-          <Breadcrumb />
-        ) : (
-          <div className="flex-1" />
-        )}
+        {/* Main Content — sidebar is the canonical BRAIN nav. Breadcrumb in
+            the header gives a wayfinding hint without duplicating the sidebar
+            like the old mega menu did. */}
+        <Breadcrumb />
 
         {/* HeaderTopbar */}
         <div className="flex items-center gap-3">
