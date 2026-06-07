@@ -112,14 +112,21 @@ function balanceFromReport(report, accountName) {
 
 /**
  * Resolve account names → ids by querying QB Account. Returns { name → id }.
+ * Cached process-wide because account ids don't change.
  */
+const _accountIdCache = new Map(); // name → id
 async function getAccountIds(names) {
   const ids = {};
+  const need = [];
   for (const name of names) {
+    if (_accountIdCache.has(name)) ids[name] = _accountIdCache.get(name);
+    else need.push(name);
+  }
+  for (const name of need) {
     try {
       const r = await qbQuery(`SELECT Id, Name FROM Account WHERE Name = '${name.replace(/'/g, "''")}'`);
       const acct = r.QueryResponse?.Account?.[0];
-      if (acct) ids[name] = acct.Id;
+      if (acct) { ids[name] = acct.Id; _accountIdCache.set(name, acct.Id); }
     } catch { /* skip */ }
   }
   return ids;
@@ -499,6 +506,92 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // ── In-process caches + request throttle for /api/mega-report/series ────
+  // The dashboard pages have ~30 TrendCells each, every hover fans out a
+  // week or month of QB queries. Without these guards the QB calls swamp
+  // the event loop and Render's health probe gets reset, killing the box.
+
+  // Per-day computed summary, TTL 5 min. Map key = `${date}|${officerId||''}`.
+  const _dayCache = new Map();
+  const DAY_CACHE_TTL_MS = 5 * 60 * 1000;
+  // Coalesce in-flight per-day computations so 30 hovers asking for the
+  // same day make exactly ONE QB roundtrip, not 30.
+  const _dayInFlight = new Map();
+
+  async function computeDaySummary(date, officerId) {
+    const key = `${date}|${officerId || ''}`;
+    const cached = _dayCache.get(key);
+    if (cached && Date.now() - cached.ts < DAY_CACHE_TTL_MS) return cached.result;
+    const existing = _dayInFlight.get(key);
+    if (existing) return existing;
+    const p = (async () => {
+      const [acct, sheets, officers] = await Promise.all([
+        getAccountBalance(date, date).catch(() => null),
+        getSheetTotals(date, date).catch(() => null),
+        aggregateOfficers(date, date, officerId).catch(() => null),
+      ]);
+      return {
+        date,
+        account: acct ? {
+          payments_total: acct.payments_in_window?.total || 0,
+          payments_count: acct.payments_in_window?.count || 0,
+          expenses_total: acct.expenses_in_window?.total || 0,
+          expenses_count: acct.expenses_in_window?.count || 0,
+          net_movement: acct.net_movement || 0,
+          opening_balance: acct.opening_balance,
+          closing_live: acct.closing_live,
+        } : null,
+        sheets: sheets ? {
+          passed_total: sheets.grand_passed_total || 0,
+          failed_total: sheets.grand_failed_total || 0,
+          unused_total: sheets.grand_unused_total || 0,
+          by_channel: Object.fromEntries(Object.entries(sheets.by_channel).map(([ch, v]) => [ch, {
+            passed_total: (v.passed?.total || 0) + (v.extra?.total || 0),
+            failed_total: v.failed?.total || 0,
+            unused_total: v.unused?.total_amount || 0,
+          }])),
+        } : null,
+        officers: officers ? {
+          total_invoice_amount: officers.grand.total_invoice_amount || 0,
+          today_balance_remain: officers.grand.today_balance_remain || 0,
+          open: officers.grand.open || 0,
+          collected: officers.grand.collected || 0,
+          pct_collected: officers.grand.pct_collected,
+          arrears_morning: officers.grand.arrears_morning || 0,
+          arrears_realtime: officers.grand.arrears_realtime || 0,
+          arrear_collected: officers.grand.arrear_collected || 0,
+          arrear_pct_collected: officers.grand.arrear_pct_collected,
+          officer_count: officers.officers.length,
+        } : null,
+      };
+    })();
+    _dayInFlight.set(key, p);
+    try {
+      const result = await p;
+      _dayCache.set(key, { result, ts: Date.now() });
+      return result;
+    } finally {
+      _dayInFlight.delete(key);
+    }
+  }
+
+  // Cheap concurrency limiter for the whole series endpoint. With more than
+  // SERIES_LIMIT requests in flight, late ones queue up rather than launching
+  // their own QB-call storms.
+  const SERIES_LIMIT = 2;
+  let _seriesInFlight = 0;
+  const _seriesWaiters = [];
+  async function acquireSeriesSlot() {
+    if (_seriesInFlight < SERIES_LIMIT) { _seriesInFlight++; return; }
+    await new Promise((r) => _seriesWaiters.push(r));
+    _seriesInFlight++;
+  }
+  function releaseSeriesSlot() {
+    _seriesInFlight--;
+    const next = _seriesWaiters.shift();
+    if (next) next();
+  }
+
   // GET /api/mega-report/series?from=YYYY-MM-DD&to=YYYY-MM-DD&officer_id=
   // Returns a compact per-day summary across the window. Powers the hover-
   // trend popovers and the click-through monthly/daily detailed views on
@@ -522,66 +615,35 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
       if (dates.length > 62) {
         return res.status(400).json({ error: `series range too wide (${dates.length} days, max 62)` });
       }
-      // Process dates with limited concurrency (4 at a time) to avoid QB throttling.
-      const out = [];
-      const CONCURRENCY = 4;
-      let idx = 0;
-      const worker = async () => {
-        while (true) {
-          const i = idx++;
-          if (i >= dates.length) return;
-          const d = dates[i];
-          try {
-            const [acct, sheets, officers] = await Promise.all([
-              getAccountBalance(d, d).catch(() => null),
-              getSheetTotals(d, d).catch(() => null),
-              aggregateOfficers(d, d, officerId).catch(() => null),
-            ]);
-            out[i] = {
-              date: d,
-              account: acct ? {
-                payments_total: acct.payments_in_window?.total || 0,
-                payments_count: acct.payments_in_window?.count || 0,
-                expenses_total: acct.expenses_in_window?.total || 0,
-                expenses_count: acct.expenses_in_window?.count || 0,
-                net_movement: acct.net_movement || 0,
-                opening_balance: acct.opening_balance,
-                closing_live: acct.closing_live,
-              } : null,
-              sheets: sheets ? {
-                passed_total: sheets.grand_passed_total || 0,
-                failed_total: sheets.grand_failed_total || 0,
-                unused_total: sheets.grand_unused_total || 0,
-                by_channel: Object.fromEntries(Object.entries(sheets.by_channel).map(([ch, v]) => [ch, {
-                  passed_total: (v.passed?.total || 0) + (v.extra?.total || 0),
-                  failed_total: v.failed?.total || 0,
-                  unused_total: v.unused?.total_amount || 0,
-                }])),
-              } : null,
-              officers: officers ? {
-                total_invoice_amount: officers.grand.total_invoice_amount || 0,
-                today_balance_remain: officers.grand.today_balance_remain || 0,
-                open: officers.grand.open || 0,
-                collected: officers.grand.collected || 0,
-                pct_collected: officers.grand.pct_collected,
-                arrears_morning: officers.grand.arrears_morning || 0,
-                arrears_realtime: officers.grand.arrears_realtime || 0,
-                arrear_collected: officers.grand.arrear_collected || 0,
-                arrear_pct_collected: officers.grand.arrear_pct_collected,
-                officer_count: officers.officers.length,
-              } : null,
-            };
-          } catch (err) {
-            out[i] = { date: d, error: err.message };
+      await acquireSeriesSlot();
+      try {
+        // Process dates with limited concurrency (2 at a time inside one
+        // request) AND share results across overlapping requests via the
+        // memo+coalesce in computeDaySummary.
+        const out = new Array(dates.length);
+        const CONCURRENCY = 2;
+        let idx = 0;
+        const worker = async () => {
+          while (true) {
+            const i = idx++;
+            if (i >= dates.length) return;
+            const d = dates[i];
+            try {
+              out[i] = await computeDaySummary(d, officerId);
+            } catch (err) {
+              out[i] = { date: d, error: err.message };
+            }
           }
-        }
-      };
-      await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-      res.json({
-        from, to, officer_id_filter: officerId,
-        days: out,
-        generated_at: new Date().toISOString(),
-      });
+        };
+        await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+        res.json({
+          from, to, officer_id_filter: officerId,
+          days: out,
+          generated_at: new Date().toISOString(),
+        });
+      } finally {
+        releaseSeriesSlot();
+      }
     } catch (err) {
       console.error('[mega-report/series] failed:', err);
       res.status(500).json({ error: err.message });
