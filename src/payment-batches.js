@@ -246,8 +246,11 @@ export function mountPaymentBatchesApi(app, deps) {
       // 10–30 QB queries (Payment + CreditMemo paginated per chunk of 50
       // customers) and adds 1–3 minutes to a dry-run that isn't going to
       // write anything anyway. Real runs still get the full safety net.
+      // tickName for created_by attribution — heisenberg / meru0300 / etc.
+      // Defaults to 'heisenberg' for ad-hoc fires that omit tick_name.
+      const tickName = String(req.body?.tick_name || 'heisenberg').toLowerCase();
       const result = await prepareAutoUpload({
-        channel, sinceIso, untilIso, asOf,
+        channel, sinceIso, untilIso, asOf, tickName,
         qbPreflightDedup: dryRun ? null : qbPreflightDedup,
       });
       if (result.skipped) {
@@ -4462,7 +4465,7 @@ async function captureInvoiceSnapshot(asOf, arrears) {
   return ins.rows[0].id;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
@@ -4852,7 +4855,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
        ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [idem, snapshotId, invoiceSnapshotId, cfg.sheetId, cfg.tab, channel, bankRefs,
        round2(sheetSum), round2(sumPaid), round2(sumUnused),
-       paid.length, unused.length, `auto-upload`],
+       paid.length, unused.length, `auto-upload:${tickName || 'unknown'}`],
     );
     batchId = ins.rows[0].id;
     // Build ref → sheet-time map so we can populate consumed_transactions.sheet_ts
