@@ -6,13 +6,17 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Undo2, RefreshCw, AlertCircle, Download, Database } from 'lucide-react';
+import { Undo2, RefreshCw, AlertCircle, Download, Database, FileSpreadsheet, FileText, History, ShieldAlert } from 'lucide-react';
 import {
   getBatch,
+  getBatchInvoicesSnapshot,
   recallBatch,
   type PaymentBatchRow,
   type PaymentUploadRow,
   type ArrearsSnapshotSummary,
+  type InvoiceSnapshotSummary,
+  type BatchLogEntry,
+  type SkippedDuplicateRow,
 } from '@/lib/brain-api';
 
 function fmt(n: number | string | null | undefined): string {
@@ -35,8 +39,15 @@ function statusVariant(s: string): 'default' | 'secondary' | 'destructive' | 'ou
   }
 }
 
-function downloadCsv(filename: string, rows: PaymentUploadRow[]) {
-  const header = ['bank_ref', 'customer_name', 'customer_id', 'invoice_no', 'amount', 'memo', 'status'];
+// SaasAnt-shaped Payment CSV.
+// Header + per-row format matches paidpaid.csv / unused.csv exactly. Used so
+// re-uploading via SaasAnt works without column re-mapping.
+function saasantCsv(filename: string, rows: PaymentUploadRow[], paymentDate: string, kind: 'paid' | 'unused') {
+  const header = [
+    'Payment Date', 'Customer', 'Payment Method', 'Deposit To Account Name',
+    'Invoice No', 'Journal No', 'Amount', 'Reference No', 'Memo',
+    'Country Code', 'Exchange Rate',
+  ];
   const escape = (v: string | number | null | undefined) => {
     if (v == null) return '';
     const s = String(v);
@@ -45,7 +56,17 @@ function downloadCsv(filename: string, rows: PaymentUploadRow[]) {
   const lines = [header.join(',')];
   for (const r of rows) {
     lines.push([
-      r.bank_ref, r.customer_name, r.customer_id, r.invoice_no, r.amount, r.memo, r.status,
+      paymentDate,
+      r.customer_name || r.customer_id || '',
+      'Cash',
+      'Kijichi Collection AC',
+      kind === 'paid' ? (r.invoice_no || '') : '',
+      '',
+      Number(r.amount) || 0,
+      '',
+      r.memo || r.bank_ref || '',
+      '',
+      '',
     ].map(escape).join(','));
   }
   const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
@@ -55,13 +76,36 @@ function downloadCsv(filename: string, rows: PaymentUploadRow[]) {
   URL.revokeObjectURL(url);
 }
 
+// Open-Invoices snapshot XLS (matches QB Account-QuickReport export shape).
+// Header row, column row, then data rows. Uses xlsx lib (dynamic import so
+// the bundle stays small for users who never download).
+async function downloadInvoicesXls(
+  filename: string,
+  data: Array<{ qbId: string; date: string; no: string; customer: string; memo?: string; balance: number; amount: number; status: string }>,
+  dateRangeHeader: string,
+) {
+  const XLSX = await import('xlsx');
+  const aoa: (string | number)[][] = [
+    [dateRangeHeader, '', '', '', '', '', '', ''],
+    ['Date', 'Type', 'No.', 'Customer', 'Memo', 'Balance', 'Amount', 'Status'],
+    ...data.map((r) => [r.date || '', 'Invoice', r.no || '', r.customer || '', r.memo || '', r.balance, r.amount, r.status || '']),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Open Invoices');
+  XLSX.writeFile(wb, filename);
+}
+
 export function PaymentBatchDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [batch, setBatch] = useState<PaymentBatchRow | null>(null);
   const [uploads, setUploads] = useState<PaymentUploadRow[]>([]);
   const [snapshot, setSnapshot] = useState<ArrearsSnapshotSummary | null>(null);
+  const [invoiceSnapshot, setInvoiceSnapshot] = useState<InvoiceSnapshotSummary | null>(null);
+  const [skippedDups, setSkippedDups] = useState<SkippedDuplicateRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [recalling, setRecalling] = useState(false);
+  const [downloadingXls, setDownloadingXls] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -71,6 +115,8 @@ export function PaymentBatchDetailPage() {
       setBatch(r.batch);
       setUploads(r.uploads);
       setSnapshot(r.snapshot);
+      setInvoiceSnapshot(r.invoice_snapshot);
+      setSkippedDups(r.skipped_duplicates || []);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -78,6 +124,22 @@ export function PaymentBatchDetailPage() {
       setLoading(false);
     }
   }, [id]);
+
+  const fireInvoicesXlsDownload = useCallback(async () => {
+    if (!id || !batch || !invoiceSnapshot) return;
+    setDownloadingXls(true);
+    try {
+      const r = await getBatchInvoicesSnapshot(id);
+      const fname = `open-invoices-${invoiceSnapshot.as_of}-${batch.channel}.xls`;
+      const header = invoiceSnapshot.date_range_header
+        || `Type: Invoices Status: Open Delivery Method: Any Date: 2026-01-01 - ${invoiceSnapshot.as_of}`;
+      await downloadInvoicesXls(fname, r.snapshot.data || [], header);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDownloadingXls(false);
+    }
+  }, [id, batch, invoiceSnapshot]);
 
   useEffect(() => {
     void refresh();
@@ -108,6 +170,21 @@ export function PaymentBatchDetailPage() {
   const paid = uploads.filter((u) => u.kind === 'payment' && u.status !== 'unmatched');
   const creditsMatched = uploads.filter((u) => u.kind === 'credit_memo' && u.status !== 'unmatched');
   const unmatched = uploads.filter((u) => u.status === 'unmatched');
+  const logs: BatchLogEntry[] = (batch?.logs as BatchLogEntry[] | undefined) || [];
+
+  // SaasAnt CSV requires a Payment Date column in MM-DD-YYYY format. We
+  // derive it from the batch's finalize timestamp (closest stand-in for
+  // "when this batch was actually pushed"). Once payment_batches.txn_date
+  // is exposed in the API we'll switch to that.
+  const paymentDateForCsv = (() => {
+    const d = new Date(batch?.finalized_at || batch?.created_at || Date.now());
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${mm}-${dd}-${d.getFullYear()}`;
+  })();
+
+  // Derive a short tick-name chip from created_by ("auto-upload:meru0300" → "meru0300")
+  const tickChip = (batch?.created_by || '').replace(/^auto-upload:?/, '') || '—';
 
   return (
     <Fragment>
@@ -157,7 +234,10 @@ export function PaymentBatchDetailPage() {
                 <div><div className="text-muted-foreground">Unused total</div><div className="font-medium text-lg tabular-nums">{fmt(batch.unused_total)} TZS</div></div>
                 <div><div className="text-muted-foreground">Sheet sum (BRAIN check)</div><div className="font-medium text-lg tabular-nums">{fmt(batch.sheet_total)} TZS</div></div>
                 <div><div className="text-muted-foreground">Rows</div><div className="font-medium text-lg">{batch.paid_count} paid · {batch.unused_count} unused</div></div>
-                <div><div className="text-muted-foreground">Created by</div><div className="font-medium">{batch.created_by || '—'}</div></div>
+                <div><div className="text-muted-foreground">Fired by</div><div className="font-medium flex items-center gap-2">
+                  <Badge variant="primary" className="uppercase text-[10px]">{tickChip}</Badge>
+                  <span className="text-xs text-muted-foreground">{batch.created_by || '—'}</span>
+                </div></div>
                 {batch.finalized_at && <div><div className="text-muted-foreground">Finalized</div><div className="font-medium">{new Date(batch.finalized_at).toLocaleString()}</div></div>}
                 {batch.recalled_at && <div><div className="text-muted-foreground">Recalled</div><div className="font-medium">{new Date(batch.recalled_at).toLocaleString()}</div></div>}
                 {batch.recalled_by && <div><div className="text-muted-foreground">Recalled by</div><div className="font-medium">{batch.recalled_by}</div></div>}
@@ -203,6 +283,53 @@ export function PaymentBatchDetailPage() {
           </Card>
         )}
 
+        {invoiceSnapshot && (
+          <Card className="mb-4 border-blue-500/30">
+            <CardHeader>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    <FileSpreadsheet className="size-4 text-blue-600" />
+                    QB Open-Invoices snapshot (used at allocation time)
+                  </CardTitle>
+                  <CardDescription>
+                    {invoiceSnapshot.date_range_header || `As of ${invoiceSnapshot.as_of}`} — captured{' '}
+                    {new Date(invoiceSnapshot.captured_at).toLocaleString()}
+                  </CardDescription>
+                </div>
+                <Button
+                  variant="primary"
+                  onClick={fireInvoicesXlsDownload}
+                  disabled={downloadingXls || invoiceSnapshot.invoice_count === 0}
+                >
+                  <FileSpreadsheet className="size-4" />
+                  {downloadingXls ? 'Building XLS…' : 'Download invoices.xls'}
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div>
+                  <div className="text-muted-foreground">Invoices in snapshot</div>
+                  <div className="font-semibold text-lg tabular-nums">{fmt(invoiceSnapshot.invoice_count)}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Total open balance</div>
+                  <div className="font-semibold text-lg tabular-nums">{fmt(invoiceSnapshot.total_balance)} TZS</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">As of</div>
+                  <div className="font-medium">{invoiceSnapshot.as_of}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Snapshot id</div>
+                  <div className="font-mono text-xs">{invoiceSnapshot.id.slice(0, 8)}</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         <Card className="mb-4">
           <CardHeader>
             <div className="flex items-center justify-between gap-2">
@@ -213,7 +340,7 @@ export function PaymentBatchDetailPage() {
               {paid.length > 0 && (
                 <Button
                   variant="outline"
-                  onClick={() => downloadCsv(`paid-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, paid)}
+                  onClick={() => saasantCsv(`paidpaid-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, paid, paymentDateForCsv, 'paid')}
                 >
                   <Download className="size-4" />
                   Export CSV
@@ -266,7 +393,7 @@ export function PaymentBatchDetailPage() {
               {creditsMatched.length > 0 && (
                 <Button
                   variant="outline"
-                  onClick={() => downloadCsv(`credit-memos-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, creditsMatched)}
+                  onClick={() => saasantCsv(`unused-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, creditsMatched, paymentDateForCsv, 'unused')}
                 >
                   <Download className="size-4" />
                   Export CSV
@@ -319,7 +446,7 @@ export function PaymentBatchDetailPage() {
               {unmatched.length > 0 && (
                 <Button
                   variant="outline"
-                  onClick={() => downloadCsv(`unmatched-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, unmatched)}
+                  onClick={() => saasantCsv(`unmatched-${batch?.id.slice(0,8)}-${batch?.channel}.csv`, unmatched, paymentDateForCsv, 'unused')}
                 >
                   <Download className="size-4" />
                   Export CSV
@@ -355,6 +482,92 @@ export function PaymentBatchDetailPage() {
             </Table>
             {unmatched.length > 500 && (
               <div className="text-sm text-muted-foreground mt-2">Showing first 500 of {unmatched.length}. Use Export CSV for the full list.</div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 border-slate-400/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <ShieldAlert className="size-4 text-slate-500" />
+              Skipped QB duplicates ({skippedDups.length})
+            </CardTitle>
+            <CardDescription>
+              Refs that BRAIN's pre-flight found ALREADY in QB (from SaasAnt, the manual transaction processor, or a prior BRAIN run). These were grey-painted on the sheet and excluded from this batch — no QB Payment was created for them here.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Bank ref</TableHead>
+                  <TableHead>QB id</TableHead>
+                  <TableHead>QB kind</TableHead>
+                  <TableHead>QB TxnDate</TableHead>
+                  <TableHead>Detected at</TableHead>
+                  <TableHead>Source</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {skippedDups.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={6} className="text-center text-muted-foreground">
+                      None — every ref in this window was fresh.
+                    </TableCell>
+                  </TableRow>
+                )}
+                {skippedDups.slice(0, 300).map((s) => (
+                  <TableRow key={`${s.bank_ref}-${s.customer_id}`}>
+                    <TableCell className="font-mono text-xs">{s.bank_ref}</TableCell>
+                    <TableCell className="font-mono text-xs">{s.qb_id}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{s.qb_kind}</Badge>
+                    </TableCell>
+                    <TableCell>{s.qb_txn_date || '—'}</TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{new Date(s.found_at).toLocaleString()}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{s.found_by}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {skippedDups.length > 300 && (
+              <div className="text-sm text-muted-foreground mt-2">Showing 300 of {skippedDups.length}.</div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <History className="size-4 text-muted-foreground" />
+              Batch logs ({logs.length})
+            </CardTitle>
+            <CardDescription>
+              Structured trail of everything BRAIN did during this batch — start, dup-check result, each chunk's outcome, every sweep retry, finalize. Use this to debug if something looks off.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {logs.length === 0 ? (
+              <div className="text-sm text-muted-foreground py-6 text-center">No logs recorded for this batch.</div>
+            ) : (
+              <div className="space-y-2 max-h-[480px] overflow-y-auto">
+                {logs.map((e, i) => (
+                  <div key={i} className="flex gap-3 items-start text-sm border-b last:border-b-0 pb-2">
+                    <Badge
+                      variant={e.level === 'error' ? 'destructive' : e.level === 'warn' ? 'secondary' : 'outline'}
+                      className="shrink-0 mt-0.5 uppercase text-[10px]"
+                    >
+                      {e.level}
+                    </Badge>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-mono text-xs text-muted-foreground">
+                        {new Date(e.ts).toLocaleString()} · {e.source}
+                      </div>
+                      <div className="whitespace-pre-wrap break-words">{e.message}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </CardContent>
         </Card>

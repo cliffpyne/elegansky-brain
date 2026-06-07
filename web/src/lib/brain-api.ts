@@ -109,6 +109,47 @@ export interface PaymentBatchRow {
   created_by: string | null;
   recalled_by: string | null;
   failure_reason: string | null;
+  invoice_snapshot_id?: string | null;
+  logs?: BatchLogEntry[];
+}
+
+export interface BatchLogEntry {
+  ts: string;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  source: string;
+  [extra: string]: unknown;
+}
+
+export interface InvoiceSnapshotSummary {
+  id: string;
+  as_of: string;
+  captured_at: string;
+  invoice_count: number;
+  total_balance: number | string;
+  date_range_header: string | null;
+}
+
+export interface InvoiceSnapshotRow {
+  qbId: string;
+  date: string;
+  dueDate?: string;
+  no: string;
+  customer: string;
+  memo?: string;
+  balance: number;
+  amount: number;
+  status: string;
+}
+
+export interface SkippedDuplicateRow {
+  bank_ref: string;
+  customer_id: string;
+  qb_id: string;
+  qb_kind: 'payment' | 'credit_memo';
+  qb_txn_date: string | null;
+  found_at: string;
+  found_by: string;
 }
 
 export interface PaymentUploadRow {
@@ -150,9 +191,19 @@ export async function getBatch(id: string): Promise<{
   batch: PaymentBatchRow;
   uploads: PaymentUploadRow[];
   snapshot: ArrearsSnapshotSummary | null;
+  invoice_snapshot: InvoiceSnapshotSummary | null;
+  skipped_duplicates: SkippedDuplicateRow[];
 }> {
   const r = await authed(`/api/payment-batches/${id}`);
   if (!r.ok) throw new Error(`getBatch ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+export async function getBatchInvoicesSnapshot(id: string): Promise<{
+  snapshot: InvoiceSnapshotSummary & { data: InvoiceSnapshotRow[] };
+}> {
+  const r = await authed(`/api/payment-batches/${id}/invoices.json`);
+  if (!r.ok) throw new Error(`getBatchInvoicesSnapshot ${r.status}: ${await r.text()}`);
   return r.json();
 }
 

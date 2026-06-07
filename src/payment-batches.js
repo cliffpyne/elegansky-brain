@@ -674,16 +674,71 @@ export function mountPaymentBatchesApi(app, deps) {
         `SELECT * FROM payment_uploads WHERE batch_id=$1 ORDER BY kind, created_at`,
         [req.params.id],
       );
-      // Snapshot summary (row_count + total_balance + as_of). Heavy data is
-      // omitted by default; client can pass ?include_snapshot=full to get it.
+      // Arrears snapshot summary (heavy data omitted unless include_snapshot=full)
       const sn = await db().query(
         `SELECT id, as_of, row_count, total_balance, created_at,
                 ${req.query.include_snapshot === 'full' ? 'data' : 'NULL::jsonb as data'}
            FROM arrears_snapshots WHERE id=$1`,
         [batch.arrears_snapshot_id],
       );
-      res.json({ batch, uploads: u.rows, snapshot: sn.rows[0] || null });
+      // Invoice snapshot (the QB Open-Invoices universe at AS_OF time).
+      // Summary fields only by default — pull full data via the dedicated
+      // /invoices.xls endpoint when the operator clicks download.
+      let invoiceSnapshot = null;
+      if (batch.invoice_snapshot_id) {
+        const ivs = await db().query(
+          `SELECT id, as_of, captured_at, invoice_count, total_balance, date_range_header
+             FROM invoice_snapshots WHERE id=$1`,
+          [batch.invoice_snapshot_id],
+        );
+        invoiceSnapshot = ivs.rows[0] || null;
+      }
+      // Skipped QB duplicates discovered during this batch's pre-flight.
+      // We don't have a direct FK from external_consumed_refs to batch — we
+      // surface ALL refs found_by this batch's channel since the batch was
+      // created. Practical heuristic; cleaner shape comes in a follow-up.
+      const sk = await db().query(
+        `SELECT bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, found_at, found_by
+           FROM external_consumed_refs
+          WHERE found_by LIKE $1 AND found_at >= $2 AND found_at <= $3
+          ORDER BY found_at DESC
+          LIMIT 5000`,
+        [
+          `auto-upload-${batch.channel}-dup-check%`,
+          new Date(new Date(batch.created_at).getTime() - 60_000),
+          new Date(new Date(batch.finalized_at || batch.created_at).getTime() + 5 * 60_000),
+        ],
+      );
+      res.json({
+        batch,
+        uploads: u.rows,
+        snapshot: sn.rows[0] || null,
+        invoice_snapshot: invoiceSnapshot,
+        skipped_duplicates: sk.rows,
+      });
     } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── GET /api/payment-batches/:id/invoices.json ──────────────────────────
+  // Full invoice snapshot data (the QB Open Invoices universe at AS_OF).
+  // Dashboard fetches this then exports as .xls client-side using the
+  // existing xlsx package — same pattern as /arrears page.
+  app.get('/api/payment-batches/:id/invoices.json', requireSupabaseJwt, async (req, res) => {
+    try {
+      const r = await db().query(
+        `SELECT iv.id, iv.as_of, iv.invoice_count, iv.total_balance,
+                iv.date_range_header, iv.data, iv.captured_at
+           FROM payment_batches pb
+           JOIN invoice_snapshots iv ON pb.invoice_snapshot_id = iv.id
+          WHERE pb.id = $1`,
+        [req.params.id],
+      );
+      if (!r.rows.length) return res.status(404).json({ error: 'invoice snapshot not found for this batch' });
+      res.json({ snapshot: r.rows[0] });
+    } catch (err) {
+      console.error('[GET /api/payment-batches/:id/invoices.json]', err);
       res.status(500).json({ error: err.message });
     }
   });
