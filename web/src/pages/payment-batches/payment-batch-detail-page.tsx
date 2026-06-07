@@ -202,11 +202,15 @@ export function PaymentBatchDetailPage() {
   const unmatchedPg = usePaged(unmatched);
   const dupsPg = usePaged(skippedDups);
 
-  // SaasAnt CSV requires a Payment Date column in MM-DD-YYYY format. We
-  // derive it from the batch's finalize timestamp (closest stand-in for
-  // "when this batch was actually pushed"). Once payment_batches.txn_date
-  // is exposed in the API we'll switch to that.
+  // SaasAnt Payment Date — MM-DD-YYYY. PREFER the batch's stored
+  // txn_date (the date the operator chose at fire time). Fallback to
+  // finalized_at for legacy batches that pre-date the txn_date column.
   const paymentDateForCsv = (() => {
+    if (batch?.txn_date) {
+      // batch.txn_date is "YYYY-MM-DD" from Postgres date column
+      const m = batch.txn_date.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${m[2]}-${m[3]}-${m[1]}`;
+    }
     const d = new Date(batch?.finalized_at || batch?.created_at || Date.now());
     const mm = String(d.getMonth() + 1).padStart(2, '0');
     const dd = String(d.getDate()).padStart(2, '0');

@@ -251,6 +251,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const tickName = String(req.body?.tick_name || 'heisenberg').toLowerCase();
       const result = await prepareAutoUpload({
         channel, sinceIso, untilIso, asOf, tickName,
+        txnDate: txnDateOverride,
         qbPreflightDedup: dryRun ? null : qbPreflightDedup,
       });
       if (result.skipped) {
@@ -4582,7 +4583,7 @@ async function captureInvoiceSnapshot(asOf, arrears) {
   return ins.rows[0].id;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
@@ -4977,11 +4978,11 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
          idempotency_key, status, arrears_snapshot_id, invoice_snapshot_id,
          sheet_id, sheet_tab, channel, bank_refs,
          sheet_total, paid_total, unused_total,
-         paid_count, unused_count, created_by
-       ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+         paid_count, unused_count, created_by, txn_date
+       ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
       [idem, snapshotId, invoiceSnapshotId, cfg.sheetId, cfg.tab, channel, bankRefs,
        round2(sheetSum), round2(sumPaid), round2(sumUnused),
-       paid.length, unused.length, `auto-upload:${tickName || 'unknown'}`],
+       paid.length, unused.length, `auto-upload:${tickName || 'unknown'}`, txnDate || null],
     );
     batchId = ins.rows[0].id;
     // Build ref → sheet-time map so we can populate consumed_transactions.sheet_ts

@@ -110,6 +110,7 @@ export interface PaymentBatchRow {
   recalled_by: string | null;
   failure_reason: string | null;
   invoice_snapshot_id?: string | null;
+  txn_date?: string | null;
   logs?: BatchLogEntry[];
 }
 
