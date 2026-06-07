@@ -211,15 +211,15 @@ export function AdminSmsPage() {
         </div>
 
         <Card>
-          <CardHeader className="border-b">
+          <CardHeader className="border-b flex-col items-start gap-1 py-4">
             <CardTitle>Recent messages</CardTitle>
-            <CardDescription>
+            <CardDescription className="mt-0">
               Latest queued/sent notifications. The relay phone APK polls
               <code className="mx-1 select-text">/api/admin-sms/pending</code> and acks each one
               after sending — <span className="font-medium">pending</span> means the APK hasn't picked it up yet.
             </CardDescription>
           </CardHeader>
-          <CardContent className="p-0">
+          <CardContent className="p-0 pt-2">
             {loading ? (
               <p className="text-sm text-muted-foreground px-5 py-8 text-center">Loading…</p>
             ) : messages.length === 0 ? (
@@ -268,7 +268,7 @@ export function AdminSmsPage() {
               </Table>
             )}
           </CardContent>
-          {messages.length > MESSAGES_PAGE_SIZE && (
+          {messages.length > 0 && (
             <div className="flex items-center justify-between border-t px-5 py-3 text-sm">
               <span className="text-muted-foreground">
                 Showing {msgPage * MESSAGES_PAGE_SIZE + 1}–{Math.min((msgPage + 1) * MESSAGES_PAGE_SIZE, messages.length)} of {messages.length.toLocaleString()}
