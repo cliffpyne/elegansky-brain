@@ -4343,17 +4343,24 @@ function processInvoicePayments(invoices, transactions) {
 // Scan QB for any of the supplied suffixed bank_refs that already exist as
 // Payment OR CreditMemo PrivateNotes within the last `daysBack` days.
 //
-// Returns Map<suffixed_ref, { qb_id, qb_kind, customer_id, txn_date }>.
+// CRITICAL (Frank 2026-06-07): match BOTH the bare ref AND the
+// channel-suffixed form. Manual QB entries (typed directly by operator)
+// have NO suffix; SaasAnt + BRAIN entries DO. We need to catch both.
 //
-// One paginated scan per kind (Payment + CreditMemo) — typically 2-5 QB
-// queries total, regardless of how many wanted refs. The scan can be heavy
-// on QB if the date window is wide; default 60 days is enough to catch any
-// realistic SaasAnt/manual residue while staying cheap.
+// wantedBareRefs: bare bank refs straight from the sheet (no suffix)
+// channelSuffix:  'N' | 'B' | 'P' | '' (the channel's letter)
+// Returns Map<bare_ref, { qb_id, qb_kind, customer_id, txn_date, matched_form }>.
+//   matched_form = 'bare' | 'suffixed' (which form QB had it in)
 //
-// Used by prepareAutoUpload's dup-check step (Frank 2026-06-07).
-async function scanQbForRefDuplicates(wantedSuffixedRefs, daysBack = 60) {
-  if (!wantedSuffixedRefs || wantedSuffixedRefs.length === 0) return new Map();
-  const wantedSet = new Set(wantedSuffixedRefs);
+// Used by prepareAutoUpload's dup-check step.
+async function scanQbForRefDuplicates(wantedBareRefs, channelSuffix, daysBack = 60) {
+  if (!wantedBareRefs || wantedBareRefs.length === 0) return new Map();
+  const bareSet = new Set(wantedBareRefs);
+  // suffixedToBare: 'XYZ123N' → 'XYZ123' (lets us O(1) recognise suffixed hits)
+  const suffixedToBare = new Map();
+  if (channelSuffix) {
+    for (const r of wantedBareRefs) suffixedToBare.set(r + channelSuffix, r);
+  }
   const fromDate = new Date(Date.now() - daysBack * 24 * 60 * 60_000).toISOString().slice(0, 10);
   const hits = new Map();
   for (const kind of ['Payment', 'CreditMemo']) {
@@ -4369,14 +4376,20 @@ async function scanQbForRefDuplicates(wantedSuffixedRefs, daysBack = 60) {
       if (!rows.length) break;
       for (const row of rows) {
         const pn = String(row.PrivateNote || '').trim();
-        if (!pn || !wantedSet.has(pn)) continue;
+        if (!pn) continue;
+        let bare = null;
+        let matchedForm = null;
+        if (bareSet.has(pn)) { bare = pn; matchedForm = 'bare'; }
+        else if (suffixedToBare.has(pn)) { bare = suffixedToBare.get(pn); matchedForm = 'suffixed'; }
+        if (!bare) continue;
         // Skip voided rows (TotalAmt=0 typically means a voided Payment in QB).
         if (kind === 'Payment' && Number(row.TotalAmt || 0) === 0) continue;
-        hits.set(pn, {
+        hits.set(bare, {
           qb_id: String(row.Id),
           qb_kind: kind === 'CreditMemo' ? 'credit_memo' : 'payment',
           customer_id: String(row.CustomerRef?.value || ''),
           txn_date: row.TxnDate || null,
+          matched_form: matchedForm,
         });
       }
       if (rows.length < PAGE) break;
@@ -4625,46 +4638,57 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
 
   // 2b. QB dup-check (Frank 2026-06-07): scan QB Payments + CreditMemos
   // for any ref already pushed from SaasAnt / CASTOR manual processor /
-  // prior BRAIN run whose consumed_transactions got cleaned up. Match is
-  // exact-string on PrivateNote — all 3 sources use the same suffixed-ref
-  // format (<bare_ref><B|P|N>). Hits get:
+  // manual QB entry / prior BRAIN run whose consumed_transactions got
+  // cleaned up. Match is EITHER the bare ref OR the channel-suffixed
+  // form — manual QB entries usually have NO suffix, while SaasAnt +
+  // BRAIN entries DO. The helper handles both.
+  // Hits get:
   //   - persisted to external_consumed_refs (future fires skip without
-  //     hitting QB again)
+  //     hitting QB again — stored in the SUFFIXED form so the existing
+  //     consumed_transactions / external_consumed_refs check at L4527
+  //     picks them up via the same allRefs key)
   //   - sheet row painted GREY + Column L = "QB_DUPLICATE <qb_id>"
   //   - excluded from this batch
   // If ALL refs in the window turn out to be QB dups, we skip the batch
   // entirely (no Payment created, no consumed_transactions inserted) —
   // the next window (e.g. meru0300's window 2) fires normally.
   try {
-    const wantedRefs = txnsClean.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
-    const qbDupHits = await scanQbForRefDuplicates(wantedRefs, 60);
+    const wantedBareRefs = txnsClean.map((t) => t.transactionId).filter(Boolean);
+    const chSuffix = suffixOf(channel);
+    const qbDupHits = await scanQbForRefDuplicates(wantedBareRefs, chSuffix, 60);
     if (qbDupHits.size > 0) {
       const dupRowMap = new Map();
       for (const t of txnsClean) {
-        const sref = appendSuf(t.transactionId, channel);
-        const hit = qbDupHits.get(sref);
+        const bareRef = t.transactionId;
+        const hit = qbDupHits.get(bareRef);
         if (!hit) continue;
         if (t.sheet_row_number) dupRowMap.set(t.sheet_row_number, hit.qb_id);
+        // Store the SUFFIXED form in external_consumed_refs so the upstream
+        // consumed_transactions / external_consumed_refs filter picks it up
+        // on the next fire without needing another QB query.
+        const sref = appendSuf(bareRef, channel);
         await db().query(
           `INSERT INTO external_consumed_refs (bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, found_by)
            VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (bank_ref, customer_id) DO NOTHING`,
-          [sref, hit.customer_id || 'unknown', hit.qb_id, hit.qb_kind, hit.txn_date || null, `auto-upload-${channel}-dup-check`],
+          [sref, hit.customer_id || 'unknown', hit.qb_id, hit.qb_kind, hit.txn_date || null, `auto-upload-${channel}-dup-check:${hit.matched_form}`],
         );
       }
       if (dupRowMap.size > 0 && cfg.sheetId && cfg.tab) {
         try {
           await markSheetRowsAsQbDuplicate(cfg.sheetId, cfg.tab, dupRowMap);
-          console.log(`[qb-dup-check] ${channel}: ${dupRowMap.size} rows marked grey + saved to external_consumed_refs`);
+          const bareCnt = [...qbDupHits.values()].filter((h) => h.matched_form === 'bare').length;
+          const sufCnt = [...qbDupHits.values()].filter((h) => h.matched_form === 'suffixed').length;
+          console.log(`[qb-dup-check] ${channel}: ${dupRowMap.size} rows grey (${bareCnt} bare-match = manual, ${sufCnt} suffixed-match = SaasAnt/BRAIN)`);
         } catch (e) {
           console.error('[qb-dup-check] sheet marking failed (non-fatal):', e.message);
         }
       }
-      txnsClean = txnsClean.filter((t) => !qbDupHits.has(appendSuf(t.transactionId, channel)));
+      txnsClean = txnsClean.filter((t) => !qbDupHits.has(t.transactionId));
       if (txnsClean.length === 0) {
         return {
           skipped: true,
-          reason: `all ${qbDupHits.size} refs already in QB (SaasAnt/manual/prior BRAIN) — marked grey + persisted to external_consumed_refs`,
+          reason: `all ${qbDupHits.size} refs already in QB — marked grey + persisted`,
           qb_duplicates: qbDupHits.size,
         };
       }
