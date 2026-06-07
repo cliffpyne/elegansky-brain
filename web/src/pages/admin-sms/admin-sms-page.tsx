@@ -1,10 +1,11 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Toolbar, ToolbarHeading } from '@/layouts/demo1/components/toolbar';
 import { Container } from '@/components/common/container';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Save, RefreshCw } from 'lucide-react';
 import { getSetting, setSetting } from '@/lib/brain-api';
@@ -134,8 +135,8 @@ export function AdminSmsPage() {
             <CardContent className="pt-6 text-destructive">{error}</CardContent>
           </Card>
         )}
-        <div className="grid gap-4 md:grid-cols-2">
-          <Card>
+        <div className="grid gap-5 md:grid-cols-2 items-stretch">
+          <Card className="flex flex-col h-full">
             <CardHeader>
               <CardTitle>Admin phone numbers</CardTitle>
               <CardDescription>
@@ -144,12 +145,21 @@ export function AdminSmsPage() {
                 always-online relay phone.
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-3">
-              <Input
-                placeholder="+255712345678, +255712345679"
-                value={phones}
-                onChange={(e) => setPhones(e.target.value)}
-              />
+            <CardContent className="grow space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="admin-phones">Phone numbers</Label>
+                <Input
+                  id="admin-phones"
+                  placeholder="+255712345678, +255712345679"
+                  value={phones}
+                  onChange={(e) => setPhones(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Separate multiple numbers with a comma.
+                </p>
+              </div>
+            </CardContent>
+            <CardFooter className="border-t justify-end gap-2">
               <Button
                 onClick={savePhones}
                 disabled={savingPhones || phones === phonesSaved}
@@ -157,10 +167,10 @@ export function AdminSmsPage() {
               >
                 <Save className="size-4" /> Save
               </Button>
-            </CardContent>
+            </CardFooter>
           </Card>
 
-          <Card>
+          <Card className="flex flex-col h-full">
             <CardHeader>
               <CardTitle>Test a notification</CardTitle>
               <CardDescription>
@@ -168,27 +178,35 @@ export function AdminSmsPage() {
                 report secret — paste it below (it's used here in your browser only).
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-3">
-              <Input
-                type="password"
-                placeholder="X-Report-Secret"
-                value={secret}
-                onChange={(e) => setSecret(e.target.value)}
-              />
-              <Input
-                placeholder="Message body"
-                value={testMsg}
-                onChange={(e) => setTestMsg(e.target.value)}
-              />
-              <div className="flex gap-2">
-                <Button onClick={fireTest} disabled={!secret} size="sm">
-                  Send test
-                </Button>
-                <Button variant="outline" size="sm" onClick={refresh}>
-                  <RefreshCw className="size-4" /> Refresh
-                </Button>
+            <CardContent className="grow space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="report-secret">Report secret</Label>
+                <Input
+                  id="report-secret"
+                  type="password"
+                  placeholder="X-Report-Secret"
+                  value={secret}
+                  onChange={(e) => setSecret(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="test-message">Message body</Label>
+                <Input
+                  id="test-message"
+                  placeholder="Test ping from BRAIN"
+                  value={testMsg}
+                  onChange={(e) => setTestMsg(e.target.value)}
+                />
               </div>
             </CardContent>
+            <CardFooter className="border-t justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={refresh}>
+                <RefreshCw className="size-4" /> Refresh
+              </Button>
+              <Button onClick={fireTest} disabled={!secret} size="sm">
+                Send test
+              </Button>
+            </CardFooter>
           </Card>
         </div>
 
