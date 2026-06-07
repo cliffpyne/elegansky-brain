@@ -96,6 +96,32 @@ async function downloadInvoicesXls(
   XLSX.writeFile(wb, filename);
 }
 
+const PAGE_SIZE = 25;
+
+function usePaged<T>(rows: T[]) {
+  const [page, setPage] = useState(0);
+  const start = page * PAGE_SIZE;
+  const pageRows = rows.slice(start, start + PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  return { pageRows, page, setPage, totalPages, start };
+}
+
+function TablePager({ total, start, page, totalPages, setPage }: { total: number; start: number; page: number; totalPages: number; setPage: (n: number) => void }) {
+  if (total <= PAGE_SIZE) return null;
+  return (
+    <div className="flex items-center justify-between border-t px-5 py-3 text-sm">
+      <span className="text-muted-foreground">
+        Showing {start + 1}–{Math.min(start + PAGE_SIZE, total)} of {total.toLocaleString()}
+      </span>
+      <div className="flex items-center gap-2">
+        <Button variant="outline" size="sm" onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}>Previous</Button>
+        <span className="text-xs text-muted-foreground tabular-nums">{page + 1} / {totalPages}</span>
+        <Button variant="outline" size="sm" onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}>Next</Button>
+      </div>
+    </div>
+  );
+}
+
 export function PaymentBatchDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [batch, setBatch] = useState<PaymentBatchRow | null>(null);
@@ -171,6 +197,10 @@ export function PaymentBatchDetailPage() {
   const creditsMatched = uploads.filter((u) => u.kind === 'credit_memo' && u.status !== 'unmatched');
   const unmatched = uploads.filter((u) => u.status === 'unmatched');
   const logs: BatchLogEntry[] = (batch?.logs as BatchLogEntry[] | undefined) || [];
+  const paidPg = usePaged(paid);
+  const creditsPg = usePaged(creditsMatched);
+  const unmatchedPg = usePaged(unmatched);
+  const dupsPg = usePaged(skippedDups);
 
   // SaasAnt CSV requires a Payment Date column in MM-DD-YYYY format. We
   // derive it from the batch's finalize timestamp (closest stand-in for
@@ -242,11 +272,21 @@ export function PaymentBatchDetailPage() {
                 {batch.recalled_at && <div><div className="text-muted-foreground">Recalled</div><div className="font-medium">{new Date(batch.recalled_at).toLocaleString()}</div></div>}
                 {batch.recalled_by && <div><div className="text-muted-foreground">Recalled by</div><div className="font-medium">{batch.recalled_by}</div></div>}
               </div>
-              {batch.failure_reason && (
-                <div className="mt-4 p-3 rounded-md bg-destructive/10 text-destructive text-sm">
-                  <strong>Failure reason:</strong> {batch.failure_reason}
-                </div>
-              )}
+              {batch.failure_reason && (() => {
+                // Dry-run "failure_reason" is actually the SUCCESS marker
+                // ("dry_run — no QB calls; consumed_transactions cleared...")
+                // — render it as info, not as a red destructive alert.
+                const isDryRunNote = /^dry_run\b/i.test(batch.failure_reason);
+                return (
+                  <div className={
+                    isDryRunNote
+                      ? 'mt-4 p-3 rounded-md bg-blue-500/10 text-blue-700 dark:text-blue-300 text-sm border border-blue-500/20'
+                      : 'mt-4 p-3 rounded-md bg-destructive/10 text-destructive text-sm'
+                  }>
+                    <strong>{isDryRunNote ? 'Dry-run note:' : 'Failure reason:'}</strong> {batch.failure_reason}
+                  </div>
+                );
+              })()}
             </CardContent>
           </Card>
         )}
@@ -361,24 +401,22 @@ export function PaymentBatchDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {paid.slice(0, 500).map((u) => (
+                {paidPg.pageRows.map((u) => (
                   <TableRow key={u.id}>
-                    <TableCell className="font-mono text-xs">{u.bank_ref}</TableCell>
+                    <TableCell className="pl-5 font-mono text-xs">{u.bank_ref}</TableCell>
                     <TableCell>{u.invoice_no || '—'}</TableCell>
                     <TableCell className="max-w-xs truncate" title={u.customer_name || u.customer_id}>
                       {u.customer_name || u.customer_id}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{fmt(u.amount)}</TableCell>
                     <TableCell className="font-mono text-xs">{u.qb_id || '—'}</TableCell>
-                    <TableCell><Badge variant={statusVariant(u.status)}>{u.status}</Badge></TableCell>
+                    <TableCell className="pr-5"><Badge variant={statusVariant(u.status)}>{u.status}</Badge></TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
-            {paid.length > 500 && (
-              <div className="text-sm text-muted-foreground mt-2">Showing first 500 of {paid.length} paid rows.</div>
-            )}
           </CardContent>
+          <TablePager total={paid.length} start={paidPg.start} page={paidPg.page} totalPages={paidPg.totalPages} setPage={paidPg.setPage} />
         </Card>
 
         <Card className="mb-4">
@@ -420,13 +458,13 @@ export function PaymentBatchDetailPage() {
                     </TableCell>
                   </TableRow>
                 )}
-                {creditsMatched.slice(0, 500).map((u) => (
+                {creditsPg.pageRows.map((u) => (
                   <TableRow key={u.id}>
-                    <TableCell className="font-mono text-xs">{u.bank_ref}</TableCell>
+                    <TableCell className="pl-5 font-mono text-xs">{u.bank_ref}</TableCell>
                     <TableCell className="max-w-xs truncate">{u.customer_name || u.customer_id || '—'}</TableCell>
                     <TableCell className="text-right tabular-nums">{fmt(u.amount)}</TableCell>
                     <TableCell className="font-mono text-xs">{u.qb_id || '—'}</TableCell>
-                    <TableCell><Badge variant={statusVariant(u.status)}>{u.status}</Badge></TableCell>
+                    <TableCell className="pr-5"><Badge variant={statusVariant(u.status)}>{u.status}</Badge></TableCell>
                   </TableRow>
                 ))}
               </TableBody>
