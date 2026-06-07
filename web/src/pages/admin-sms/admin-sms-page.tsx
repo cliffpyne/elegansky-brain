@@ -140,13 +140,13 @@ export function AdminSmsPage() {
         )}
         <div className="grid gap-5 md:grid-cols-2 items-start">
           <Card>
-            <CardHeader className="border-b">
+            <CardHeader className="border-b flex-col items-start gap-1.5 py-5">
               <CardTitle>Admin phone numbers</CardTitle>
-              <CardDescription>
+              <CardDescription className="mt-0">
                 Comma-separated. Every number gets an SMS when a worker cycle hits its retry limit.
               </CardDescription>
             </CardHeader>
-            <CardContent className="p-5 space-y-4">
+            <CardContent className="p-6 space-y-5">
               <div className="space-y-1.5">
                 <Label htmlFor="admin-phones" className="text-sm font-medium">Phone numbers</Label>
                 <Input
@@ -172,13 +172,13 @@ export function AdminSmsPage() {
           </Card>
 
           <Card>
-            <CardHeader className="border-b">
+            <CardHeader className="border-b flex-col items-start gap-1.5 py-5">
               <CardTitle>Test a notification</CardTitle>
-              <CardDescription>
+              <CardDescription className="mt-0">
                 Send a test SMS to every configured phone. Needs the shared report secret.
               </CardDescription>
             </CardHeader>
-            <CardContent className="p-5 space-y-4">
+            <CardContent className="p-6 space-y-5">
               <div className="space-y-1.5">
                 <Label htmlFor="report-secret" className="text-sm font-medium">Report secret</Label>
                 <Input
@@ -211,7 +211,7 @@ export function AdminSmsPage() {
         </div>
 
         <Card>
-          <CardHeader className="border-b flex-col items-start gap-1 py-4">
+          <CardHeader className="border-b flex-col items-start gap-1.5 py-5">
             <CardTitle>Recent messages</CardTitle>
             <CardDescription className="mt-0">
               Latest queued/sent notifications. The relay phone APK polls
@@ -219,7 +219,7 @@ export function AdminSmsPage() {
               after sending — <span className="font-medium">pending</span> means the APK hasn't picked it up yet.
             </CardDescription>
           </CardHeader>
-          <CardContent className="p-0 pt-2">
+          <CardContent className="p-0 pt-3">
             {loading ? (
               <p className="text-sm text-muted-foreground px-5 py-8 text-center">Loading…</p>
             ) : messages.length === 0 ? (
