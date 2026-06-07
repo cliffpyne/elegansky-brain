@@ -27,27 +27,35 @@ import {
   getOfficerArrears,
 } from './officer-reports.js';
 
-const KIJICHI_ACCOUNT_NAME = 'Kijichi Collection AC';
+// Parent + sub-accounts that operator's Account QuickReport rolls up.
+// "Elegansky Collection AC" is the parent; "Kijichi Collection AC" is the
+// active sub-account where almost all Payments + Expenses land.
+const PARENT_ACCOUNT_NAME = 'Elegansky Collection AC';
+const SUB_ACCOUNT_NAMES = ['Kijichi Collection AC'];
 
 // Channel sheet config — same sheet ids as officer-reports & payment-batches.
-// PASSED and FAILED tab names per channel.
+// Each channel has a PASSED tab, a FAILED tab, and optionally extra tabs
+// (e.g. NMB's PASSED_SAV_NMB) that we include in the totals for completeness.
 const CHANNEL_TABS = {
   nmbnew: {
     sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek',
     passed: 'PASSED',
-    failed: 'FAILED',
+    failed: 'FAILED_NMB',
+    extra: ['PASSED_SAV_NMB'],
     suffix: 'N',
   },
   bank: {
     sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o',
     passed: 'PASSED',
     failed: 'FAILED',
+    extra: [],
     suffix: 'B',
   },
   iphone_bank: {
     sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ',
     passed: 'BANK_PASSED',
     failed: 'BANK_FAILED',
+    extra: [],
     suffix: 'P',
   },
 };
@@ -70,66 +78,146 @@ function parseAmount(s) {
   return Number(String(s || '').replace(/[, ]/g, '')) || 0;
 }
 
-// ── Section A — QB Account Balance ────────────────────────────────────────
+// ── Section A — Account QuickReport-style (Beginning + credits − debits) ─
 
 /**
- * QB Balance Sheet "as of" a date → balance for one account name. We use the
- * BalanceSheet report (not GeneralLedger) because BalanceSheet returns the
- * running balance at the as-of date directly.
+ * Find the Account row's ending balance from a BalanceSheet report for one
+ * named account. Walks the nested Rows tree.
  */
-async function balanceAsOf(accountName, asOfDate) {
-  try {
-    const r = await qbReport('BalanceSheet', { date_macro: '', end_date: asOfDate, start_date: '2020-01-01' });
-    // BalanceSheet report has nested Rows; walk to find our account row.
-    const target = String(accountName).toLowerCase();
-    let found = null;
-    const walk = (node) => {
-      if (!node) return;
-      if (Array.isArray(node)) { node.forEach(walk); return; }
-      const summary = node.Summary?.ColData;
-      if (summary?.[0]?.value && String(summary[0].value).toLowerCase().includes(target)) {
-        const val = Number(summary[summary.length - 1]?.value || 0);
-        if (!isNaN(val)) found = val;
-      }
-      const rowData = node.ColData;
-      if (Array.isArray(rowData) && rowData[0]?.value && String(rowData[0].value).toLowerCase().includes(target)) {
-        const val = Number(rowData[rowData.length - 1]?.value || 0);
-        if (!isNaN(val)) found = val;
-      }
-      if (node.Rows?.Row) walk(node.Rows.Row);
-      if (node.Row) walk(node.Row);
-    };
-    walk(r?.Rows?.Row || r?.Rows || []);
-    return found;
-  } catch (err) {
-    console.error('[mega-report] balanceAsOf failed:', accountName, asOfDate, err.message);
-    return null;
-  }
+function balanceFromReport(report, accountName) {
+  const target = String(accountName).toLowerCase();
+  let found = null;
+  const walk = (node) => {
+    if (!node) return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    const summary = node.Summary?.ColData;
+    if (summary?.[0]?.value && String(summary[0].value).toLowerCase().includes(target)) {
+      const val = Number(summary[summary.length - 1]?.value || 0);
+      if (!isNaN(val)) found = val;
+    }
+    const rowData = node.ColData;
+    if (Array.isArray(rowData) && rowData[0]?.value && String(rowData[0].value).toLowerCase().includes(target)) {
+      const val = Number(rowData[rowData.length - 1]?.value || 0);
+      if (!isNaN(val)) found = val;
+    }
+    if (node.Rows?.Row) walk(node.Rows.Row);
+    if (node.Row) walk(node.Row);
+  };
+  walk(report?.Rows?.Row || report?.Rows || []);
+  return found;
 }
 
 /**
- * Section A: opening (start-of-day = end-of-prev-day), closing (end-of-day),
- * and live (now). All values are the QB account balance for Kijichi
- * Collection AC.
+ * Resolve account names → ids by querying QB Account. Returns { name → id }.
+ */
+async function getAccountIds(names) {
+  const ids = {};
+  for (const name of names) {
+    try {
+      const r = await qbQuery(`SELECT Id, Name FROM Account WHERE Name = '${name.replace(/'/g, "''")}'`);
+      const acct = r.QueryResponse?.Account?.[0];
+      if (acct) ids[name] = acct.Id;
+    } catch { /* skip */ }
+  }
+  return ids;
+}
+
+/**
+ * Sum TotalAmt of all Payments WHERE TxnDate in [from, to] AND
+ * DepositToAccountRef IN accountIds. Paginated 1000 at a time.
+ */
+async function sumPaymentsInWindow(accountIds, fromDate, toDate) {
+  const targetIds = new Set(accountIds.map(String));
+  let total = 0, count = 0;
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, TotalAmt, DepositToAccountRef ` +
+      `FROM Payment WHERE TxnDate >= '${fromDate}' AND TxnDate <= '${toDate}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Payment || [];
+    for (const p of rows) {
+      if (targetIds.has(String(p.DepositToAccountRef?.value || ''))) {
+        total += Number(p.TotalAmt || 0); count++;
+      }
+    }
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  return { total, count };
+}
+
+/**
+ * Sum TotalAmt of all Purchase ("Expense") transactions WHERE TxnDate in
+ * [from, to] AND AccountRef in accountIds. QB calls operator-side Expense
+ * entries Purchase records.
+ */
+async function sumExpensesInWindow(accountIds, fromDate, toDate) {
+  const targetIds = new Set(accountIds.map(String));
+  let total = 0, count = 0;
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, TotalAmt, AccountRef ` +
+      `FROM Purchase WHERE TxnDate >= '${fromDate}' AND TxnDate <= '${toDate}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Purchase || [];
+    for (const p of rows) {
+      if (targetIds.has(String(p.AccountRef?.value || ''))) {
+        total += Number(p.TotalAmt || 0); count++;
+      }
+    }
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  return { total, count };
+}
+
+/**
+ * Section A: Account QuickReport-style.
+ *  - Beginning balance of Elegansky Collection AC (parent) at start of window
+ *  - Sum of all Payments (credits) into Elegansky + sub-accounts
+ *  - Sum of all Expenses (debits) out of Elegansky + sub-accounts
+ *  - Net movement = credits − debits  ← this matches operator's "Total" row
+ *  - Live closing balance (parent + sub-accounts, right now)
  */
 async function getAccountBalance(fromDate, toDate) {
-  // Opening = balance at the END of the day BEFORE fromDate.
+  const allNames = [PARENT_ACCOUNT_NAME, ...SUB_ACCOUNT_NAMES];
+  const ids = await getAccountIds(allNames);
+  const targetIds = Object.values(ids);
+  // Beginning balance: parent account's balance at end of (fromDate - 1)
   const prevDay = new Date(fromDate + 'T00:00:00Z');
   prevDay.setUTCDate(prevDay.getUTCDate() - 1);
   const openingAsOf = prevDay.toISOString().slice(0, 10);
-  const [opening, closing, live] = await Promise.all([
-    balanceAsOf(KIJICHI_ACCOUNT_NAME, openingAsOf),
-    balanceAsOf(KIJICHI_ACCOUNT_NAME, toDate),
-    balanceAsOf(KIJICHI_ACCOUNT_NAME, new Date().toISOString().slice(0, 10)),
+  let opening = null, closing_live = null;
+  try {
+    const openReport = await qbReport('BalanceSheet', { end_date: openingAsOf, start_date: '2020-01-01' });
+    opening = balanceFromReport(openReport, PARENT_ACCOUNT_NAME);
+    const liveReport = await qbReport('BalanceSheet', { end_date: new Date().toISOString().slice(0, 10), start_date: '2020-01-01' });
+    closing_live = balanceFromReport(liveReport, PARENT_ACCOUNT_NAME);
+  } catch (err) {
+    console.error('[mega-report] BalanceSheet failed:', err.message);
+  }
+  const [payments, expenses] = await Promise.all([
+    sumPaymentsInWindow(targetIds, fromDate, toDate),
+    sumExpensesInWindow(targetIds, fromDate, toDate),
   ]);
+  const net_movement = payments.total - expenses.total;
   return {
-    account_name: KIJICHI_ACCOUNT_NAME,
+    parent_account: PARENT_ACCOUNT_NAME,
+    sub_accounts: SUB_ACCOUNT_NAMES,
+    account_ids: ids,
     opening_as_of: openingAsOf,
-    opening,
-    closing_as_of: toDate,
-    closing,
-    live,
-    delta_in_window: (opening != null && closing != null) ? closing - opening : null,
+    opening_balance: opening,
+    window: { from: fromDate, to: toDate },
+    payments_in_window: payments,
+    expenses_in_window: expenses,
+    net_movement,
+    closing_live,
   };
 }
 
@@ -188,25 +276,35 @@ async function getSheetTotals(fromDate, toDate) {
   const byChannel = {};
   let totalPassed = 0, totalFailed = 0, totalUnused = 0;
   for (const [channel, cfg] of Object.entries(CHANNEL_TABS)) {
-    const [passed, failed] = await Promise.all([
+    const extras = (cfg.extra || []).map((tab) => readSheetTab(cfg.sheetId, tab, winStart, winEndExclusive));
+    const [passed, failed, ...extraResults] = await Promise.all([
       readSheetTab(cfg.sheetId, cfg.passed, winStart, winEndExclusive),
       readSheetTab(cfg.sheetId, cfg.failed, winStart, winEndExclusive),
+      ...extras,
     ]);
+    const extraTotal = extraResults.reduce((s, e) => s + e.total, 0);
+    const extraRows = extraResults.reduce((s, e) => s + e.rows, 0);
+    const extraUnusedRows = extraResults.reduce((s, e) => s + e.unused_rows, 0);
+    const extraUnusedTotal = extraResults.reduce((s, e) => s + e.unused_total, 0);
     byChannel[channel] = {
       passed: { rows: passed.rows, total: passed.total },
       failed: { rows: failed.rows, total: failed.total },
+      extra_tabs: cfg.extra || [],
+      extra: { rows: extraRows, total: extraTotal },
       unused: {
         passed_rows: passed.unused_rows,
         passed_total: passed.unused_total,
         failed_rows: failed.unused_rows,
         failed_total: failed.unused_total,
-        total_rows: passed.unused_rows + failed.unused_rows,
-        total_amount: passed.unused_total + failed.unused_total,
+        extra_rows: extraUnusedRows,
+        extra_total: extraUnusedTotal,
+        total_rows: passed.unused_rows + failed.unused_rows + extraUnusedRows,
+        total_amount: passed.unused_total + failed.unused_total + extraUnusedTotal,
       },
     };
-    totalPassed += passed.total;
+    totalPassed += passed.total + extraTotal;
     totalFailed += failed.total;
-    totalUnused += passed.unused_total + failed.unused_total;
+    totalUnused += passed.unused_total + failed.unused_total + extraUnusedTotal;
   }
   return {
     by_channel: byChannel,

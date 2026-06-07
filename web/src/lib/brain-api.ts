@@ -513,20 +513,26 @@ export async function getPaymentUploadsTodayTotals(): Promise<PaymentUploadsTota
 
 export interface MegaReportWindow { from: string; to: string }
 export interface MegaAccountBalance {
-  account_name: string;
+  parent_account: string;
+  sub_accounts: string[];
+  account_ids: Record<string, string>;
   opening_as_of: string;
-  opening: number | null;
-  closing_as_of: string;
-  closing: number | null;
-  live: number | null;
-  delta_in_window: number | null;
+  opening_balance: number | null;
+  window: { from: string; to: string };
+  payments_in_window: { total: number; count: number };
+  expenses_in_window: { total: number; count: number };
+  net_movement: number;
+  closing_live: number | null;
 }
 export interface MegaChannelSection {
   passed: { rows: number; total: number };
   failed: { rows: number; total: number };
+  extra_tabs: string[];
+  extra: { rows: number; total: number };
   unused: {
     passed_rows: number; passed_total: number;
     failed_rows: number; failed_total: number;
+    extra_rows: number; extra_total: number;
     total_rows: number; total_amount: number;
   };
 }

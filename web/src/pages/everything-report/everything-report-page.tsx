@@ -169,38 +169,47 @@ export function EverythingReportPage() {
         </CardContent>
       </Card>
 
-      {/* Section A — QB Account Balance */}
+      {/* Section A — Account QuickReport (Beginning + credits − debits) */}
       <Card>
-        <CardHeader><CardTitle>A · QB Kijichi Collection AC balance</CardTitle></CardHeader>
+        <CardHeader>
+          <CardTitle>
+            A · {sectionA?.parent_account || 'Elegansky Collection AC'} (with sub-accounts: {sectionA?.sub_accounts?.join(', ') || '—'})
+          </CardTitle>
+        </CardHeader>
         <CardContent>
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>Metric</TableHead>
-                <TableHead>Amount (TZS)</TableHead>
-                <TableHead>As of</TableHead>
+                <TableHead className="text-right">Amount (TZS)</TableHead>
+                <TableHead>Detail</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               <TableRow>
-                <TableCell>Opening balance (start of window)</TableCell>
-                <TableCell className="font-mono">{fmt(sectionA?.opening)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{sectionA?.opening_as_of}</TableCell>
+                <TableCell>Beginning balance (parent)</TableCell>
+                <TableCell className="text-right font-mono">{fmt(sectionA?.opening_balance)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">as of {sectionA?.opening_as_of}</TableCell>
               </TableRow>
               <TableRow>
-                <TableCell>Closing balance (end of window)</TableCell>
-                <TableCell className="font-mono">{fmt(sectionA?.closing)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{sectionA?.closing_as_of}</TableCell>
+                <TableCell className="text-green-700">+ Payments received (credits)</TableCell>
+                <TableCell className="text-right font-mono text-green-700">{fmt(sectionA?.payments_in_window.total)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{sectionA?.payments_in_window.count} txns</TableCell>
               </TableRow>
               <TableRow>
-                <TableCell>Δ in window (closing − opening)</TableCell>
-                <TableCell className="font-mono">{fmt(sectionA?.delta_in_window)}</TableCell>
-                <TableCell>—</TableCell>
+                <TableCell className="text-red-700">− Expenses (debits)</TableCell>
+                <TableCell className="text-right font-mono text-red-700">{fmt(sectionA?.expenses_in_window.total)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{sectionA?.expenses_in_window.count} txns</TableCell>
               </TableRow>
               <TableRow className="bg-muted/30">
-                <TableCell className="font-semibold">Live (right now)</TableCell>
-                <TableCell className="font-mono font-semibold">{fmt(sectionA?.live)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">now</TableCell>
+                <TableCell className="font-semibold">= Net movement in window</TableCell>
+                <TableCell className="text-right font-mono font-semibold">{fmt(sectionA?.net_movement)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{sectionA?.window.from} → {sectionA?.window.to}</TableCell>
+              </TableRow>
+              <TableRow>
+                <TableCell>Live balance (right now)</TableCell>
+                <TableCell className="text-right font-mono">{fmt(sectionA?.closing_live)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">parent + sub-accounts</TableCell>
               </TableRow>
             </TableBody>
           </Table>
@@ -226,9 +235,14 @@ export function EverythingReportPage() {
             <TableBody>
               {sectionB && Object.entries(sectionB.by_channel).map(([ch, v]) => (
                 <TableRow key={ch}>
-                  <TableCell className="font-medium">{ch}</TableCell>
-                  <TableCell className="text-right">{fmt(v.passed.rows)}</TableCell>
-                  <TableCell className="text-right font-mono">{fmt(v.passed.total)}</TableCell>
+                  <TableCell className="font-medium">
+                    {ch}
+                    {v.extra_tabs.length > 0 && (
+                      <span className="text-xs text-muted-foreground ml-1">(+{v.extra_tabs.join(',')})</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right">{fmt(v.passed.rows + v.extra.rows)}</TableCell>
+                  <TableCell className="text-right font-mono">{fmt(v.passed.total + v.extra.total)}</TableCell>
                   <TableCell className="text-right">{fmt(v.failed.rows)}</TableCell>
                   <TableCell className="text-right font-mono">{fmt(v.failed.total)}</TableCell>
                   <TableCell className="text-right">{fmt(v.unused.total_rows)}</TableCell>
