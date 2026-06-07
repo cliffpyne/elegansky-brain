@@ -4665,14 +4665,12 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     // counter for reporting so the operator sees how many rows fell back.
     // (Empty dates are still skipped — that's the operator's deliberate
     // skip-flag for multi-plate rows, which is a different intent.)
-    // Upper bound only — keep out future-dated test data. Lower bound
-    // dropped 2026-06-07: late-arriving rows (sheet_ts BEFORE the cursor
-    // because they were added to the sheet AFTER the cursor batch closed)
-    // would silently skip with the old `ts < winStart` check, even though
-    // K marker tells us they're fresh. Trust the K marker for "not yet
-    // processed". Pairs with the QB dup-check (next phase) so refs that
-    // are old AND already in QB get marked instead of re-pushed.
-    if (ts && ts >= winEnd) { skippedOutOfWindow++; continue; }
+    // STRICT window: enforce both lower AND upper bound (Frank 2026-06-07,
+    // CASTOR parity). Without the lower-bound check BRAIN was picking up
+    // rows with very old bank dates (e.g. MAR 2026 FTM refs) that the
+    // operator's window didn't intend. CASTOR uses operator's CSV which
+    // only includes rows in the chosen window — BRAIN now matches.
+    if (ts && (ts < winStart || ts >= winEnd)) { skippedOutOfWindow++; continue; }
     if (!ts) includedBadFormat++;
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
