@@ -455,21 +455,34 @@ export function mountPaymentBatchesApi(app, deps) {
         `SELECT * FROM payment_uploads WHERE batch_id=$1 AND status='created' ORDER BY created_at`,
         [batchId],
       );
-      // Keep retrying failed voids until ALL succeed (or hard ceiling of 20
-      // attempts to prevent infinite loop on permanent errors). Frank's rule
-      // 2026-06-05: "pure recall retry until recalled" — don't leave any
-      // Payment stranded silently.
-      const MAX_RECALL_ATTEMPTS = 20;
+      // Never-give-up recall (Frank 2026-06-07): retry every failed void
+      // up to MAX_RECALL_ATTEMPTS (default 100, env-overridable). Aggressive
+      // mode (?aggressive=1) drops the cap entirely and retries until every
+      // single void succeeds, regardless of how many attempts.
+      // Each retry round logs to batch_logs so the operator can come back
+      // and read the full trail in the batch detail page.
+      const isAggressive = req.query?.aggressive === '1' || req.body?.aggressive === true;
+      const MAX_RECALL_ATTEMPTS = isAggressive ? Infinity : Number(process.env.MAX_RECALL_ATTEMPTS || 100);
+      await logBatch(batchId, 'info', `recall start: ${ups.rows.length} payments to void, mode=${isAggressive ? 'AGGRESSIVE (no cap)' : 'capped @ ' + MAX_RECALL_ATTEMPTS}, reason="${reason}"`, 'recall', { void_count: ups.rows.length, aggressive: isAggressive });
       let voids = await voidUploadsBestEffort(ups.rows, qbVoid);
-      for (let attempt = 2; attempt <= MAX_RECALL_ATTEMPTS; attempt++) {
+      let attempt = 1;
+      while (attempt < MAX_RECALL_ATTEMPTS) {
         const stillFailed = voids.filter((v) => !v.ok);
         if (!stillFailed.length) {
-          console.log(`[recall ${batchId}] all voids succeeded after ${attempt - 1} attempts`);
+          console.log(`[recall ${batchId}] all voids succeeded after ${attempt} attempts`);
+          await logBatch(batchId, 'info', `all ${ups.rows.length} voids succeeded after ${attempt} attempt(s)`, 'recall', { attempts: attempt });
           break;
         }
-        console.log(`[recall ${batchId}] attempt ${attempt}/${MAX_RECALL_ATTEMPTS}: ${stillFailed.length} voids still failing`);
-        // Exponential-ish backoff capped at 30s. 3s, 6s, 10s, 15s, 20s, 25s, 30s, 30s, …
-        const wait = Math.min(30_000, 3_000 + (attempt - 2) * 4_000);
+        attempt++;
+        const capLabel = MAX_RECALL_ATTEMPTS === Infinity ? '∞' : MAX_RECALL_ATTEMPTS;
+        console.log(`[recall ${batchId}] attempt ${attempt}/${capLabel}: ${stillFailed.length} voids still failing`);
+        await logBatch(batchId, 'warn', `attempt ${attempt}/${capLabel}: ${stillFailed.length} voids still failing — retrying after backoff`, 'recall', { attempt, still_failing: stillFailed.length });
+        // Exponential backoff with jitter, capped at 60s.
+        // Aggressive mode is more patient — gives QB more time to recover
+        // from rate-limit stuns (especially on big batches with hundreds
+        // of voids hammering the throttle).
+        const baseMs = isAggressive ? 5_000 : 3_000;
+        const wait = Math.min(60_000, baseMs * Math.pow(1.6, Math.min(attempt - 1, 8))) + Math.random() * 1000;
         await new Promise((r) => setTimeout(r, wait));
         const failedUploadIds = new Set(stillFailed.map((v) => v.upload_id));
         const failedUploads = ups.rows.filter((u) => failedUploadIds.has(u.id));
@@ -480,7 +493,8 @@ export function mountPaymentBatchesApi(app, deps) {
       const allOk = voids.every((v) => v.ok);
       const stuckCount = voids.filter((v) => !v.ok).length;
       if (!allOk) {
-        console.warn(`[recall ${batchId}] gave up after ${MAX_RECALL_ATTEMPTS} attempts — ${stuckCount} voids still failing (permanent errors?)`);
+        console.warn(`[recall ${batchId}] gave up after ${attempt} attempts — ${stuckCount} voids still failing (permanent errors?)`);
+        await logBatch(batchId, 'error', `gave up after ${attempt} attempts — ${stuckCount} voids still failing (likely permanent errors: 404 Payment gone, 400 invalid). See payment_uploads.failure_reason for each.`, 'recall', { final_attempts: attempt, stuck_count: stuckCount });
       }
 
       const c = await db().connect();
