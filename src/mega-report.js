@@ -41,21 +41,24 @@ const CHANNEL_TABS = {
     sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek',
     passed: 'PASSED',
     failed: 'FAILED_NMB',
-    extra: ['PASSED_SAV_NMB'],
+    suffix: 'N',
+  },
+  nmbnew_sav: {
+    sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek',
+    passed: 'PASSED_SAV_NMB',
+    failed: null,
     suffix: 'N',
   },
   bank: {
     sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o',
     passed: 'PASSED',
     failed: 'FAILED',
-    extra: [],
     suffix: 'B',
   },
   iphone_bank: {
     sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ',
     passed: 'BANK_PASSED',
     failed: 'BANK_FAILED',
-    extra: [],
     suffix: 'P',
   },
 };
@@ -276,35 +279,31 @@ async function getSheetTotals(fromDate, toDate) {
   const byChannel = {};
   let totalPassed = 0, totalFailed = 0, totalUnused = 0;
   for (const [channel, cfg] of Object.entries(CHANNEL_TABS)) {
-    const extras = (cfg.extra || []).map((tab) => readSheetTab(cfg.sheetId, tab, winStart, winEndExclusive));
-    const [passed, failed, ...extraResults] = await Promise.all([
+    const [passed, failed] = await Promise.all([
       readSheetTab(cfg.sheetId, cfg.passed, winStart, winEndExclusive),
-      readSheetTab(cfg.sheetId, cfg.failed, winStart, winEndExclusive),
-      ...extras,
+      cfg.failed ? readSheetTab(cfg.sheetId, cfg.failed, winStart, winEndExclusive)
+                 : Promise.resolve({ rows: 0, total: 0, unused_rows: 0, unused_total: 0 }),
     ]);
-    const extraTotal = extraResults.reduce((s, e) => s + e.total, 0);
-    const extraRows = extraResults.reduce((s, e) => s + e.rows, 0);
-    const extraUnusedRows = extraResults.reduce((s, e) => s + e.unused_rows, 0);
-    const extraUnusedTotal = extraResults.reduce((s, e) => s + e.unused_total, 0);
     byChannel[channel] = {
       passed: { rows: passed.rows, total: passed.total },
       failed: { rows: failed.rows, total: failed.total },
-      extra_tabs: cfg.extra || [],
-      extra: { rows: extraRows, total: extraTotal },
+      // legacy shape kept for backward-compat with v3 dashboard build
+      extra_tabs: [],
+      extra: { rows: 0, total: 0 },
       unused: {
         passed_rows: passed.unused_rows,
         passed_total: passed.unused_total,
         failed_rows: failed.unused_rows,
         failed_total: failed.unused_total,
-        extra_rows: extraUnusedRows,
-        extra_total: extraUnusedTotal,
-        total_rows: passed.unused_rows + failed.unused_rows + extraUnusedRows,
-        total_amount: passed.unused_total + failed.unused_total + extraUnusedTotal,
+        extra_rows: 0,
+        extra_total: 0,
+        total_rows: passed.unused_rows + failed.unused_rows,
+        total_amount: passed.unused_total + failed.unused_total,
       },
     };
-    totalPassed += passed.total + extraTotal;
+    totalPassed += passed.total;
     totalFailed += failed.total;
-    totalUnused += passed.unused_total + failed.unused_total + extraUnusedTotal;
+    totalUnused += passed.unused_total + failed.unused_total;
   }
   return {
     by_channel: byChannel,
