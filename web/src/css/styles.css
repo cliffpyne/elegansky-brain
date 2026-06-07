@@ -13,6 +13,32 @@
   *:focus-visible {
     @apply outline-ring rounded-xs shadow-none outline-2 outline-offset-3 transition-none!;
   }
+
+  /* Kill the I-beam text caret + double-click text selection on non-text
+   * UI surfaces. Operator was seeing the "typing" cursor pop up when
+   * clicking labels, badges, table cells, card headers, etc. Real text
+   * inputs (and any element explicitly marked) keep normal behavior. */
+  body {
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  input, textarea, [contenteditable="true"], [contenteditable=""],
+  .select-text, [data-text="true"], pre, code {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  a, button, [role="button"], [role="tab"], [role="menuitem"], summary,
+  label[for], select, [data-slot="select-trigger"] {
+    cursor: pointer;
+  }
+  /* The blinking caret only inside actual text-entry fields */
+  body, button, a, [role="button"], [role="tab"] {
+    caret-color: transparent;
+  }
+  input, textarea, [contenteditable="true"], [contenteditable=""] {
+    caret-color: auto;
+  }
 }
 
 /* Metronic Components  */
