@@ -4660,6 +4660,10 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   }
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
+  // Renamed semantics 2026-06-07: bad-format rows are no longer skipped —
+  // they're INCLUDED with receivedTimestamp=null. We keep skippedBadFormat
+  // for backwards-compat with callers reading the response (always 0 now).
+  let includedBadFormat = 0;
   for (let i = 1; i < sheet.length; i++) {
     // Belt + suspenders: skip if ANY of three signals says "already processed"
     //   (a) Row is at or below the last Column K "end of tick" marker
@@ -4680,7 +4684,12 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
-    if (!ts) { skippedBadFormat++; continue; }
+    // Bad-format dates (e.g. "20.26.2026" OCR errors): INCLUDE with
+    // receivedTimestamp=null per the design rule. Operator OCR errors
+    // shouldn't lose transactions silently. Bumped to includedBadFormat
+    // counter for reporting so the operator sees how many rows fell back.
+    // (Empty dates are still skipped — that's the operator's deliberate
+    // skip-flag for multi-plate rows, which is a different intent.)
     // Upper bound only — keep out future-dated test data. Lower bound
     // dropped 2026-06-07: late-arriving rows (sheet_ts BEFORE the cursor
     // because they were added to the sheet AFTER the cursor batch closed)
@@ -4688,12 +4697,13 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     // K marker tells us they're fresh. Trust the K marker for "not yet
     // processed". Pairs with the QB dup-check (next phase) so refs that
     // are old AND already in QB get marked instead of re-pushed.
-    if (ts >= winEnd) { skippedOutOfWindow++; continue; }
+    if (ts && ts >= winEnd) { skippedOutOfWindow++; continue; }
+    if (!ts) includedBadFormat++;
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`, channel,
       customerPhone: sheet[i][5] || null, customerName: sheet[i][6] || null, contractName: sheet[i][6] || null,
       amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
-      receivedTimestamp: ts.getTime(), transactionId: sheet[i][7] || null,
+      receivedTimestamp: ts ? ts.getTime() : null, transactionId: sheet[i][7] || null,
       // Phase 2: track the actual Google Sheets row number (1-based) so we can
       // write Column I + J back to the right row after processing.
       sheet_row_number: i + 1,
