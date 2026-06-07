@@ -264,18 +264,26 @@ export function startScheduler() {
 async function checkMissedTicks() {
   try {
     const now = new Date();
+    // SCHEDULE is defined in tick-name (= time) order, meru0300 first. So
+    // looping in order guarantees meru0300 catches up BEFORE later ticks.
     for (const sched of SCHEDULE) {
       const lastFire = lastFireTimeUtc(sched.utc, now);
       if (!lastFire) continue;
       const ageMs = now - lastFire;
-      if (ageMs > 2 * 3600_000) continue;
+      const isMeru = sched.name === 'meru0300';
+      // Meru0300 special case (Frank 2026-06-07): on service restart, meru
+      // is ALWAYS the first to fire if it hasn't completed today —
+      // regardless of how late (no 2-hour cap). All other ticks still
+      // honor the 2-hour staleness rule to avoid noisy late catchups.
+      if (!isMeru && ageMs > 2 * 3600_000) continue;
       if (ageMs < 60_000) continue;
       const r = await db().query(
         `SELECT 1 FROM agent_sessions WHERE trigger=$1 AND started_at > $2 LIMIT 1`,
         ['cron:' + sched.name, lastFire.toISOString()],
       );
       if (r.rows.length === 0) {
-        console.log(`[scheduler] catching up missed tick ${sched.name} (would have fired ${lastFire.toISOString()})`);
+        const note = isMeru && ageMs > 2 * 3600_000 ? ' (meru0300 special — no time cap)' : '';
+        console.log(`[scheduler] catching up missed tick ${sched.name} (would have fired ${lastFire.toISOString()})${note}`);
         fireTick(sched);
       }
     }
