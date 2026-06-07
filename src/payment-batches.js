@@ -5166,11 +5166,15 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
     }
   }
 
-  // ─── Self-healing sweep: hammer any 'failed' rows up to 3 more times
-  // before giving up. Catches Stale Object Errors that slipped past the
-  // per-call retry budget (e.g. operator was editing the same invoice in
-  // QB UI), plus any other transient blips. Only finalize when failed=0.
-  for (let sweep = 1; sweep <= 3 && failed > 0; sweep++) {
+  // ─── Self-healing sweep with NEVER-GIVE-UP retry (Frank 2026-06-07).
+  // Hammer any 'failed' rows with exponential backoff up to MAX_SWEEPS
+  // attempts (default 100, configurable via AUTO_UPLOAD_MAX_SWEEPS env).
+  // 429s and transient 5xx/timeouts are retried indefinitely — for
+  // permanent 4xx errors a row keeps re-failing with the same reason
+  // until the cap. Each sweep logs to batch_logs so the operator can
+  // come back and see the trail.
+  const MAX_SWEEPS = Number(process.env.AUTO_UPLOAD_MAX_SWEEPS || 100);
+  for (let sweep = 1; sweep <= MAX_SWEEPS && failed > 0; sweep++) {
     const { rows: stillFailed } = await db().query(
       `SELECT id, kind, customer_id, invoice_qb_id, invoice_no, amount, memo,
               bank_ref, customer_name
@@ -5180,8 +5184,10 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
       [batchId],
     );
     if (stillFailed.length === 0) { failed = 0; break; }
-    console.log(`[auto-upload] sweep ${sweep}/3: retrying ${stillFailed.length} failed rows`);
+    console.log(`[auto-upload] sweep ${sweep}/${MAX_SWEEPS}: retrying ${stillFailed.length} failed rows`);
+    await logBatch(batchId, 'info', `sweep ${sweep}/${MAX_SWEEPS}: retrying ${stillFailed.length} failed rows`, 'qb-push', { sweep, failed_count: stillFailed.length });
     let sweepCursor = 0;
+    let sweepRecovered = 0;
     const sweeper = async () => {
       while (true) {
         const idx = sweepCursor++;
@@ -5190,20 +5196,17 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
         try {
           let qb;
           if (u.kind === 'payment' && u.invoice_qb_id) {
-            // Paid → Payment with LinkedTxn
             qb = await qbCreatePayment({
               customerId: u.customer_id, invoiceQbId: u.invoice_qb_id,
               amount: Number(u.amount), memo: u.memo || '',
               txnDate,
             });
           } else if (u.kind === 'payment' && !u.invoice_qb_id && qbCreateUnappliedPayment) {
-            // Unapplied (no invoice match) → Payment without LinkedTxn
             qb = await qbCreateUnappliedPayment({
               customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
               txnDate,
             });
           } else {
-            // Legacy kind='credit_memo' from the single-row manual endpoint
             qb = await qbCreateCreditMemo({
               customerId: u.customer_id, amount: Number(u.amount), memo: u.memo || '',
               txnDate,
@@ -5216,7 +5219,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
             [u.id, qb.id, JSON.stringify(qb.response)],
           );
           failed--;
-          // Sweep-recovered PU: map bank_ref → sheet_row_number and mark J.
+          sweepRecovered++;
           const sheetRow = refToRow.get(u.bank_ref);
           if (sheetRow) {
             recordJ(sheetRow, qb.id);
@@ -5231,8 +5234,16 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
       }
     };
     await Promise.all(Array.from({ length: CONCURRENCY }, () => sweeper()));
-    // Small pause between sweeps so any in-flight operator edits commit.
-    if (failed > 0 && sweep < 3) await new Promise((r) => setTimeout(r, 1500));
+    if (sweepRecovered > 0) {
+      await logBatch(batchId, 'info', `sweep ${sweep} recovered ${sweepRecovered} rows, ${failed} still failing`, 'qb-push', { sweep, recovered: sweepRecovered, still_failed: failed });
+    }
+    // Exponential backoff: 1.5s → 3s → 6s → 12s → 30s (capped at 60s).
+    // 429s are most likely the cause when bulk sweeps keep failing —
+    // giving QB room to breathe between sweeps unstuns the throttle.
+    if (failed > 0 && sweep < MAX_SWEEPS) {
+      const wait = Math.min(60_000, 1500 * Math.pow(2, Math.min(sweep - 1, 5))) + Math.random() * 500;
+      await new Promise((r) => setTimeout(r, wait));
+    }
   }
 
   if (failed === 0) {
@@ -5242,10 +5253,10 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   } else {
     await db().query(
       `UPDATE payment_batches SET failure_reason=$2 WHERE id=$1`,
-      [batchId, `${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason`],
+      [batchId, `${failed} per-row failures after ${MAX_SWEEPS} sweeps — see payment_uploads.failure_reason`],
     );
-    console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after 3 sweeps.`);
-    await logBatch(batchId, 'error', `batch left pending: ${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason for each`, 'qb-push', { failed_count: failed });
+    console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after ${MAX_SWEEPS} sweeps.`);
+    await logBatch(batchId, 'error', `batch left pending: ${failed} per-row failures after ${MAX_SWEEPS} sweeps — see payment_uploads.failure_reason for each`, 'qb-push', { failed_count: failed, max_sweeps: MAX_SWEEPS });
   }
 
   // J markers are flushed per-chunk (and per sweep success) above. No
