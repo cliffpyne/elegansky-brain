@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers, markSheetRowsAsQbDuplicate } from './sheets.js';
 import { qbQuery, qbReport, qbPatchPaymentTxnDate } from './qb-client.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
@@ -4323,6 +4323,52 @@ function processInvoicePayments(invoices, transactions) {
   return out;
 }
 
+// Scan QB for any of the supplied suffixed bank_refs that already exist as
+// Payment OR CreditMemo PrivateNotes within the last `daysBack` days.
+//
+// Returns Map<suffixed_ref, { qb_id, qb_kind, customer_id, txn_date }>.
+//
+// One paginated scan per kind (Payment + CreditMemo) — typically 2-5 QB
+// queries total, regardless of how many wanted refs. The scan can be heavy
+// on QB if the date window is wide; default 60 days is enough to catch any
+// realistic SaasAnt/manual residue while staying cheap.
+//
+// Used by prepareAutoUpload's dup-check step (Frank 2026-06-07).
+async function scanQbForRefDuplicates(wantedSuffixedRefs, daysBack = 60) {
+  if (!wantedSuffixedRefs || wantedSuffixedRefs.length === 0) return new Map();
+  const wantedSet = new Set(wantedSuffixedRefs);
+  const fromDate = new Date(Date.now() - daysBack * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  const hits = new Map();
+  for (const kind of ['Payment', 'CreditMemo']) {
+    let start = 1;
+    const PAGE = 1000;
+    while (start < 200_000) {
+      const sql =
+        `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM ${kind} ` +
+        `WHERE TxnDate >= '${fromDate}' ` +
+        `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
+      const r = await qbQuery(sql);
+      const rows = r.QueryResponse?.[kind] || [];
+      if (!rows.length) break;
+      for (const row of rows) {
+        const pn = String(row.PrivateNote || '').trim();
+        if (!pn || !wantedSet.has(pn)) continue;
+        // Skip voided rows (TotalAmt=0 typically means a voided Payment in QB).
+        if (kind === 'Payment' && Number(row.TotalAmt || 0) === 0) continue;
+        hits.set(pn, {
+          qb_id: String(row.Id),
+          qb_kind: kind === 'CreditMemo' ? 'credit_memo' : 'payment',
+          customer_id: String(row.CustomerRef?.value || ''),
+          txn_date: row.TxnDate || null,
+        });
+      }
+      if (rows.length < PAGE) break;
+      start += PAGE;
+    }
+  }
+  return hits;
+}
+
 async function fetchAllArrears(asOf) {
   const { default: fetchImpl } = { default: globalThis.fetch };
   const base = process.env.SELF_URL || 'http://127.0.0.1:' + (process.env.PORT || 3000);
@@ -4416,7 +4462,10 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // I/J markers still get written per-row for observability (audit can
   // spot silent failures via sheet-lock-audit), but they are NO LONGER
   // used to gate processing. K is the single source of truth.
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+  // Column L holds "QB_DUPLICATE <qb_id>" markers when the dup-check
+  // discovered a ref already in QB (SaasAnt / manual processor / prior
+  // BRAIN run). Read A:L so the skip logic can honor those too.
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L80000`);
   const sheet = sheetData.values || sheetData.data || [];
   // Find the highest row index whose Column K holds a BRAIN end-of-tick
   // marker. Only values that start with "end of " are treated as
@@ -4449,11 +4498,16 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
     const colI = String(sheet[i][8] || '').trim();
     const colJ = String(sheet[i][9] || '').trim();
+    const colL = String(sheet[i][11] || '').trim();
     // Dry-run markers ("(DRY_RUN)" suffix) are provisional — ignore them
     // so a dry-run preview doesn't lock rows from the next real upload.
     const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
     const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
     if (colIReal || colJReal) { skippedAlreadyPushed++; continue; }
+    // Column L = "QB_DUPLICATE <qb_id>" → ref is already in QB (came in
+    // via SaasAnt / manual processor / prior BRAIN). Skip without
+    // re-querying — the dup-check already added it to external_consumed_refs.
+    if (colL.startsWith('QB_DUPLICATE')) { skippedAlreadyPushed++; continue; }
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
@@ -4521,8 +4575,61 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     const ext = await db().query(`SELECT bank_ref FROM external_consumed_refs WHERE bank_ref = ANY($1)`, [chunk]);
     ext.rows.forEach((r) => forbidden.add(r.bank_ref));
   }
-  const txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
+  let txnsClean = txns.filter((t) => !forbidden.has(appendSuf(t.transactionId, channel)));
   if (txnsClean.length === 0) return { skipped: true, reason: 'all refs already consumed' };
+
+  // 2b. QB dup-check (Frank 2026-06-07): scan QB Payments + CreditMemos
+  // for any ref already pushed from SaasAnt / CASTOR manual processor /
+  // prior BRAIN run whose consumed_transactions got cleaned up. Match is
+  // exact-string on PrivateNote — all 3 sources use the same suffixed-ref
+  // format (<bare_ref><B|P|N>). Hits get:
+  //   - persisted to external_consumed_refs (future fires skip without
+  //     hitting QB again)
+  //   - sheet row painted GREY + Column L = "QB_DUPLICATE <qb_id>"
+  //   - excluded from this batch
+  // If ALL refs in the window turn out to be QB dups, we skip the batch
+  // entirely (no Payment created, no consumed_transactions inserted) —
+  // the next window (e.g. meru0300's window 2) fires normally.
+  try {
+    const wantedRefs = txnsClean.map((t) => appendSuf(t.transactionId, channel)).filter(Boolean);
+    const qbDupHits = await scanQbForRefDuplicates(wantedRefs, 60);
+    if (qbDupHits.size > 0) {
+      const dupRowMap = new Map();
+      for (const t of txnsClean) {
+        const sref = appendSuf(t.transactionId, channel);
+        const hit = qbDupHits.get(sref);
+        if (!hit) continue;
+        if (t.sheet_row_number) dupRowMap.set(t.sheet_row_number, hit.qb_id);
+        await db().query(
+          `INSERT INTO external_consumed_refs (bank_ref, customer_id, qb_id, qb_kind, qb_txn_date, found_by)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (bank_ref, customer_id) DO NOTHING`,
+          [sref, hit.customer_id || 'unknown', hit.qb_id, hit.qb_kind, hit.txn_date || null, `auto-upload-${channel}-dup-check`],
+        );
+      }
+      if (dupRowMap.size > 0 && cfg.sheetId && cfg.tab) {
+        try {
+          await markSheetRowsAsQbDuplicate(cfg.sheetId, cfg.tab, dupRowMap);
+          console.log(`[qb-dup-check] ${channel}: ${dupRowMap.size} rows marked grey + saved to external_consumed_refs`);
+        } catch (e) {
+          console.error('[qb-dup-check] sheet marking failed (non-fatal):', e.message);
+        }
+      }
+      txnsClean = txnsClean.filter((t) => !qbDupHits.has(appendSuf(t.transactionId, channel)));
+      if (txnsClean.length === 0) {
+        return {
+          skipped: true,
+          reason: `all ${qbDupHits.size} refs already in QB (SaasAnt/manual/prior BRAIN) — marked grey + persisted to external_consumed_refs`,
+          qb_duplicates: qbDupHits.size,
+        };
+      }
+    }
+  } catch (err) {
+    // Non-fatal — if QB is unreachable, we proceed with the normal flow.
+    // consumed_transactions still protects against BRAIN's own re-pushes;
+    // the qbPreflightDedup later in the pipeline is the next safety net.
+    console.error('[qb-dup-check] scan failed (non-fatal, continuing):', err.message);
+  }
 
   // 3. Arrears + snapshot (only after we know there's work to do).
   const arrears = await fetchAllArrears(asOf);

@@ -134,6 +134,51 @@ export async function clearSheetColumn(spreadsheetId, tabName, columnLetter) {
 }
 
 /**
+ * Mark sheet rows as "already-pushed-to-QB-from-non-BRAIN-source" — paint
+ * the row grey (cols A..L) and write "QB_DUPLICATE <qb_id>" to Column L.
+ * Called after the QB dup-check finds refs already in QB (SaasAnt/manual
+ * processor/prior BRAIN run whose consumed_transactions got cleaned up).
+ *
+ * dupRowMap: Map<row_number_1based, qb_id>
+ */
+export async function markSheetRowsAsQbDuplicate(spreadsheetId, tabName, dupRowMap) {
+  if (!dupRowMap || dupRowMap.size === 0) return { marked: 0 };
+  const sheets = await sheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets.properties' });
+  const tab = (meta.data.sheets || []).find((s) => s.properties?.title === tabName);
+  if (!tab) throw new Error(`tab '${tabName}' not found in ${spreadsheetId}`);
+  const sheetId = tab.properties.sheetId;
+  // Grey: distinct from purple (real run) and yellow (dry-run preview).
+  const grey = { red: 0.85, green: 0.85, blue: 0.85 };
+  const requests = [];
+  for (const [row, qbId] of dupRowMap) {
+    const row0 = row - 1;
+    requests.push({
+      repeatCell: {
+        range: { sheetId, startRowIndex: row0, endRowIndex: row0 + 1, startColumnIndex: 0, endColumnIndex: 12 },
+        cell: { userEnteredFormat: { backgroundColor: grey } },
+        fields: 'userEnteredFormat.backgroundColor',
+      },
+    });
+    requests.push({
+      updateCells: {
+        range: { sheetId, startRowIndex: row0, endRowIndex: row0 + 1, startColumnIndex: 11, endColumnIndex: 12 },
+        rows: [{ values: [{ userEnteredValue: { stringValue: `QB_DUPLICATE ${qbId}` } }] }],
+        fields: 'userEnteredValue',
+      },
+    });
+  }
+  const CH = 200;
+  for (let i = 0; i < requests.length; i += CH) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: requests.slice(i, i + CH) },
+    });
+  }
+  return { marked: dupRowMap.size };
+}
+
+/**
  * Wipe every dry-run marker BRAIN previously painted on a tab. A row is
  * "dry-run-marked" if any of columns I/J/K contains the literal substring
  * "(DRY_RUN)". For every such row we:
