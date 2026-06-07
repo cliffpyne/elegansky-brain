@@ -78,6 +78,7 @@ export function PaymentBatchesPage() {
                 <TableRow>
                   <TableHead>When</TableHead>
                   <TableHead>Channel</TableHead>
+                  <TableHead>Fired by</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Paid (TZS)</TableHead>
                   <TableHead className="text-right">Unused (TZS)</TableHead>
@@ -90,40 +91,46 @@ export function PaymentBatchesPage() {
               <TableBody>
                 {batches.length === 0 && !loading && (
                   <TableRow>
-                    <TableCell colSpan={9} className="text-center text-muted-foreground">
+                    <TableCell colSpan={10} className="text-center text-muted-foreground">
                       No batches yet.
                     </TableCell>
                   </TableRow>
                 )}
-                {batches.map((b) => (
-                  <TableRow key={b.id}>
-                    <TableCell className="whitespace-nowrap text-sm">
-                      <div>{new Date(b.created_at).toLocaleString()}</div>
-                      <div className="text-xs text-muted-foreground">{b.id.slice(0, 8)}</div>
-                    </TableCell>
-                    <TableCell>{b.channel}</TableCell>
-                    <TableCell>
-                      <Badge variant={statusVariant(b.status)}>{b.status}</Badge>
-                      {b.failure_reason && (
-                        <div className="text-xs text-destructive mt-1 max-w-xs truncate" title={b.failure_reason}>
-                          {b.failure_reason}
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">{fmt(b.paid_total)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{fmt(b.unused_total)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{fmt(b.sheet_total)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{b.paid_count}</TableCell>
-                    <TableCell className="text-right tabular-nums">{b.unused_count}</TableCell>
-                    <TableCell>
-                      <Button variant="ghost" size="sm" asChild>
-                        <Link to={`/payment-batches/${b.id}`}>
-                          <ChevronRight className="size-4" />
-                        </Link>
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {batches.map((b) => {
+                  const tick = (b.created_by || '').replace(/^auto-upload:?/, '') || '—';
+                  return (
+                    <TableRow key={b.id}>
+                      <TableCell className="whitespace-nowrap text-sm">
+                        <div>{new Date(b.created_at).toLocaleString()}</div>
+                        <div className="text-xs text-muted-foreground">{b.id.slice(0, 8)}</div>
+                      </TableCell>
+                      <TableCell>{b.channel}</TableCell>
+                      <TableCell>
+                        <Badge variant="primary" className="uppercase text-[10px]">{tick}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={statusVariant(b.status)}>{b.status}</Badge>
+                        {b.failure_reason && (
+                          <div className="text-xs text-destructive mt-1 max-w-xs truncate" title={b.failure_reason}>
+                            {b.failure_reason}
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{fmt(b.paid_total)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{fmt(b.unused_total)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{fmt(b.sheet_total)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{b.paid_count}</TableCell>
+                      <TableCell className="text-right tabular-nums">{b.unused_count}</TableCell>
+                      <TableCell>
+                        <Button variant="ghost" size="sm" asChild>
+                          <Link to={`/payment-batches/${b.id}`}>
+                            <ChevronRight className="size-4" />
+                          </Link>
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </CardContent>
