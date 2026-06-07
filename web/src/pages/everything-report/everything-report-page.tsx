@@ -19,6 +19,8 @@ import {
 
 const fmt = (n: number | null | undefined) =>
   n == null ? '—' : Math.round(n).toLocaleString();
+const fmt2 = (n: number | null | undefined) =>
+  n == null ? '—' : n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtPct = (p: number | null | undefined) =>
   p == null ? '—' : p.toFixed(1) + '%';
 
@@ -172,44 +174,44 @@ export function EverythingReportPage() {
       {/* Section A — Account QuickReport (Beginning + credits − debits) */}
       <Card>
         <CardHeader>
-          <CardTitle>
-            A · {sectionA?.parent_account || 'Elegansky Collection AC'} (with sub-accounts: {sectionA?.sub_accounts?.join(', ') || '—'})
-          </CardTitle>
+          <CardTitle>A · Account QuickReport — {sectionA?.parent_account || 'Elegansky Collection AC'}</CardTitle>
         </CardHeader>
         <CardContent>
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>Metric</TableHead>
-                <TableHead className="text-right">Amount (TZS)</TableHead>
-                <TableHead>Detail</TableHead>
+                <TableHead className="text-right">Value</TableHead>
+                <TableHead>Source</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               <TableRow>
-                <TableCell>Beginning balance (parent)</TableCell>
-                <TableCell className="text-right font-mono">{fmt(sectionA?.opening_balance)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">as of {sectionA?.opening_as_of}</TableCell>
+                <TableCell>Beginning balance ({sectionA?.opening_as_of?.slice(5) || '—'})</TableCell>
+                <TableCell className="text-right font-mono">{fmt2(sectionA?.opening_balance)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">
+                  {sectionA?.parent_account} + {sectionA?.sub_accounts?.join(', ') || '—'} sub
+                </TableCell>
               </TableRow>
               <TableRow>
-                <TableCell className="text-green-700">+ Payments received (credits)</TableCell>
+                <TableCell className="text-green-700">+ Payments (credits)</TableCell>
                 <TableCell className="text-right font-mono text-green-700">{fmt(sectionA?.payments_in_window.total)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{sectionA?.payments_in_window.count} txns</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{fmt(sectionA?.payments_in_window.count)} txns</TableCell>
               </TableRow>
               <TableRow>
                 <TableCell className="text-red-700">− Expenses (debits)</TableCell>
                 <TableCell className="text-right font-mono text-red-700">{fmt(sectionA?.expenses_in_window.total)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{sectionA?.expenses_in_window.count} txns</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{fmt(sectionA?.expenses_in_window.count)} txns</TableCell>
               </TableRow>
               <TableRow className="bg-muted/30">
-                <TableCell className="font-semibold">= Net movement in window</TableCell>
-                <TableCell className="text-right font-mono font-semibold">{fmt(sectionA?.net_movement)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{sectionA?.window.from} → {sectionA?.window.to}</TableCell>
+                <TableCell className="font-semibold">= Net movement</TableCell>
+                <TableCell className="text-right font-mono font-semibold">{fmt(sectionA?.net_movement)} ✓</TableCell>
+                <TableCell className="text-xs text-muted-foreground">Matches Account QuickReport TOTAL row</TableCell>
               </TableRow>
               <TableRow>
-                <TableCell>Live balance (right now)</TableCell>
-                <TableCell className="text-right font-mono">{fmt(sectionA?.closing_live)}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">parent + sub-accounts</TableCell>
+                <TableCell>Live balance now</TableCell>
+                <TableCell className="text-right font-mono">{fmt2(sectionA?.closing_live)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">parent + sub</TableCell>
               </TableRow>
             </TableBody>
           </Table>
