@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Toolbar, ToolbarHeading } from '@/layouts/demo1/components/toolbar';
 import { Container } from '@/components/common/container';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -62,6 +62,9 @@ export function AdminSmsPage() {
   const [savingPhones, setSavingPhones] = useState(false);
   const [secret, setSecret] = useState('');
   const [messages, setMessages] = useState<Awaited<ReturnType<typeof fetchMessages>>['messages']>([]);
+  const [msgPage, setMsgPage] = useState(0);
+  const MESSAGES_PAGE_SIZE = 10;
+  const pagedMessages = messages.slice(msgPage * MESSAGES_PAGE_SIZE, (msgPage + 1) * MESSAGES_PAGE_SIZE);
   const [testMsg, setTestMsg] = useState('Test ping from BRAIN');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -135,52 +138,49 @@ export function AdminSmsPage() {
             <CardContent className="pt-6 text-destructive">{error}</CardContent>
           </Card>
         )}
-        <div className="grid gap-5 md:grid-cols-2 items-stretch">
-          <Card className="flex flex-col h-full">
-            <CardHeader>
+        <div className="grid gap-5 md:grid-cols-2 items-start">
+          <Card>
+            <CardHeader className="border-b">
               <CardTitle>Admin phone numbers</CardTitle>
               <CardDescription>
-                Comma-separated. International format (e.g. +255712345678). When a worker
-                cycle hits its retry limit, every number listed here gets an SMS via the
-                always-online relay phone.
+                Comma-separated. Every number gets an SMS when a worker cycle hits its retry limit.
               </CardDescription>
             </CardHeader>
-            <CardContent className="grow space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="admin-phones">Phone numbers</Label>
+            <CardContent className="p-5 space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="admin-phones" className="text-sm font-medium">Phone numbers</Label>
                 <Input
                   id="admin-phones"
                   placeholder="+255712345678, +255712345679"
                   value={phones}
                   onChange={(e) => setPhones(e.target.value)}
                 />
-                <p className="text-xs text-muted-foreground">
-                  Separate multiple numbers with a comma.
-                </p>
+              </div>
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="text-xs text-muted-foreground">
+                  {phones === phonesSaved ? 'No unsaved changes' : 'Unsaved changes'}
+                </span>
+                <Button
+                  onClick={savePhones}
+                  disabled={savingPhones || phones === phonesSaved}
+                  size="sm"
+                >
+                  <Save className="size-4" /> Save
+                </Button>
               </div>
             </CardContent>
-            <CardFooter className="border-t justify-end gap-2">
-              <Button
-                onClick={savePhones}
-                disabled={savingPhones || phones === phonesSaved}
-                size="sm"
-              >
-                <Save className="size-4" /> Save
-              </Button>
-            </CardFooter>
           </Card>
 
-          <Card className="flex flex-col h-full">
-            <CardHeader>
+          <Card>
+            <CardHeader className="border-b">
               <CardTitle>Test a notification</CardTitle>
               <CardDescription>
-                Enqueue a test message to every configured phone. Requires the shared
-                report secret — paste it below (it's used here in your browser only).
+                Send a test SMS to every configured phone. Needs the shared report secret.
               </CardDescription>
             </CardHeader>
-            <CardContent className="grow space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="report-secret">Report secret</Label>
+            <CardContent className="p-5 space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="report-secret" className="text-sm font-medium">Report secret</Label>
                 <Input
                   id="report-secret"
                   type="password"
@@ -189,8 +189,8 @@ export function AdminSmsPage() {
                   onChange={(e) => setSecret(e.target.value)}
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="test-message">Message body</Label>
+              <div className="space-y-1.5">
+                <Label htmlFor="test-message" className="text-sm font-medium">Message body</Label>
                 <Input
                   id="test-message"
                   placeholder="Test ping from BRAIN"
@@ -198,59 +198,59 @@ export function AdminSmsPage() {
                   onChange={(e) => setTestMsg(e.target.value)}
                 />
               </div>
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <Button variant="outline" size="sm" onClick={refresh}>
+                  <RefreshCw className="size-4" /> Refresh
+                </Button>
+                <Button onClick={fireTest} disabled={!secret} size="sm">
+                  Send test
+                </Button>
+              </div>
             </CardContent>
-            <CardFooter className="border-t justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={refresh}>
-                <RefreshCw className="size-4" /> Refresh
-              </Button>
-              <Button onClick={fireTest} disabled={!secret} size="sm">
-                Send test
-              </Button>
-            </CardFooter>
           </Card>
         </div>
 
-        <Card className="mt-4">
-          <CardHeader>
+        <Card>
+          <CardHeader className="border-b">
             <CardTitle>Recent messages</CardTitle>
             <CardDescription>
-              Latest 100 queued/sent notifications. The relay phone APK polls
-              <code className="mx-1">/api/admin-sms/pending</code> and acks each one
-              after sending — pending means the APK hasn't picked it up yet.
+              Latest queued/sent notifications. The relay phone APK polls
+              <code className="mx-1 select-text">/api/admin-sms/pending</code> and acks each one
+              after sending — <span className="font-medium">pending</span> means the APK hasn't picked it up yet.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0">
             {loading ? (
-              <p className="text-sm text-muted-foreground">Loading…</p>
+              <p className="text-sm text-muted-foreground px-5 py-8 text-center">Loading…</p>
             ) : messages.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
+              <p className="text-sm text-muted-foreground px-5 py-8 text-center">
                 No messages yet. Configure phones and trigger a failure (or use the test box).
               </p>
             ) : (
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>When</TableHead>
+                    <TableHead className="pl-5">When</TableHead>
                     <TableHead>Phone</TableHead>
                     <TableHead>Kind</TableHead>
                     <TableHead>Message</TableHead>
-                    <TableHead>Status</TableHead>
+                    <TableHead className="pr-5">Status</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {messages.map((m) => (
+                  {pagedMessages.map((m) => (
                     <TableRow key={m.id}>
-                      <TableCell className="whitespace-nowrap text-sm text-muted-foreground">
+                      <TableCell className="pl-5 whitespace-nowrap text-sm text-muted-foreground">
                         {new Date(m.created_at).toLocaleString()}
                       </TableCell>
                       <TableCell className="font-mono text-xs">{m.to_phone}</TableCell>
                       <TableCell>{m.kind || '—'}</TableCell>
                       <TableCell className="max-w-md truncate">{m.message}</TableCell>
-                      <TableCell>
+                      <TableCell className="pr-5">
                         <Badge
                           variant={
                             m.status === 'sent'
-                              ? 'default'
+                              ? 'primary'
                               : m.status === 'failed'
                                 ? 'destructive'
                                 : 'secondary'
@@ -268,6 +268,17 @@ export function AdminSmsPage() {
               </Table>
             )}
           </CardContent>
+          {messages.length > MESSAGES_PAGE_SIZE && (
+            <div className="flex items-center justify-between border-t px-5 py-3 text-sm">
+              <span className="text-muted-foreground">
+                Showing {msgPage * MESSAGES_PAGE_SIZE + 1}–{Math.min((msgPage + 1) * MESSAGES_PAGE_SIZE, messages.length)} of {messages.length.toLocaleString()}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => setMsgPage((p) => Math.max(0, p - 1))} disabled={msgPage === 0}>Previous</Button>
+                <Button variant="outline" size="sm" onClick={() => setMsgPage((p) => Math.min(Math.ceil(messages.length / MESSAGES_PAGE_SIZE) - 1, p + 1))} disabled={(msgPage + 1) * MESSAGES_PAGE_SIZE >= messages.length}>Next</Button>
+              </div>
+            </div>
+          )}
         </Card>
       </div>
       </Container>
