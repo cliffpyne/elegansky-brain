@@ -752,6 +752,7 @@ export async function computeOfficerReport(date) {
   const collections = new Map();
   for (const r of collectionsRes.rows) {
     collections.set(r.officer_id, {
+      officer_name: r.officer_name,
       collection: Number(r.collection),
       payment_count: Number(r.payment_count),
     });
@@ -775,7 +776,7 @@ export async function computeOfficerReport(date) {
     const off = offlineCounts.get(id);
     const col = collections.get(id);
     const arr = arrears.get(id);
-    const name = inv?.officer_name || off?.officer_name || arr?.officer_name || 'Unknown';
+    const name = inv?.officer_name || off?.officer_name || arr?.officer_name || col?.officer_name || 'Unknown';
     if (isExcluded(name)) continue; // hidden by operator preference
 
     const total_invoice_amount = inv?.total_invoice_amount || 0;

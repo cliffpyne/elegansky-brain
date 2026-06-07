@@ -5,7 +5,13 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { getMegaReport, type MegaReport } from '@/lib/brain-api';
+import {
+  getMegaReport,
+  refreshOfficerInvoiceTotals,
+  refreshOfficerArrears,
+  refreshOfficerOfflineMotos,
+  type MegaReport,
+} from '@/lib/brain-api';
 
 export type Granularity = 'day' | 'week' | 'month' | 'range';
 
@@ -202,6 +208,32 @@ export function useDefaultFilter(): [SectionFilterState, (s: SectionFilterState)
   return useState<SectionFilterState>({
     granularity: 'day', anchor: today, rangeFrom: today, rangeTo: today, officerId: '',
   });
+}
+
+/**
+ * Hook that exposes a "refresh snapshots" function: re-pulls invoice totals,
+ * arrears, and OFFICE/POLICE motorcycle counts from QB + Frank's tracker
+ * sheet. The snapshot tables are keyed by today's date, so calling this
+ * makes the data fresh for TODAY only.
+ */
+export function useSnapshotRefresh(onDone?: () => void) {
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        refreshOfficerOfflineMotos().catch(() => null),
+        refreshOfficerInvoiceTotals(true).catch(() => null),
+        refreshOfficerArrears(true).catch(() => null),
+      ]);
+      // Give the snapshot table ~2s to settle before reloading.
+      await new Promise((r) => setTimeout(r, 2000));
+      onDone?.();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onDone]);
+  return { refresh, refreshing };
 }
 
 export function PageShell({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {

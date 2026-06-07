@@ -4,14 +4,17 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { EverythingReportSubNav } from './sub-nav';
 import {
   PageShell, SectionCard, SectionFilterBar,
-  fmt, fmtPct, useDefaultFilter, useReportComparison,
+  fmt, fmtPct, useDefaultFilter, useReportComparison, useSnapshotRefresh,
 } from './shared';
 import { TrendKpiTile } from './trend-kpi-tile';
 import { TrendCell } from './trend-cell';
+import { Button } from '@/components/ui/button';
+import { RefreshCw } from 'lucide-react';
 
 export function OpenInvoicesPage() {
   const [state, setState] = useDefaultFilter();
   const { current, previous, loading, reload, windows, lastFetch } = useReportComparison(state);
+  const { refresh: refreshSnapshots, refreshing } = useSnapshotRefresh(reload);
   const c = current?.section_c_d_officers;
   const cp = previous?.section_c_d_officers;
   const officerOptions = useMemo(() =>
@@ -26,6 +29,15 @@ export function OpenInvoicesPage() {
       >
         <EverythingReportSubNav />
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} officerOptions={officerOptions} />
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-muted-foreground">
+            Invoice/balance snapshots stamped to today's date. Click <b>Refresh snapshots</b> to pull fresh data from QB for today.
+          </div>
+          <Button onClick={refreshSnapshots} disabled={refreshing || loading} variant="outline" size="sm">
+            <RefreshCw className={`mr-2 size-4 ${refreshing ? 'animate-spin' : ''}`} />
+            {refreshing ? 'Refreshing QB…' : 'Refresh snapshots (live QB)'}
+          </Button>
+        </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <TrendKpiTile
