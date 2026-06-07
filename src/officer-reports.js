@@ -650,6 +650,108 @@ export async function refreshOfficerArrears({ force = false } = {}) {
   };
 }
 
+/**
+ * Pull invoice totals per officer LIVE from QB for ANY date — no snapshot
+ * table dependency. Returns Map<officer_id, { officer_name, total_invoice_amount,
+ * today_balance_remain, open_invoice_count }>. Frank's spec 2026-06-07:
+ *   - Amount of an invoice is immutable from creation, so total_invoice_amount
+ *     is the same whether we query in the morning or evening.
+ *   - Balance changes as payments land — so today_balance_remain reflects the
+ *     CURRENT balance regardless of which date we're querying.
+ * Operator pages no longer need a refresh button to populate snapshots.
+ */
+export async function getLiveOfficerInvoiceTotals(date) {
+  const allInvoices = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, CustomerRef, TotalAmt, Balance, TxnDate ` +
+      `FROM Invoice WHERE TxnDate = '${date}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Invoice || [];
+    allInvoices.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  const customerIds = [...new Set(allInvoices.map((inv) => String(inv.CustomerRef?.value || '')))]
+    .filter(Boolean);
+  const mapRows = customerIds.length ? await db().query(
+    `SELECT customer_id, officer_id, officer_name
+       FROM customer_officer_map WHERE customer_id = ANY($1)`,
+    [customerIds],
+  ) : { rows: [] };
+  const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
+  const out = new Map();
+  for (const inv of allInvoices) {
+    const off = cidToOfficer.get(String(inv.CustomerRef?.value || ''));
+    if (!off) continue;
+    if (!out.has(off.officer_id)) {
+      out.set(off.officer_id, {
+        officer_id: off.officer_id,
+        officer_name: off.officer_name,
+        total_invoice_amount: 0,
+        today_balance_remain: 0,
+        open_invoice_count: 0,
+      });
+    }
+    const p = out.get(off.officer_id);
+    p.total_invoice_amount += Number(inv.TotalAmt || 0);
+    p.today_balance_remain += Number(inv.Balance || 0);
+    p.open_invoice_count += 1;
+  }
+  return out;
+}
+
+/**
+ * Pull arrears (overdue open balance) per officer LIVE from QB for any date.
+ * arrears = Σ Balance of every invoice WHERE Balance > 0 AND DueDate < date.
+ * QB handles the day-rollover automatically — today's invoices become arrears
+ * once their DueDate is past, no manual snapshot needed.
+ */
+export async function getLiveOfficerArrears(date) {
+  const allInvoices = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, CustomerRef, TotalAmt, Balance, DueDate ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate < '${date}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Invoice || [];
+    allInvoices.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  const customerIds = [...new Set(allInvoices.map((inv) => String(inv.CustomerRef?.value || '')))]
+    .filter(Boolean);
+  const mapRows = customerIds.length ? await db().query(
+    `SELECT customer_id, officer_id, officer_name
+       FROM customer_officer_map WHERE customer_id = ANY($1)`,
+    [customerIds],
+  ) : { rows: [] };
+  const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
+  const out = new Map();
+  for (const inv of allInvoices) {
+    const off = cidToOfficer.get(String(inv.CustomerRef?.value || ''));
+    if (!off) continue;
+    if (!out.has(off.officer_id)) {
+      out.set(off.officer_id, {
+        officer_id: off.officer_id,
+        officer_name: off.officer_name,
+        total_arrears: 0,
+        overdue_invoice_count: 0,
+      });
+    }
+    const p = out.get(off.officer_id);
+    p.total_arrears += Number(inv.Balance || 0);
+    p.overdue_invoice_count += 1;
+  }
+  return out;
+}
+
 export async function getOfficerArrears(snapshotDate) {
   const r = await db().query(
     `SELECT officer_id, officer_name, total_arrears, overdue_invoice_count, cached_at

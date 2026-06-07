@@ -25,6 +25,9 @@ import { readSheet } from './sheets.js';
 import {
   computeOfficerReport,
   getOfficerArrears,
+  getLiveOfficerInvoiceTotals,
+  getLiveOfficerArrears,
+  getOfficerOfflineCounts,
 } from './officer-reports.js';
 
 // Parent + sub-accounts that operator's Account QuickReport rolls up.
@@ -355,6 +358,7 @@ function eachDateInRange(from, to) {
 async function aggregateOfficers(from, to, officerIdFilter) {
   const dates = eachDateInRange(from, to);
   const byOfficer = new Map();
+  const FEE_PER_MOTO = 12_000;
   let grand = {
     total_invoice_amount: 0,
     today_balance_remain: 0,
@@ -366,18 +370,41 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     arrears_morning: 0,
     arrears_realtime: 0,
   };
-  // Morning arrears = baseline on FROM date (start of window).
-  const morningArrears = await getOfficerArrears(from);
-  // Real-time arrears = freshest snapshot (today) — captured by latest day's
-  // computeOfficerReport.
+  // LIVE QB queries — works for any date, no snapshot dependency.
+  // Morning arrears = overdue invoices as of the start (`from`) day.
+  // Real-time arrears = overdue invoices as of right NOW (today + 1 = strict <
+  // bound includes everything overdue today). For multi-day windows we use
+  // `to + 1` so the comparison reflects state at the end of the chosen window.
+  const tomorrow = new Date(to + 'T00:00:00Z');
+  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+  const arrearsNowCutoff = tomorrow.toISOString().slice(0, 10);
+  const [morningArrears, realtimeArrears, offlineCounts] = await Promise.all([
+    getLiveOfficerArrears(from),
+    getLiveOfficerArrears(arrearsNowCutoff),
+    getOfficerOfflineCounts(from), // motos snapshot (refreshed live by operator)
+  ]);
+  // Collections — sum payment_uploads.amount per officer across the window.
+  const collectionsRes = await db().query(
+    `SELECT m.officer_id, m.officer_name,
+            COALESCE(SUM(pu.amount), 0) AS collection
+       FROM payment_uploads pu
+       JOIN customer_officer_map m ON m.customer_id = pu.customer_id
+      WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date >= $1
+        AND (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date <= $2
+        AND pu.status = 'created'
+      GROUP BY m.officer_id, m.officer_name`,
+    [from, to],
+  );
+  const collections = new Map(collectionsRes.rows.map((r) => [r.officer_id, {
+    officer_name: r.officer_name, collection: Number(r.collection),
+  }]));
+  // Invoices — sum live per-day, accumulating across the window.
   for (const d of dates) {
-    const report = await computeOfficerReport(d);
-    for (const row of report.per_officer || report.officers || []) {
-      if (officerIdFilter && String(row.officer_id) !== String(officerIdFilter)) continue;
-      const morningAmt = Number(morningArrears.get(row.officer_id)?.total_arrears
-        || morningArrears.get(row.officer_id)?.amount || 0);
-      const cur = byOfficer.get(row.officer_id) || {
-        officer_id: row.officer_id,
+    const inv = await getLiveOfficerInvoiceTotals(d);
+    for (const [officer_id, row] of inv.entries()) {
+      if (officerIdFilter && String(officer_id) !== String(officerIdFilter)) continue;
+      const cur = byOfficer.get(officer_id) || {
+        officer_id,
         officer_name: row.officer_name,
         total_invoice_amount: 0,
         today_balance_remain: 0,
@@ -386,20 +413,50 @@ async function aggregateOfficers(from, to, officerIdFilter) {
         motos_office: 0,
         motos_police: 0,
         collection: 0,
-        arrears_morning: morningAmt,
-        arrears_realtime: 0,
+        arrears_morning: Number(morningArrears.get(officer_id)?.total_arrears || 0),
+        arrears_realtime: Number(realtimeArrears.get(officer_id)?.total_arrears || 0),
       };
-      cur.total_invoice_amount += Number(row.total_invoice_amount || 0);
-      cur.today_balance_remain += Number(row.today_balance_remain || 0);
-      cur.open += Number(row.open || 0);
-      cur.adjustment += Number(row.offline_adjustment || row.adjustment || 0);
-      cur.motos_office += Number(row.office_count || row.motos_office || 0);
-      cur.motos_police += Number(row.police_count || row.motos_police || 0);
-      cur.collection += Number(row.collection || 0);
-      // Real-time arrears = latest day's value (overwrite each iteration).
-      cur.arrears_realtime = Number(row.total_arrears || row.arrears || 0);
-      byOfficer.set(row.officer_id, cur);
+      cur.total_invoice_amount += row.total_invoice_amount;
+      cur.today_balance_remain += row.today_balance_remain;
+      byOfficer.set(officer_id, cur);
     }
+  }
+  // Apply moto adjustments + collections to every officer that surfaced.
+  // Officers that have collections/arrears but no invoices today still get a
+  // row (they may have arrears + a payment but no fresh invoice).
+  const allIds = new Set([
+    ...byOfficer.keys(),
+    ...morningArrears.keys(),
+    ...realtimeArrears.keys(),
+    ...collections.keys(),
+  ]);
+  for (const id of allIds) {
+    if (officerIdFilter && String(id) !== String(officerIdFilter)) continue;
+    if (!byOfficer.has(id)) {
+      const morning = morningArrears.get(id);
+      const realtime = realtimeArrears.get(id);
+      const col = collections.get(id);
+      byOfficer.set(id, {
+        officer_id: id,
+        officer_name: morning?.officer_name || realtime?.officer_name || col?.officer_name || 'Unknown',
+        total_invoice_amount: 0,
+        today_balance_remain: 0,
+        open: 0,
+        adjustment: 0,
+        motos_office: 0,
+        motos_police: 0,
+        collection: 0,
+        arrears_morning: Number(morning?.total_arrears || 0),
+        arrears_realtime: Number(realtime?.total_arrears || 0),
+      });
+    }
+    const cur = byOfficer.get(id);
+    const motos = offlineCounts.get(id);
+    cur.motos_office = Number(motos?.office_count || 0);
+    cur.motos_police = Number(motos?.police_count || 0);
+    cur.adjustment = (cur.motos_office + cur.motos_police) * FEE_PER_MOTO;
+    cur.open = Math.max(0, cur.total_invoice_amount - cur.adjustment);
+    cur.collection = Number(collections.get(id)?.collection || 0);
   }
   const officers = Array.from(byOfficer.values()).map((o) => {
     const collected = o.total_invoice_amount - o.today_balance_remain;
