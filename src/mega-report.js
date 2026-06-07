@@ -499,4 +499,93 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
       res.status(500).json({ error: err.message });
     }
   });
+
+  // GET /api/mega-report/series?from=YYYY-MM-DD&to=YYYY-MM-DD&officer_id=
+  // Returns a compact per-day summary across the window. Powers the hover-
+  // trend popovers and the click-through monthly/daily detailed views on
+  // the dashboard. Each day computes Account Balance + Sheet Totals +
+  // Officers in parallel; only the metrics needed by KPI tiles are returned.
+  app.get('/api/mega-report/series', requireSecretOrJwt, async (req, res) => {
+    try {
+      const from = String(req.query.from || '');
+      const to = String(req.query.to || '');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+        return res.status(400).json({ error: 'from + to (YYYY-MM-DD) required' });
+      }
+      const officerId = req.query.officer_id || null;
+      const dates = [];
+      const fd = new Date(from + 'T00:00:00Z');
+      const td = new Date(to + 'T00:00:00Z');
+      for (let d = new Date(fd); d <= td; d.setUTCDate(d.getUTCDate() + 1)) {
+        dates.push(d.toISOString().slice(0, 10));
+      }
+      // Hard cap so a careless hover doesn't fan out into hundreds of QB calls.
+      if (dates.length > 62) {
+        return res.status(400).json({ error: `series range too wide (${dates.length} days, max 62)` });
+      }
+      // Process dates with limited concurrency (4 at a time) to avoid QB throttling.
+      const out = [];
+      const CONCURRENCY = 4;
+      let idx = 0;
+      const worker = async () => {
+        while (true) {
+          const i = idx++;
+          if (i >= dates.length) return;
+          const d = dates[i];
+          try {
+            const [acct, sheets, officers] = await Promise.all([
+              getAccountBalance(d, d).catch(() => null),
+              getSheetTotals(d, d).catch(() => null),
+              aggregateOfficers(d, d, officerId).catch(() => null),
+            ]);
+            out[i] = {
+              date: d,
+              account: acct ? {
+                payments_total: acct.payments_in_window?.total || 0,
+                payments_count: acct.payments_in_window?.count || 0,
+                expenses_total: acct.expenses_in_window?.total || 0,
+                expenses_count: acct.expenses_in_window?.count || 0,
+                net_movement: acct.net_movement || 0,
+                opening_balance: acct.opening_balance,
+                closing_live: acct.closing_live,
+              } : null,
+              sheets: sheets ? {
+                passed_total: sheets.grand_passed_total || 0,
+                failed_total: sheets.grand_failed_total || 0,
+                unused_total: sheets.grand_unused_total || 0,
+                by_channel: Object.fromEntries(Object.entries(sheets.by_channel).map(([ch, v]) => [ch, {
+                  passed_total: (v.passed?.total || 0) + (v.extra?.total || 0),
+                  failed_total: v.failed?.total || 0,
+                  unused_total: v.unused?.total_amount || 0,
+                }])),
+              } : null,
+              officers: officers ? {
+                total_invoice_amount: officers.grand.total_invoice_amount || 0,
+                today_balance_remain: officers.grand.today_balance_remain || 0,
+                open: officers.grand.open || 0,
+                collected: officers.grand.collected || 0,
+                pct_collected: officers.grand.pct_collected,
+                arrears_morning: officers.grand.arrears_morning || 0,
+                arrears_realtime: officers.grand.arrears_realtime || 0,
+                arrear_collected: officers.grand.arrear_collected || 0,
+                arrear_pct_collected: officers.grand.arrear_pct_collected,
+                officer_count: officers.officers.length,
+              } : null,
+            };
+          } catch (err) {
+            out[i] = { date: d, error: err.message };
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+      res.json({
+        from, to, officer_id_filter: officerId,
+        days: out,
+        generated_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('[mega-report/series] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
 }

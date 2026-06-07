@@ -597,3 +597,51 @@ export async function getMegaReport(p: MegaReportParams = {}): Promise<MegaRepor
   if (!r.ok) throw new Error(`mega-report ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ─── Mega-Report time series (for hover trends + drilldowns) ───────────────
+
+export interface DailySummary {
+  date: string;
+  account: {
+    payments_total: number; payments_count: number;
+    expenses_total: number; expenses_count: number;
+    net_movement: number;
+    opening_balance: number | null;
+    closing_live: number | null;
+  } | null;
+  sheets: {
+    passed_total: number;
+    failed_total: number;
+    unused_total: number;
+    by_channel: Record<string, { passed_total: number; failed_total: number; unused_total: number }>;
+  } | null;
+  officers: {
+    total_invoice_amount: number;
+    today_balance_remain: number;
+    open: number;
+    collected: number;
+    pct_collected: number | null;
+    arrears_morning: number;
+    arrears_realtime: number;
+    arrear_collected: number;
+    arrear_pct_collected: number | null;
+    officer_count: number;
+  } | null;
+  error?: string;
+}
+export interface MegaReportSeries {
+  from: string;
+  to: string;
+  officer_id_filter: string | null;
+  days: DailySummary[];
+  generated_at: string;
+}
+export async function getMegaReportSeries(params: { from: string; to: string; officer_id?: string }): Promise<MegaReportSeries> {
+  const q = new URLSearchParams();
+  q.set('from', params.from);
+  q.set('to', params.to);
+  if (params.officer_id) q.set('officer_id', params.officer_id);
+  const r = await authed(`/api/mega-report/series?${q.toString()}`);
+  if (!r.ok) throw new Error(`mega-report/series ${r.status}: ${await r.text()}`);
+  return r.json();
+}

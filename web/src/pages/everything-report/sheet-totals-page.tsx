@@ -2,9 +2,10 @@ import { Container } from '@/components/common/container';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { EverythingReportSubNav } from './sub-nav';
 import {
-  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  PageShell, SectionCard, SectionFilterBar,
   fmt, useDefaultFilter, useReportComparison,
 } from './shared';
+import { TrendKpiTile } from './trend-kpi-tile';
 
 export function SheetTotalsPage() {
   const [state, setState] = useDefaultFilter();
@@ -22,9 +23,32 @@ export function SheetTotalsPage() {
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} />
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <ComparisonKpiTile label="PASSED total" current={b?.grand_passed_total ?? null} previous={bp?.grand_passed_total ?? null} />
-          <ComparisonKpiTile label="FAILED total" current={b?.grand_failed_total ?? null} previous={bp?.grand_failed_total ?? null} invertDirection />
-          <ComparisonKpiTile label="UNUSED total" current={b?.grand_unused_total ?? null} previous={bp?.grand_unused_total ?? null} invertDirection />
+          <TrendKpiTile
+            label="PASSED total"
+            current={b?.grand_passed_total ?? null}
+            previous={bp?.grand_passed_total ?? null}
+            extractor={(d) => d.sheets?.passed_total ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="FAILED total"
+            current={b?.grand_failed_total ?? null}
+            previous={bp?.grand_failed_total ?? null}
+            invertDirection
+            extractor={(d) => d.sheets?.failed_total ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="UNUSED total"
+            current={b?.grand_unused_total ?? null}
+            previous={bp?.grand_unused_total ?? null}
+            invertDirection
+            extractor={(d) => d.sheets?.unused_total ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
         </div>
 
         <SectionCard

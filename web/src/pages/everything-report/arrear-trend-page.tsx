@@ -4,9 +4,10 @@ import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { EverythingReportSubNav } from './sub-nav';
 import {
-  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  PageShell, SectionCard, SectionFilterBar,
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
+import { TrendKpiTile } from './trend-kpi-tile';
 
 export function ArrearTrendPage() {
   const [state, setState] = useDefaultFilter();
@@ -25,9 +26,32 @@ export function ArrearTrendPage() {
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} />
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <ComparisonKpiTile label="Arrears current" current={cur} previous={prev} invertDirection />
-          <ComparisonKpiTile label="Arrears prev period" current={prev} previous={null} />
-          <ComparisonKpiTile label="Net Δ arrears" current={(cur ?? 0) - (prev ?? 0)} previous={0} invertDirection />
+          <TrendKpiTile
+            label="Arrears current"
+            current={cur}
+            previous={prev}
+            invertDirection
+            extractor={(d) => d.officers?.arrears_realtime ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Arrears prev period"
+            current={prev}
+            previous={null}
+            extractor={(d) => d.officers?.arrears_realtime ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Net Δ arrears"
+            current={(cur ?? 0) - (prev ?? 0)}
+            previous={0}
+            invertDirection
+            extractor={(d) => d.officers?.arrear_collected ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
         </div>
 
         <SectionCard

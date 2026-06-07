@@ -3,9 +3,10 @@ import { Container } from '@/components/common/container';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { EverythingReportSubNav } from './sub-nav';
 import {
-  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  PageShell, SectionCard, SectionFilterBar,
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
+import { TrendKpiTile } from './trend-kpi-tile';
 
 export function ArrearsPage() {
   const [state, setState] = useDefaultFilter();
@@ -26,10 +27,40 @@ export function ArrearsPage() {
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} officerOptions={officerOptions} />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <ComparisonKpiTile label="Arrears morning" current={c?.grand.arrears_morning ?? null} previous={cp?.grand.arrears_morning ?? null} invertDirection />
-          <ComparisonKpiTile label="Arrears now (real-time)" current={c?.grand.arrears_realtime ?? null} previous={cp?.grand.arrears_realtime ?? null} invertDirection />
-          <ComparisonKpiTile label="Arrear collected" current={c?.grand.arrear_collected ?? null} previous={cp?.grand.arrear_collected ?? null} />
-          <ComparisonKpiTile label="Officers active" current={c?.officers.length ?? null} previous={cp?.officers.length ?? null} />
+          <TrendKpiTile
+            label="Arrears morning"
+            current={c?.grand.arrears_morning ?? null}
+            previous={cp?.grand.arrears_morning ?? null}
+            invertDirection
+            extractor={(d) => d.officers?.arrears_morning ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Arrears now (real-time)"
+            current={c?.grand.arrears_realtime ?? null}
+            previous={cp?.grand.arrears_realtime ?? null}
+            invertDirection
+            extractor={(d) => d.officers?.arrears_realtime ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Arrear collected"
+            current={c?.grand.arrear_collected ?? null}
+            previous={cp?.grand.arrear_collected ?? null}
+            extractor={(d) => d.officers?.arrear_collected ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Officers active"
+            current={c?.officers.length ?? null}
+            previous={cp?.officers.length ?? null}
+            extractor={(d) => d.officers?.officer_count ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
         </div>
 
         <SectionCard

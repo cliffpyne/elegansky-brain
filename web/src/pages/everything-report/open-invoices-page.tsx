@@ -3,9 +3,10 @@ import { Container } from '@/components/common/container';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { EverythingReportSubNav } from './sub-nav';
 import {
-  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  PageShell, SectionCard, SectionFilterBar,
   fmt, fmtPct, useDefaultFilter, useReportComparison,
 } from './shared';
+import { TrendKpiTile } from './trend-kpi-tile';
 
 export function OpenInvoicesPage() {
   const [state, setState] = useDefaultFilter();
@@ -26,10 +27,39 @@ export function OpenInvoicesPage() {
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} officerOptions={officerOptions} />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <ComparisonKpiTile label="Total invoice amount" current={c?.grand.total_invoice_amount ?? null} previous={cp?.grand.total_invoice_amount ?? null} />
-          <ComparisonKpiTile label="Balance remain" current={c?.grand.today_balance_remain ?? null} previous={cp?.grand.today_balance_remain ?? null} invertDirection />
-          <ComparisonKpiTile label="Open (after motos)" current={c?.grand.open ?? null} previous={cp?.grand.open ?? null} />
-          <ComparisonKpiTile label="Collected" current={c?.grand.collected ?? null} previous={cp?.grand.collected ?? null} />
+          <TrendKpiTile
+            label="Total invoice amount"
+            current={c?.grand.total_invoice_amount ?? null}
+            previous={cp?.grand.total_invoice_amount ?? null}
+            extractor={(d) => d.officers?.total_invoice_amount ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Balance remain"
+            current={c?.grand.today_balance_remain ?? null}
+            previous={cp?.grand.today_balance_remain ?? null}
+            invertDirection
+            extractor={(d) => d.officers?.today_balance_remain ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Open (after motos)"
+            current={c?.grand.open ?? null}
+            previous={cp?.grand.open ?? null}
+            extractor={(d) => d.officers?.open ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Collected"
+            current={c?.grand.collected ?? null}
+            previous={cp?.grand.collected ?? null}
+            extractor={(d) => d.officers?.collected ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
         </div>
 
         <SectionCard

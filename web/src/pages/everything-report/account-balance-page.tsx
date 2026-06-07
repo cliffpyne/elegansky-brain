@@ -2,9 +2,10 @@ import { Container } from '@/components/common/container';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { EverythingReportSubNav } from './sub-nav';
 import {
-  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  PageShell, SectionCard, SectionFilterBar,
   fmt, fmt2, useDefaultFilter, useReportComparison,
 } from './shared';
+import { TrendKpiTile } from './trend-kpi-tile';
 
 export function AccountBalancePage() {
   const [state, setState] = useDefaultFilter();
@@ -21,10 +22,40 @@ export function AccountBalancePage() {
         <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <ComparisonKpiTile label="Payments (credits)" current={a?.payments_in_window.total ?? null} previous={ap?.payments_in_window.total ?? null} />
-          <ComparisonKpiTile label="Expenses (debits)" current={a?.expenses_in_window.total ?? null} previous={ap?.expenses_in_window.total ?? null} invertDirection />
-          <ComparisonKpiTile label="Net movement" current={a?.net_movement ?? null} previous={ap?.net_movement ?? null} />
-          <ComparisonKpiTile label="Live balance" current={a?.closing_live ?? null} previous={ap?.closing_live ?? null} formatter={fmt2} />
+          <TrendKpiTile
+            label="Payments (credits)"
+            current={a?.payments_in_window.total ?? null}
+            previous={ap?.payments_in_window.total ?? null}
+            extractor={(d) => d.account?.payments_total ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Expenses (debits)"
+            current={a?.expenses_in_window.total ?? null}
+            previous={ap?.expenses_in_window.total ?? null}
+            invertDirection
+            extractor={(d) => d.account?.expenses_total ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Net movement"
+            current={a?.net_movement ?? null}
+            previous={ap?.net_movement ?? null}
+            extractor={(d) => d.account?.net_movement ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
+          <TrendKpiTile
+            label="Live balance"
+            current={a?.closing_live ?? null}
+            previous={ap?.closing_live ?? null}
+            formatter={fmt2}
+            extractor={(d) => d.account?.closing_live ?? null}
+            anchor={state.anchor}
+            officerId={state.officerId || undefined}
+          />
         </div>
 
         <SectionCard
