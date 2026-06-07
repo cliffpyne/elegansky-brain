@@ -4395,6 +4395,13 @@ function processInvoicePayments(invoices, transactions) {
   return out;
 }
 
+// In-process cache for the heavy QB Payment+CreditMemo scan. The scan
+// itself is identical regardless of wanted refs, so caching the FULL
+// PrivateNote → info Map lets 3-channel fires within the same window
+// share one ~30-60s QB scan. Cleared automatically after 5 min.
+const _qbScanCache = { hits: null, expires: 0, daysBack: 0 };
+const QB_SCAN_TTL_MS = 5 * 60_000;
+
 // Scan QB for any of the supplied suffixed bank_refs that already exist as
 // Payment OR CreditMemo PrivateNotes within the last `daysBack` days.
 //
@@ -4410,45 +4417,57 @@ function processInvoicePayments(invoices, transactions) {
 // Used by prepareAutoUpload's dup-check step.
 async function scanQbForRefDuplicates(wantedBareRefs, channelSuffix, daysBack = 60) {
   if (!wantedBareRefs || wantedBareRefs.length === 0) return new Map();
-  const bareSet = new Set(wantedBareRefs);
-  // suffixedToBare: 'XYZ123N' → 'XYZ123' (lets us O(1) recognise suffixed hits)
-  const suffixedToBare = new Map();
-  if (channelSuffix) {
-    for (const r of wantedBareRefs) suffixedToBare.set(r + channelSuffix, r);
-  }
-  const fromDate = new Date(Date.now() - daysBack * 24 * 60 * 60_000).toISOString().slice(0, 10);
-  const hits = new Map();
-  for (const kind of ['Payment', 'CreditMemo']) {
-    let start = 1;
-    const PAGE = 1000;
-    while (start < 200_000) {
-      const sql =
-        `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM ${kind} ` +
-        `WHERE TxnDate >= '${fromDate}' ` +
-        `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
-      const r = await qbQuery(sql);
-      const rows = r.QueryResponse?.[kind] || [];
-      if (!rows.length) break;
-      for (const row of rows) {
-        const pn = String(row.PrivateNote || '').trim();
-        if (!pn) continue;
-        let bare = null;
-        let matchedForm = null;
-        if (bareSet.has(pn)) { bare = pn; matchedForm = 'bare'; }
-        else if (suffixedToBare.has(pn)) { bare = suffixedToBare.get(pn); matchedForm = 'suffixed'; }
-        if (!bare) continue;
-        // Skip voided rows (TotalAmt=0 typically means a voided Payment in QB).
-        if (kind === 'Payment' && Number(row.TotalAmt || 0) === 0) continue;
-        hits.set(bare, {
-          qb_id: String(row.Id),
-          qb_kind: kind === 'CreditMemo' ? 'credit_memo' : 'payment',
-          customer_id: String(row.CustomerRef?.value || ''),
-          txn_date: row.TxnDate || null,
-          matched_form: matchedForm,
-        });
+
+  // CACHE PATH: the QB scan is identical no matter the wanted set. We cache
+  // the FULL PrivateNote → info Map and filter per-caller. 3-channel fires
+  // within 5 min share one ~30-60s QB scan. 38× speedup on a meru0300 cycle.
+  let allHits;
+  if (_qbScanCache.hits && _qbScanCache.expires > Date.now() && _qbScanCache.daysBack === daysBack) {
+    allHits = _qbScanCache.hits;
+  } else {
+    allHits = new Map(); // PrivateNote → info (any non-voided Payment/CreditMemo TxnDate >= cutoff)
+    const fromDate = new Date(Date.now() - daysBack * 24 * 60 * 60_000).toISOString().slice(0, 10);
+    for (const kind of ['Payment', 'CreditMemo']) {
+      let start = 1;
+      const PAGE = 1000;
+      while (start < 200_000) {
+        const sql =
+          `SELECT Id, PrivateNote, TotalAmt, TxnDate, CustomerRef FROM ${kind} ` +
+          `WHERE TxnDate >= '${fromDate}' ` +
+          `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
+        const r = await qbQuery(sql);
+        const rows = r.QueryResponse?.[kind] || [];
+        if (!rows.length) break;
+        for (const row of rows) {
+          const pn = String(row.PrivateNote || '').trim();
+          if (!pn) continue;
+          // Skip voided rows (TotalAmt=0 typically means a voided Payment in QB).
+          if (kind === 'Payment' && Number(row.TotalAmt || 0) === 0) continue;
+          allHits.set(pn, {
+            qb_id: String(row.Id),
+            qb_kind: kind === 'CreditMemo' ? 'credit_memo' : 'payment',
+            customer_id: String(row.CustomerRef?.value || ''),
+            txn_date: row.TxnDate || null,
+          });
+        }
+        if (rows.length < PAGE) break;
+        start += PAGE;
       }
-      if (rows.length < PAGE) break;
-      start += PAGE;
+    }
+    _qbScanCache.hits = allHits;
+    _qbScanCache.expires = Date.now() + QB_SCAN_TTL_MS;
+    _qbScanCache.daysBack = daysBack;
+  }
+
+  // Per-caller filter: only keep refs the caller actually wanted, matched
+  // against the bare OR suffixed form.
+  const hits = new Map();
+  for (const r of wantedBareRefs) {
+    const bareInfo = allHits.get(r);
+    if (bareInfo) { hits.set(r, { ...bareInfo, matched_form: 'bare' }); continue; }
+    if (channelSuffix) {
+      const sufInfo = allHits.get(r + channelSuffix);
+      if (sufInfo) hits.set(r, { ...sufInfo, matched_form: 'suffixed' });
     }
   }
   return hits;
@@ -4482,7 +4501,17 @@ async function logBatch(batchId, level, message, source, extra = null) {
   }
 }
 
+// In-process cache for /arrears — same per-channel meru0300 cycle hits
+// this 6 times with identical AS_OF; one fetch then reuse for 5 min.
+// Each fetch pages ~12k QB invoices ~15-25s.
+const _arrearsCache = new Map(); // asOf → { rows, expires }
+const ARREARS_TTL_MS = 5 * 60_000;
+
 async function fetchAllArrears(asOf) {
+  const cacheKey = String(asOf || 'NONE');
+  const cached = _arrearsCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return cached.rows;
+
   const { default: fetchImpl } = { default: globalThis.fetch };
   const base = process.env.SELF_URL || 'http://127.0.0.1:' + (process.env.PORT || 3000);
   const arrears = [];
@@ -4497,6 +4526,12 @@ async function fetchAllArrears(asOf) {
     arrears.push(...invs);
     if (!j.page?.nextStart) break;
     start = j.page.nextStart;
+  }
+  _arrearsCache.set(cacheKey, { rows: arrears, expires: Date.now() + ARREARS_TTL_MS });
+  // Prune to keep memory bounded — keep last 4 AS_OFs.
+  if (_arrearsCache.size > 4) {
+    const oldest = [...(_arrearsCache.entries())].sort((a, b) => a[1].expires - b[1].expires)[0];
+    if (oldest) _arrearsCache.delete(oldest[0]);
   }
   return arrears;
 }
