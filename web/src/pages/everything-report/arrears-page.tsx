@@ -1,0 +1,76 @@
+import { useMemo } from 'react';
+import { Container } from '@/components/common/container';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { EverythingReportSubNav } from './sub-nav';
+import {
+  PageShell, SectionCard, SectionFilterBar, ComparisonKpiTile,
+  fmt, fmtPct, useDefaultFilter, useReportComparison,
+} from './shared';
+
+export function ArrearsPage() {
+  const [state, setState] = useDefaultFilter();
+  const { current, previous, loading, reload, windows, lastFetch } = useReportComparison(state);
+  const c = current?.section_c_d_officers;
+  const cp = previous?.section_c_d_officers;
+  const officerOptions = useMemo(() =>
+    (c?.officers || []).map((o) => ({ id: String(o.officer_id), name: o.officer_name || o.officer_id })),
+    [c],
+  );
+  return (
+    <Container>
+      <PageShell
+        title="D · Open & Closing Arrears per Officer"
+        description={`Morning arrear baseline vs real-time + % collected · ${windows.current.from} → ${windows.current.to}`}
+      >
+        <EverythingReportSubNav />
+        <SectionFilterBar state={state} onChange={setState} onRefresh={reload} loading={loading} officerOptions={officerOptions} />
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <ComparisonKpiTile label="Arrears morning" current={c?.grand.arrears_morning ?? null} previous={cp?.grand.arrears_morning ?? null} invertDirection />
+          <ComparisonKpiTile label="Arrears now (real-time)" current={c?.grand.arrears_realtime ?? null} previous={cp?.grand.arrears_realtime ?? null} invertDirection />
+          <ComparisonKpiTile label="Arrear collected" current={c?.grand.arrear_collected ?? null} previous={cp?.grand.arrear_collected ?? null} />
+          <ComparisonKpiTile label="Officers active" current={c?.officers.length ?? null} previous={cp?.officers.length ?? null} />
+        </div>
+
+        <SectionCard
+          title="Officer arrear breakdown"
+          toolbar={lastFetch ? <span className="text-xs text-muted-foreground">Fetched {lastFetch.toLocaleTimeString()}</span> : null}
+        >
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Officer</TableHead>
+                  <TableHead className="text-right">Arrear morning</TableHead>
+                  <TableHead className="text-right">Arrear now</TableHead>
+                  <TableHead className="text-right">Arrear collected</TableHead>
+                  <TableHead className="text-right">% arrear collected</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {c?.officers.map((o) => (
+                  <TableRow key={o.officer_id}>
+                    <TableCell className="whitespace-nowrap font-medium">{o.officer_name}</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(o.arrears_morning)}</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(o.arrears_realtime)}</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(o.arrear_collected)}</TableCell>
+                    <TableCell className="text-right">{fmtPct(o.arrear_pct_collected)}</TableCell>
+                  </TableRow>
+                ))}
+                {c && (
+                  <TableRow className="bg-muted/30 font-semibold">
+                    <TableCell>TOTAL</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(c.grand.arrears_morning)}</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(c.grand.arrears_realtime)}</TableCell>
+                    <TableCell className="text-right font-mono">{fmt(c.grand.arrear_collected)}</TableCell>
+                    <TableCell className="text-right">{fmtPct(c.grand.arrear_pct_collected)}</TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </SectionCard>
+      </PageShell>
+    </Container>
+  );
+}
