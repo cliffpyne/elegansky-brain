@@ -508,3 +508,86 @@ export async function getPaymentUploadsTodayTotals(): Promise<PaymentUploadsTota
   if (!r.ok) throw new Error(`today-totals ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ─── Mega-Report (everything-report page) ──────────────────────────────────
+
+export interface MegaReportWindow { from: string; to: string }
+export interface MegaAccountBalance {
+  account_name: string;
+  opening_as_of: string;
+  opening: number | null;
+  closing_as_of: string;
+  closing: number | null;
+  live: number | null;
+  delta_in_window: number | null;
+}
+export interface MegaChannelSection {
+  passed: { rows: number; total: number };
+  failed: { rows: number; total: number };
+  unused: {
+    passed_rows: number; passed_total: number;
+    failed_rows: number; failed_total: number;
+    total_rows: number; total_amount: number;
+  };
+}
+export interface MegaSheetTotals {
+  by_channel: Record<string, MegaChannelSection>;
+  grand_passed_total: number;
+  grand_failed_total: number;
+  grand_unused_total: number;
+}
+export interface MegaOfficerRow {
+  officer_id: string;
+  officer_name: string;
+  total_invoice_amount: number;
+  today_balance_remain: number;
+  open: number;
+  adjustment: number;
+  motos_office: number;
+  motos_police: number;
+  collection: number;
+  collected: number;
+  pct_collected: number | null;
+  arrears_morning: number;
+  arrears_realtime: number;
+  arrear_collected: number;
+  arrear_pct_collected: number | null;
+}
+export interface MegaOfficersAgg {
+  officers: MegaOfficerRow[];
+  grand: MegaOfficerRow & Record<string, number | null>;
+}
+export interface MegaArrearTrend {
+  current: number;
+  previous: number;
+  delta: number;
+  direction: 'up' | 'down' | 'flat';
+  pct_change: number | null;
+}
+export interface MegaReport {
+  window: MegaReportWindow;
+  officer_id_filter: string | null;
+  section_a_account_balance: MegaAccountBalance;
+  section_b_sheet_totals: MegaSheetTotals;
+  section_c_d_officers: MegaOfficersAgg;
+  section_e_company_arrear_trend: MegaArrearTrend;
+  generated_at: string;
+}
+export interface MegaReportParams {
+  granularity?: 'day' | 'week' | 'month' | 'range';
+  anchor?: string;
+  from?: string;
+  to?: string;
+  officer_id?: string;
+}
+export async function getMegaReport(p: MegaReportParams = {}): Promise<MegaReport> {
+  const q = new URLSearchParams();
+  if (p.granularity) q.set('granularity', p.granularity);
+  if (p.anchor) q.set('anchor', p.anchor);
+  if (p.from) q.set('from', p.from);
+  if (p.to) q.set('to', p.to);
+  if (p.officer_id) q.set('officer_id', p.officer_id);
+  const r = await authed(`/api/mega-report?${q.toString()}`);
+  if (!r.ok) throw new Error(`mega-report ${r.status}: ${await r.text()}`);
+  return r.json();
+}
