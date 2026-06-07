@@ -435,3 +435,28 @@ CREATE TABLE IF NOT EXISTS officer_invoice_snapshots (
   cached_at              timestamptz   NOT NULL DEFAULT now(),
   PRIMARY KEY (snapshot_date, officer_id)
 );
+
+-- QB Open-Invoices snapshot, captured per AS_OF date. Batches share a
+-- snapshot when they fire against the same AS_OF (e.g. 3 channels firing
+-- the same morning tick all bind to one snapshot). Lets the operator
+-- later download the exact invoice universe that was allocated against.
+CREATE TABLE IF NOT EXISTS invoice_snapshots (
+  id            uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  as_of         date          NOT NULL,
+  captured_at   timestamptz   NOT NULL DEFAULT now(),
+  invoice_count integer       NOT NULL,
+  total_balance numeric       NOT NULL,
+  -- Array of { date, no, customer, memo, balance, amount, status } shapes.
+  data          jsonb         NOT NULL,
+  -- The header line we render at the top of the .xls download.
+  date_range_header text
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoice_snapshots_as_of
+  ON invoice_snapshots (as_of, captured_at DESC);
+
+-- Link payment_batches → invoice_snapshots. NULL on batches created
+-- before this feature shipped. Always populated for new batches.
+ALTER TABLE payment_batches
+  ADD COLUMN IF NOT EXISTS invoice_snapshot_id uuid
+    REFERENCES invoice_snapshots(id);

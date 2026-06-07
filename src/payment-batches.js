@@ -4500,6 +4500,52 @@ async function fetchAllArrears(asOf) {
   return arrears;
 }
 
+// Persist the QB Open-Invoices snapshot that batch <X> was built against.
+// Always-on (no toggle). Dedupes by (as_of, captured_at) so 3-channel tick
+// fires for the same AS_OF share one row instead of writing 3× ~2MB of jsonb.
+//
+// We REUSE the `arrears` array prepareAutoUpload already fetched — zero extra
+// QB load. The trade-off: snapshot reflects whatever /arrears returns at that
+// instant. That's exactly the universe the upload allocated against, which
+// is what we want for audit (operator: "show me the invoice list this batch
+// chose to apply payments to").
+//
+// Cache window: 30 min. A tick that fires meru0300 across 3 channels within
+// 30 min picks up the same snapshot id. After 30 min we assume the operator's
+// triggering a new cycle and want a fresh list.
+async function captureInvoiceSnapshot(asOf, arrears) {
+  if (!asOf) return null;
+  const recent = await db().query(
+    `SELECT id FROM invoice_snapshots
+      WHERE as_of = $1 AND captured_at > now() - interval '30 minutes'
+      ORDER BY captured_at DESC LIMIT 1`,
+    [asOf],
+  );
+  if (recent.rows.length) return recent.rows[0].id;
+
+  // Trim to the .xls-shaped fields (drop branch + customerLeaf — derivable).
+  const data = (arrears || []).map((r) => ({
+    qbId: r.qbId, date: r.date, dueDate: r.dueDate,
+    no: r.no, customer: r.customer, memo: r.memo || '',
+    balance: Number(r.balance) || 0, amount: Number(r.amount) || 0,
+    status: r.status || 'overdue',
+  }));
+  const totalBalance = data.reduce((s, r) => s + r.balance, 0);
+  // Header line matches Frank's QB-export sample:
+  //   "Type: Invoices Status: Open Delivery Method: Any Date: <from> - <asOf>"
+  const dates = data.map((r) => r.date).filter(Boolean).sort();
+  const fromDate = dates[0] || `${String(asOf).slice(0, 4)}-01-01`;
+  const header = `Type: Invoices Status: Open Delivery Method: Any Date: ${fromDate} - ${asOf}`;
+
+  const ins = await db().query(
+    `INSERT INTO invoice_snapshots
+       (as_of, invoice_count, total_balance, data, date_range_header)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [asOf, data.length, round2(totalBalance), JSON.stringify(data), header],
+  );
+  return ins.rows[0].id;
+}
+
 async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
@@ -4655,6 +4701,17 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   );
   const snapshotId = snapInsert.rows[0].id;
 
+  // Persist a downloadable QB Open-Invoices snapshot for this AS_OF. Always-on
+  // per Frank's spec: every batch (auto + heisenberg) must be replayable from
+  // the dashboard via Invoices.xls / Paid.csv / Unused.csv downloads.
+  // Reuses the `arrears` array we just fetched — no extra QB load.
+  let invoiceSnapshotId = null;
+  try {
+    invoiceSnapshotId = await captureInvoiceSnapshot(snapshotAsOf, arrears);
+  } catch (e) {
+    console.error('[captureInvoiceSnapshot] failed (non-fatal):', e.message);
+  }
+
   // 4. Algorithm
   const result = processInvoicePayments(invoices, txnsClean);
   let paid = result.filter((p) => !p.isUnused && p.amount > 0);
@@ -4788,12 +4845,12 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     await client.query('BEGIN');
     const ins = await client.query(
       `INSERT INTO payment_batches (
-         idempotency_key, status, arrears_snapshot_id,
+         idempotency_key, status, arrears_snapshot_id, invoice_snapshot_id,
          sheet_id, sheet_tab, channel, bank_refs,
          sheet_total, paid_total, unused_total,
          paid_count, unused_count, created_by
-       ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-      [idem, snapshotId, cfg.sheetId, cfg.tab, channel, bankRefs,
+       ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [idem, snapshotId, invoiceSnapshotId, cfg.sheetId, cfg.tab, channel, bankRefs,
        round2(sheetSum), round2(sumPaid), round2(sumUnused),
        paid.length, unused.length, `auto-upload`],
     );
