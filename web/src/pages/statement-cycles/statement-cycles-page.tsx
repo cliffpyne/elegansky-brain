@@ -35,7 +35,7 @@ import {
 import { Play, Activity as ActivityIcon } from 'lucide-react';
 
 const REFRESH_MS = 30_000;
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 10;
 
 export function StatementCyclesPage() {
   const [summary, setSummary] = useState<SummaryResp | null>(null);
