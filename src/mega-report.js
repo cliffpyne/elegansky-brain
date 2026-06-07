@@ -144,25 +144,35 @@ async function getAccountBalance(fromDate, toDate) {
  *   D = description E = amount        F = plate code(s)
  *   G = customer    H = bank_ref
  */
-async function readSheetTab(sheetId, tab) {
-  const out = { rows: 0, total: 0, unused_rows: 0, unused_total: 0, refs: [] };
+/**
+ * Parse "DD.MM.YYYY HH:MM:SS" → Date (treats clock as EAT, returns UTC Date).
+ */
+function parseSheetTs(s) {
+  if (!s) return null;
+  const m = String(s).trim().match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const [, d, mo, y, hh, mm, ss] = m;
+  return new Date(Date.UTC(+y, +mo - 1, +d, +hh - 3, +mm, +(ss || 0)));
+}
+
+async function readSheetTab(sheetId, tab, windowStart, windowEnd) {
+  const out = { rows: 0, total: 0, unused_rows: 0, unused_total: 0 };
   try {
     const sheet = await readSheet(sheetId, `${tab}!A1:H100000`);
     const data = sheet.values || sheet.data || [];
     for (let i = 1; i < data.length; i++) {
       const r = data[i] || [];
-      if (!r[1]) continue; // skip no-date rows
+      const ts = parseSheetTs(r[1]);
+      if (!ts) continue;
+      if (windowStart && ts < windowStart) continue;
+      if (windowEnd && ts >= windowEnd) continue;
       const amt = parseAmount(r[4]);
-      const plate = r[5];
-      const cust = r[6];
-      const ref = String(r[7] || '').trim();
       out.rows++;
       out.total += amt;
-      if (isUnusedRow(plate, cust)) {
+      if (isUnusedRow(r[5], r[6])) {
         out.unused_rows++;
         out.unused_total += amt;
       }
-      if (ref) out.refs.push(ref);
     }
   } catch (err) {
     console.error('[mega-report] readSheetTab failed:', sheetId, tab, err.message);
@@ -170,13 +180,17 @@ async function readSheetTab(sheetId, tab) {
   return out;
 }
 
-async function getSheetTotals() {
+async function getSheetTotals(fromDate, toDate) {
+  // Window: [fromDate 00:00 EAT, (toDate + 1 day) 00:00 EAT) in UTC.
+  const winStart = new Date(fromDate + 'T00:00:00+03:00');
+  const winEndExclusive = new Date(toDate + 'T00:00:00+03:00');
+  winEndExclusive.setUTCDate(winEndExclusive.getUTCDate() + 1);
   const byChannel = {};
   let totalPassed = 0, totalFailed = 0, totalUnused = 0;
   for (const [channel, cfg] of Object.entries(CHANNEL_TABS)) {
     const [passed, failed] = await Promise.all([
-      readSheetTab(cfg.sheetId, cfg.passed),
-      readSheetTab(cfg.sheetId, cfg.failed),
+      readSheetTab(cfg.sheetId, cfg.passed, winStart, winEndExclusive),
+      readSheetTab(cfg.sheetId, cfg.failed, winStart, winEndExclusive),
     ]);
     byChannel[channel] = {
       passed: { rows: passed.rows, total: passed.total },
@@ -240,8 +254,10 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   // computeOfficerReport.
   for (const d of dates) {
     const report = await computeOfficerReport(d);
-    for (const row of report.officers || []) {
+    for (const row of report.per_officer || report.officers || []) {
       if (officerIdFilter && String(row.officer_id) !== String(officerIdFilter)) continue;
+      const morningAmt = Number(morningArrears.get(row.officer_id)?.total_arrears
+        || morningArrears.get(row.officer_id)?.amount || 0);
       const cur = byOfficer.get(row.officer_id) || {
         officer_id: row.officer_id,
         officer_name: row.officer_name,
@@ -252,15 +268,15 @@ async function aggregateOfficers(from, to, officerIdFilter) {
         motos_office: 0,
         motos_police: 0,
         collection: 0,
-        arrears_morning: Number(morningArrears.get(row.officer_id)?.amount || 0),
+        arrears_morning: morningAmt,
         arrears_realtime: 0,
       };
       cur.total_invoice_amount += Number(row.total_invoice_amount || 0);
       cur.today_balance_remain += Number(row.today_balance_remain || 0);
       cur.open += Number(row.open || 0);
-      cur.adjustment += Number(row.adjustment || 0);
-      cur.motos_office += Number(row.motos_office || row.office_count || 0);
-      cur.motos_police += Number(row.motos_police || row.police_count || 0);
+      cur.adjustment += Number(row.offline_adjustment || row.adjustment || 0);
+      cur.motos_office += Number(row.office_count || row.motos_office || 0);
+      cur.motos_police += Number(row.police_count || row.motos_police || 0);
       cur.collection += Number(row.collection || 0);
       // Real-time arrears = latest day's value (overwrite each iteration).
       cur.arrears_realtime = Number(row.total_arrears || row.arrears || 0);
@@ -348,7 +364,7 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
       const officerId = req.query.officer_id || null;
       const [accountBalance, sheetTotals, officersAgg] = await Promise.all([
         getAccountBalance(window.from, window.to),
-        getSheetTotals(),
+        getSheetTotals(window.from, window.to),
         aggregateOfficers(window.from, window.to, officerId),
       ]);
       // Previous-period comparison for arrear trend (same length, immediately prior).
