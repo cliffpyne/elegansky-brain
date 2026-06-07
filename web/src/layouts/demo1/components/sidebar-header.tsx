@@ -1,6 +1,7 @@
 import { ChevronFirst } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { cn } from '@/lib/utils';
+import { toAbsoluteUrl } from '@/lib/helpers';
 import { useSettings } from '@/providers/settings-provider';
 import { Button } from '@/components/ui/button';
 
@@ -15,14 +16,14 @@ export function SidebarHeader() {
   return (
     <div className="sidebar-header hidden lg:flex items-center relative justify-between px-3 lg:px-6 shrink-0">
       <Link to="/" className="flex items-center gap-2">
-        <div
-          className="size-8 rounded-md bg-gradient-to-br from-primary to-primary/60 grid place-items-center text-primary-foreground font-bold shrink-0"
-          aria-hidden
-        >
-          B
-        </div>
+        <img
+          src={toAbsoluteUrl('/media/app/elegansky-logo-256.png')}
+          srcSet={`${toAbsoluteUrl('/media/app/elegansky-logo-256.png')} 1x, ${toAbsoluteUrl('/media/app/elegansky-logo.png')} 2x`}
+          alt="Elegansky"
+          className="size-9 object-contain shrink-0"
+        />
         {!collapsed && (
-          <span className="text-lg font-bold tracking-tight text-foreground">BRAIN</span>
+          <span className="text-lg font-bold tracking-tight text-foreground">ELEGANSKY</span>
         )}
       </Link>
       <Button
