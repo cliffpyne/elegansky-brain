@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Toolbar, ToolbarActions, ToolbarHeading } from '@/layouts/demo1/components/toolbar';
 import { Container } from '@/components/common/container';
@@ -125,10 +125,23 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
     firedAt: number;
   } | null>(null);
 
+  // Ref-based double-fire guard. `firing` state has React's async lag —
+  // a rapid double-click can pass through both `disabled={firing}` and the
+  // initial setFiring(true) before the re-render lands the disabled style.
+  // The ref locks synchronously so the second click bails immediately.
+  // Frank 2026-06-07: confirmed two agent sessions started 197ms apart
+  // before this guard was added.
+  const firingRef = useRef(false);
+
   // Shared push helper — same code path whether triggered from the main
   // Fire button or the Push-to-QB shortcut. forceMode lets the shortcut
   // override the dropdown.
   const doFire = async (forceMode?: 'plan' | 'execute') => {
+    if (firingRef.current) {
+      console.warn('[heisenberg] doFire ignored — already firing (double-click guard)');
+      return;
+    }
+    firingRef.current = true;
     const effectiveMode = forceMode || mode;
     setFiring(true);
     setResult(null);
@@ -168,12 +181,13 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
       // Cooldown — keep the button disabled for 90s after fire so an
       // impatient operator can't spawn a second agent while the first
       // is still mid-flight (acquired the channel lock).
-      setTimeout(() => setFiring(false), 90_000);
+      setTimeout(() => { setFiring(false); firingRef.current = false; }, 90_000);
       return;
     } catch (e) {
       setError((e as Error).message);
     }
     setFiring(false);
+    firingRef.current = false;
   };
   const fire = () => doFire();
 
