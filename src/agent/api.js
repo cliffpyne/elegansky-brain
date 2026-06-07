@@ -112,11 +112,17 @@ export function mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, re
   app.get('/api/agent/sessions', requireSupabaseJwt, async (req, res) => {
     try {
       const limit = Math.min(Number(req.query.limit) || 50, 200);
+      // FILTER seed rows (model='pending-spawn') — these are short-lived
+      // placeholders that exist only between the sync HTTP response and the
+      // real session insert. Showing them in the dashboard made every fire
+      // look like a double-fire (Frank case 2026-06-07). They get deleted
+      // automatically when the real session finishes.
       const r = await db().query(
         `SELECT id, trigger, trigger_context, mode, model, status, summary, stats,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
                 started_at, ended_at
            FROM agent_sessions
+          WHERE model IS DISTINCT FROM 'pending-spawn'
           ORDER BY started_at DESC LIMIT $1`,
         [limit],
       );

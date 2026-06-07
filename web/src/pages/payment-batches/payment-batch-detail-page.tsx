@@ -488,13 +488,44 @@ export function PaymentBatchDetailPage() {
 
         <Card className="mb-4 border-slate-400/40">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <ShieldAlert className="size-4 text-slate-500" />
-              Skipped QB duplicates ({skippedDups.length})
-            </CardTitle>
-            <CardDescription>
-              Refs that BRAIN's pre-flight found ALREADY in QB (from SaasAnt, the manual transaction processor, or a prior BRAIN run). These were grey-painted on the sheet and excluded from this batch — no QB Payment was created for them here.
-            </CardDescription>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <ShieldAlert className="size-4 text-slate-500" />
+                  Skipped QB duplicates ({skippedDups.length})
+                </CardTitle>
+                <CardDescription>
+                  Refs that BRAIN's pre-flight found ALREADY in QB (from SaasAnt, the manual transaction processor, or a prior BRAIN run). These were grey-painted on the sheet and excluded from this batch — no QB Payment was created for them here.
+                </CardDescription>
+              </div>
+              {skippedDups.length > 0 && (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    const header = ['bank_ref', 'qb_id', 'qb_kind', 'qb_txn_date', 'customer_id', 'found_at', 'found_by'];
+                    const esc = (v: string | null | undefined) => {
+                      if (v == null) return '';
+                      const s = String(v);
+                      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+                    };
+                    const lines = [header.join(',')];
+                    for (const r of skippedDups) {
+                      lines.push([r.bank_ref, r.qb_id, r.qb_kind, r.qb_txn_date, r.customer_id, r.found_at, r.found_by].map(esc).join(','));
+                    }
+                    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `skipped-duplicates-${batch?.id.slice(0, 8)}-${batch?.channel}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                >
+                  <Download className="size-4" />
+                  Export CSV
+                </Button>
+              )}
+            </div>
           </CardHeader>
           <CardContent>
             <Table>
