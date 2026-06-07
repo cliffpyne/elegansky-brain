@@ -270,7 +270,13 @@ export async function dispatch(toolName, input, ctx) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Report-Secret': secret },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(180_000),
+          // 600s (10 min) — enough headroom for the FIRST fire of a session
+          // when none of the perf caches (arrears 12k, QB dup-scan 60-day) are
+          // warm. Subsequent fires within 5 min hit the cache and finish in
+          // 15-30s. Before bumping this, the agent timed out at 180s and
+          // retried 3× getting 409 lock conflicts while the server job
+          // genuinely was still processing (Frank case 2026-06-07T16:40Z).
+          signal: AbortSignal.timeout(600_000),
         });
         const j = await r.json().catch(async () => ({ error: 'non-json response', body: (await r.text()).slice(0, 500) }));
         if (!r.ok) {
