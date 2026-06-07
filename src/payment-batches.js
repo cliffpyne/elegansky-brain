@@ -97,246 +97,6 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
-  // ── POST /api/payment-batches — THE BIG ONE ──────────────────────────────
-  //
-  // Body shape:
-  // {
-  //   idempotency_key:    "sha256-of-payload",
-  //   arrears_snapshot_id: "uuid",
-  //   sheet_id:           "1rd...",
-  //   sheet_tab:          "PASSED",
-  //   channel:            "bank" | "iphone_bank" | "nmbnew",
-  //   bank_refs:          ["REF:abc...", ...],   ← ALL refs in this batch
-  //   paid:    [{ bank_ref, customer_id, invoice_qb_id, invoice_no, amount, memo }],
-  //   unused:  [{ bank_ref, customer_id, customer_name, amount, memo }],
-  //   created_by: "invoice-payment-app@hostname"
-  // }
-  //
-  // Returns:
-  //   201 { batch: {...}, idempotent_replay: false }
-  //   200 { batch: {...}, idempotent_replay: true }    ← same key, prior run
-  //   400/403/409/422 with { error: "..." }            ← gate failures
-  //   500 + rolled_back on QB error mid-flight
-  app.post('/api/payment-batches', requireSharedSecret, async (req, res) => {
-    const body = req.body ?? {};
-
-    // ── 1. Idempotency ────────────────────────────────────────────────────
-    if (!body.idempotency_key || typeof body.idempotency_key !== 'string') {
-      return res.status(400).json({ error: 'idempotency_key required' });
-    }
-    const existing = await db().query(
-      `SELECT * FROM payment_batches WHERE idempotency_key = $1`,
-      [body.idempotency_key],
-    );
-    if (existing.rows.length) {
-      return res.json({ batch: existing.rows[0], idempotent_replay: true });
-    }
-
-    // ── 2. Body validation ────────────────────────────────────────────────
-    const v = validateBatchBody(body);
-    if (v.error) return res.status(400).json({ error: v.error });
-
-    // ── 3. Allow/deny check ───────────────────────────────────────────────
-    const sheetCfg = await getSheetConfig(body.sheet_id);
-    if (sheetCfg.denied) return res.status(403).json({ error: sheetCfg.reason });
-    if (!sheetCfg.allowed) {
-      return res.status(403).json({
-        error: `sheet_id ${body.sheet_id} is not in app_settings.sheet_allowlist`,
-      });
-    }
-    if (sheetCfg.config.channel !== body.channel) {
-      return res.status(400).json({
-        error: `channel ${body.channel} does not match sheet allowlist channel ${sheetCfg.config.channel}`,
-      });
-    }
-    if (sheetCfg.config.tab !== body.sheet_tab) {
-      return res.status(400).json({
-        error: `sheet_tab ${body.sheet_tab} does not match allowlist tab ${sheetCfg.config.tab}`,
-      });
-    }
-
-    // ── 4. Consumed-ref check (the gate) ──────────────────────────────────
-    const refsSet = Array.from(new Set(body.bank_refs.map(String)));
-    const consumedRows = await db().query(
-      `SELECT bank_ref, batch_id FROM consumed_transactions WHERE bank_ref = ANY($1)`,
-      [refsSet],
-    );
-    if (consumedRows.rows.length) {
-      return res.status(409).json({
-        error: 'one or more bank_refs are already in an active batch',
-        already_consumed: consumedRows.rows,
-      });
-    }
-
-    // ── 5. Sheet-side sum (BRAIN's independent check) ────────────────────
-    let sheetSum;
-    try {
-      sheetSum = await sumSheetForRefs({
-        sheetId: body.sheet_id,
-        tab: body.sheet_tab,
-        cfg: sheetCfg.config,
-        wantedRefs: refsSet,
-        channel: body.channel,
-      });
-    } catch (err) {
-      return res.status(500).json({ error: 'sheet sum failed: ' + err.message });
-    }
-
-    const paidTotal = body.paid.reduce((s, r) => s + Number(r.amount || 0), 0);
-    const unusedTotal = body.unused.reduce((s, r) => s + Number(r.amount || 0), 0);
-    const clientTotal = round2(paidTotal + unusedTotal);
-    const brainTotal = round2(sheetSum.total);
-
-    if (sheetSum.missingRefs.length) {
-      return res.status(422).json({
-        error: 'some bank_refs were not found in the sheet — refusing to upload',
-        missing: sheetSum.missingRefs,
-      });
-    }
-    if (clientTotal !== brainTotal) {
-      return res.status(422).json({
-        error: 'reconciliation mismatch — refusing to upload',
-        sheet_total: brainTotal,
-        paid_total: round2(paidTotal),
-        unused_total: round2(unusedTotal),
-        client_total: clientTotal,
-        difference: round2(clientTotal - brainTotal),
-      });
-    }
-
-    // ── 6. QB connection check (cheap — does not call QB) ─────────────────
-    try {
-      await ensureQbConnected();
-    } catch (err) {
-      return res.status(503).json({ error: 'QuickBooks not connected: ' + err.message });
-    }
-
-    // ── 7. Insert batch row (pending) + lock refs in consumed_transactions ─
-    const client = await db().connect();
-    let batch;
-    try {
-      await client.query('BEGIN');
-      const b = await client.query(
-        `INSERT INTO payment_batches (
-           idempotency_key, status, arrears_snapshot_id,
-           sheet_id, sheet_tab, channel, bank_refs,
-           sheet_total, paid_total, unused_total,
-           paid_count, unused_count, created_by
-         ) VALUES ($1,'pending',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         RETURNING *`,
-        [
-          body.idempotency_key, body.arrears_snapshot_id,
-          body.sheet_id, body.sheet_tab, body.channel, refsSet,
-          brainTotal, round2(paidTotal), round2(unusedTotal),
-          body.paid.length, body.unused.length,
-          body.created_by || null,
-        ],
-      );
-      batch = b.rows[0];
-      // Lock every ref in one shot — fails if anyone snuck in since check.
-      for (const ref of refsSet) {
-        await client.query(
-          `INSERT INTO consumed_transactions (bank_ref, batch_id) VALUES ($1, $2)`,
-          [ref, batch.id],
-        );
-      }
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      client.release();
-      // Most likely conflict — another caller raced us between step 4 + 7.
-      if (err.code === '23505') {
-        return res.status(409).json({ error: 'bank_ref race detected — retry' });
-      }
-      return res.status(500).json({ error: err.message });
-    }
-    client.release();
-
-    // ── 8. QB calls + per-upload row tracking ─────────────────────────────
-    const uploaded = []; // for rollback
-    const failed = [];
-    try {
-      // Payments first.
-      for (let i = 0; i < body.paid.length; i++) {
-        const row = body.paid[i];
-        const qb = await qbCreatePayment({
-          customerId: row.customer_id,
-          invoiceQbId: row.invoice_qb_id,
-          amount: Number(row.amount),
-          memo: row.memo || '',
-        });
-        const upload = await recordUpload({
-          batchId: batch.id, kind: 'payment', row, qbId: qb.id,
-          qbResponse: qb.response, status: 'created',
-        });
-        uploaded.push(upload);
-      }
-      // Unused side: customer-matched rows go to QB as unapplied Payments
-      // (Payment without LinkedTxn — Frank's rule from 2026-06-04; CreditMemo
-      // is deprecated). Rows without customer_id get queued for SaasAnt.
-      for (let i = 0; i < body.unused.length; i++) {
-        const row = body.unused[i];
-        if (!row.customer_id) {
-          await recordUpload({
-            batchId: batch.id, kind: 'payment', row, qbId: null,
-            qbResponse: null, status: 'needs_saasant',
-          });
-          continue;
-        }
-        const qb = await qbCreateUnappliedPayment({
-          customerId: row.customer_id,
-          amount: Number(row.amount),
-          memo: row.memo || '',
-        });
-        const upload = await recordUpload({
-          batchId: batch.id, kind: 'payment', row, qbId: qb.id,
-          qbResponse: qb.response, status: 'created',
-        });
-        uploaded.push(upload);
-      }
-    } catch (err) {
-      // ── ROLLBACK PATH ──
-      console.error(`[payment-batches] QB error mid-flight, rolling back`, err);
-      const voidResults = await voidUploadsBestEffort(uploaded, qbVoid);
-      const c = await db().connect();
-      try {
-        await c.query('BEGIN');
-        await c.query(
-          `UPDATE payment_batches SET status='rolled_back', rolled_back_at=now(),
-             failure_reason=$2 WHERE id=$1`,
-          [batch.id, String(err.message || err).slice(0, 1000)],
-        );
-        await c.query(`DELETE FROM consumed_transactions WHERE batch_id=$1`, [batch.id]);
-        await c.query('COMMIT');
-      } catch (e) {
-        await c.query('ROLLBACK').catch(() => {});
-      } finally {
-        c.release();
-      }
-      const b2 = await db().query(`SELECT * FROM payment_batches WHERE id=$1`, [batch.id]);
-      return res.status(500).json({
-        error: 'QB upload failed mid-batch — rolled back',
-        original_error: err.message,
-        batch: b2.rows[0],
-        void_results: voidResults,
-      });
-    }
-
-    // ── 9. Mark finalized ─────────────────────────────────────────────────
-    await db().query(
-      `UPDATE payment_batches SET status='finalized', finalized_at=now() WHERE id=$1`,
-      [batch.id],
-    );
-    const b3 = await db().query(`SELECT * FROM payment_batches WHERE id=$1`, [batch.id]);
-    res.status(201).json({
-      batch: b3.rows[0],
-      idempotent_replay: false,
-      uploaded_count: uploaded.length,
-      payments: uploaded.filter((u) => u.kind === 'payment').length,
-      credit_memos: uploaded.filter((u) => u.kind === 'credit_memo').length,
-    });
-  });
-
   // ── POST /api/payment-batches/auto-upload/:channel ───────────────────────
   // The hourly cycle's "match-and-post" step. The worker calls this after
   // each statement pull; we run the verbatim invoice-payment-app algorithm
@@ -351,6 +111,19 @@ export function mountPaymentBatchesApi(app, deps) {
     const channel = req.params.channel;
     if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
       return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
+    }
+    // Hard requirement (2026-06-07): every fire MUST carry an explicit
+    // txn_date. No wall-clock fallback — silent defaults previously let
+    // wrong-date Payments land in QB when a caller forgot to supply it.
+    // Both callers (cron scheduler and heisenberg ad-hoc UI) construct
+    // txn_date deliberately per tick identity or operator pick; if either
+    // sends without it, that's a caller bug we want LOUD.
+    const txnDateFromBody = req.body?.txn_date;
+    if (!txnDateFromBody || !/^\d{4}-\d{2}-\d{2}$/.test(String(txnDateFromBody))) {
+      return res.status(400).json({
+        error: 'txn_date required (YYYY-MM-DD) — wall-clock fallback removed',
+        got: txnDateFromBody ?? null,
+      });
     }
     // ─── KILL SWITCH (scheduled-tick automation only) ─────────────────
     // app_settings.auto_upload_enabled = 'false' blocks AUTOMATION

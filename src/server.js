@@ -229,22 +229,17 @@ async function ensureQbConnected() {
 }
 
 /**
- * EAT cutoff rule (operator-set):
- *   - Before cutoff today → Payment dated TODAY (EAT)
- *   - From cutoff today until cutoff tomorrow → Payment dated TOMORROW (EAT)
- *
- * Defaults to 16:16 EAT but can be overridden via env vars (e.g. PAYMENT_CUTOFF_HOUR=17,
- * PAYMENT_CUTOFF_MINUTE=30 for a 17:30 cutoff on exception days).
+ * Hard requirement (2026-06-07): every QB-write caller must supply txnDate
+ * explicitly. The legacy paymentTxnDate() wall-clock function was REMOVED
+ * because callers that forgot to pass it silently stamped Payments with
+ * server clock time, landing rows on the wrong QB date. Helper kept only
+ * to throw a clear error in case any caller still hits the old code path.
  */
-function paymentTxnDate() {
-  const cutoffHour = Number(process.env.PAYMENT_CUTOFF_HOUR ?? 16);
-  const cutoffMinute = Number(process.env.PAYMENT_CUTOFF_MINUTE ?? 16);
-  const eat = new Date(Date.now() + 3 * 3600_000);
-  const h = eat.getUTCHours();
-  const m = eat.getUTCMinutes();
-  const pastCutoff = h > cutoffHour || (h === cutoffHour && m >= cutoffMinute);
-  if (pastCutoff) eat.setUTCDate(eat.getUTCDate() + 1);
-  return eat.toISOString().slice(0, 10);
+function requireTxnDate(txnDate, fnName) {
+  if (!txnDate || typeof txnDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(txnDate)) {
+    throw new Error(`${fnName}: txnDate required (YYYY-MM-DD) — wall-clock fallback removed. got=${JSON.stringify(txnDate)}`);
+  }
+  return txnDate;
 }
 
 // Default DepositToAccountRef for Payments. 785 = "Elegansky Collection AC:Kijichi
@@ -260,7 +255,7 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo, txnDate 
     CustomerRef: { value: String(customerId) },
     TotalAmt: Number(amount),
     PrivateNote: memo || undefined,
-    TxnDate: txnDate || paymentTxnDate(),
+    TxnDate: requireTxnDate(txnDate, 'qbCreatePayment'),
     DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
     Line: [{
       Amount: Number(amount),
@@ -282,9 +277,10 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo, txnDate 
 async function qbBatchCreatePayments(items) {
   if (items.length === 0) return [];
   if (items.length > 30) throw new Error(`qbBatchCreatePayments: ${items.length} > 30 (QB max)`);
-  // Each item may carry its own txnDate override (the autonomous scheduler
-  // sets this from the tick's name, e.g. kili1615 → today; rwenzori1800 →
-  // tomorrow). Falls back to paymentTxnDate() per-item if omitted.
+  // Each item MUST carry txnDate (2026-06-07 hard requirement). Scheduler
+  // sets this from the tick identity (e.g. kili1615 → today; mawenzi1800 →
+  // tomorrow). Heisenberg sets it from the dashboard's date-input field.
+  // requireTxnDate throws if any item is missing it.
   const body = {
     BatchItemRequest: items.map((it, ix) => ({
       bId: `b${ix}`,
@@ -293,7 +289,7 @@ async function qbBatchCreatePayments(items) {
         CustomerRef: { value: String(it.customerId) },
         TotalAmt: Number(it.amount),
         PrivateNote: it.memo || undefined,
-        TxnDate: it.txnDate || paymentTxnDate(),
+        TxnDate: requireTxnDate(it.txnDate, 'qbBatchCreatePayments'),
         DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
         Line: [{ Amount: Number(it.amount), LinkedTxn: [{ TxnId: String(it.invoiceQbId), TxnType: 'Invoice' }] }],
       },
@@ -323,7 +319,7 @@ async function qbCreateUnappliedPayment({ customerId, amount, memo, txnDate }) {
     CustomerRef: { value: String(customerId) },
     TotalAmt: Number(amount),
     PrivateNote: memo || undefined,
-    TxnDate: txnDate || paymentTxnDate(),
+    TxnDate: requireTxnDate(txnDate, 'qbCreateUnappliedPayment'),
     DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
     // No Line[] → unapplied. Frank verified this is the correct shape.
   };
@@ -343,7 +339,7 @@ async function qbBatchCreateUnappliedPayments(items) {
         CustomerRef: { value: String(it.customerId) },
         TotalAmt: Number(it.amount),
         PrivateNote: it.memo || undefined,
-        TxnDate: it.txnDate || paymentTxnDate(),
+        TxnDate: requireTxnDate(it.txnDate, 'qbBatchCreateUnappliedPayments'),
         DepositToAccountRef: { value: DEFAULT_DEPOSIT_ACCT_ID },
       },
     })),
@@ -475,7 +471,7 @@ async function qbCreateCreditMemo({ customerId, amount, memo, txnDate }) {
   const body = {
     CustomerRef: { value: String(customerId) },
     PrivateNote: memo || undefined,
-    TxnDate: txnDate || paymentTxnDate(),
+    TxnDate: requireTxnDate(txnDate, 'qbCreateCreditMemo'),
     Line: [{
       DetailType: 'SalesItemLineDetail',
       Amount: Number(amount),
