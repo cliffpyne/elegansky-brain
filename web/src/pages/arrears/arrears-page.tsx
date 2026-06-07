@@ -156,6 +156,7 @@ export function ArrearsPage() {
   return (
     <Fragment>
       <Container>
+        <div className="space-y-5">
         <Toolbar>
           <ToolbarHeading
             title="Arrears"
@@ -315,6 +316,7 @@ export function ArrearsPage() {
             </Button>
           </div>
         </Card>
+      </div>
       </Container>
     </Fragment>
   );

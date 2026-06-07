@@ -157,6 +157,7 @@ export function StatementCyclesPage() {
   return (
     <Fragment>
       <Container>
+        <div className="space-y-5">
         <Toolbar>
           <ToolbarHeading
             title="Statement Cycles"
@@ -398,6 +399,7 @@ export function StatementCyclesPage() {
             )}
           </CardContent>
         </Card>
+      </div>
       </Container>
     </Fragment>
   );

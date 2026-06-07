@@ -128,6 +128,7 @@ export function AdminSmsPage() {
         <ToolbarHeading title="Admin notifications" description="Phone numbers that get an SMS when something fails" />
       </Toolbar>
       <Container>
+        <div className="space-y-5">
         {error && (
           <Card className="mb-4 border-destructive">
             <CardContent className="pt-6 text-destructive">{error}</CardContent>
@@ -250,6 +251,7 @@ export function AdminSmsPage() {
             )}
           </CardContent>
         </Card>
+      </div>
       </Container>
     </Fragment>
   );

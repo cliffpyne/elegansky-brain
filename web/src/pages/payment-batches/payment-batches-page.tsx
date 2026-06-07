@@ -62,8 +62,9 @@ export function PaymentBatchesPage() {
         </ToolbarActions>
       </Toolbar>
       <Container>
+        <div className="space-y-5">
         {error && (
-          <Card className="mb-4 border-destructive">
+          <Card className="border-destructive">
             <CardContent className="pt-6 text-destructive">{error}</CardContent>
           </Card>
         )}
@@ -127,6 +128,7 @@ export function PaymentBatchesPage() {
             </Table>
           </CardContent>
         </Card>
+        </div>
       </Container>
     </Fragment>
   );

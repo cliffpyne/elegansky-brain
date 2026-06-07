@@ -29,7 +29,6 @@ import {
 } from '@/components/ui/sheet';
 import { Container } from '@/components/common/container';
 import { Breadcrumb } from './breadcrumb';
-import { MegaMenu } from './mega-menu';
 import { MegaMenuMobile } from './mega-menu-mobile';
 import { SidebarMenu } from './sidebar-menu';
 
@@ -114,11 +113,13 @@ export function Header() {
           </div>
         </div>
 
-        {/* Main Content (MegaMenu or Breadcrumbs) */}
+        {/* Main Content — sidebar is the canonical BRAIN nav; mega menu just
+            duplicates it so we keep the top header minimal. The breadcrumb
+            still appears for /account flows since they need it. */}
         {pathname.startsWith('/account') ? (
           <Breadcrumb />
         ) : (
-          !mobileMode && <MegaMenu />
+          <div className="flex-1" />
         )}
 
         {/* HeaderTopbar */}

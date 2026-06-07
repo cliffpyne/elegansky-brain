@@ -130,6 +130,7 @@ export function OfficerReportsPage() {
 
   return (
     <Container>
+        <div className="space-y-5">
       <Toolbar>
         <ToolbarHeading>
           <div className="flex flex-col">
@@ -338,6 +339,7 @@ export function OfficerReportsPage() {
           </Table>
         </CardContent>
       </Card>
-    </Container>
+    </div>
+      </Container>
   );
 }
