@@ -4369,6 +4369,34 @@ async function scanQbForRefDuplicates(wantedSuffixedRefs, daysBack = 60) {
   return hits;
 }
 
+// Append one structured log entry to a batch's logs[] jsonb column.
+// Fire-and-forget — failures don't block the upload (logged to console).
+// Frank uses this trail to debug after-the-fact via the batch detail page.
+//
+// level: "info" | "warn" | "error"
+// source: short string identifying the code path (e.g. "qb-push", "dup-check")
+// extra: optional object merged into the log entry for structured fields
+async function logBatch(batchId, level, message, source, extra = null) {
+  if (!batchId) return;
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      level,
+      message: String(message || '').slice(0, 2000),
+      source,
+      ...(extra && typeof extra === 'object' ? extra : {}),
+    };
+    await db().query(
+      `UPDATE payment_batches
+          SET logs = COALESCE(logs, '[]'::jsonb) || $1::jsonb
+        WHERE id = $2`,
+      [JSON.stringify(entry), batchId],
+    );
+  } catch (e) {
+    console.error('[logBatch] non-fatal write fail:', e.message);
+  }
+}
+
 async function fetchAllArrears(asOf) {
   const { default: fetchImpl } = { default: globalThis.fetch };
   const base = process.env.SELF_URL || 'http://127.0.0.1:' + (process.env.PORT || 3000);
@@ -4857,6 +4885,8 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   cfg,  // { sheetId, tab } — used to write Column I + J markers
   tickName,  // 'meru0300' / 'kili1615' / 'heisenberg' (manual button) etc.
 }) {
+  await logBatch(batchId, 'info', `runAutoUploadBackground start: paid=${paid.length} unused=${unused.length} txnDate=${txnDate} tick=${tickName || 'unknown'}`, 'qb-push');
+
   // ─── Per-payment J-marker state (cumulative across chunks) ────────────
   // rowToQbIds maps sheet_row_number -> [qb_id, qb_id, ...] for that row.
   // Multi-invoice splits accumulate IDs as their Payments land. Each chunk
@@ -4948,13 +4978,16 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
           txnDate,
         }));
         let results;
+        let chunkError = null;
         try {
           results = await qbBatchCreatePayments(items);
         } catch (err) {
           // whole batch hard-failed (after retries) — mark all as failed
-          results = items.map(() => ({ ok: false, id: null, response: null, error: String(err.message || err).slice(0, 500) }));
+          chunkError = String(err.message || err).slice(0, 500);
+          results = items.map(() => ({ ok: false, id: null, response: null, error: chunkError }));
         }
         const affectedRows = new Set();
+        let chunkOk = 0, chunkFail = 0;
         for (let i = 0; i < chunk.length; i++) {
           const p = chunk[i]; const r = results[i];
           if (r.ok) {
@@ -4969,8 +5002,10 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
             );
             recordJ(p.sheet_row_number, r.id);
             if (p.sheet_row_number) affectedRows.add(p.sheet_row_number);
+            chunkOk++;
           } else {
             failed++;
+            chunkFail++;
             await db().query(
               `INSERT INTO payment_uploads (
                  batch_id, kind, bank_ref, customer_id, customer_name,
@@ -4981,6 +5016,11 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
                String(r.error || 'unknown').slice(0, 500)],
             );
           }
+        }
+        if (chunkError) {
+          await logBatch(batchId, 'error', `paid chunk #${ci} hard-failed: ${chunkError} — all ${chunk.length} rows flagged failed`, 'qb-push', { chunk_index: ci, chunk_size: chunk.length });
+        } else if (chunkFail > 0) {
+          await logBatch(batchId, 'warn', `paid chunk #${ci}: ${chunkOk}/${chunk.length} ok, ${chunkFail} per-row failures`, 'qb-push', { chunk_index: ci, ok: chunkOk, fail: chunkFail });
         }
         // Per-chunk J flush — only rows whose Payment actually landed in QB
         // get marked. Failed rows leave J empty so the audit can spot them.
@@ -5195,12 +5235,14 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   if (failed === 0) {
     await db().query(`UPDATE payment_batches SET status='finalized', finalized_at=now() WHERE id=$1`, [batchId]);
     console.log(`[auto-upload] batch ${batchId} finalized.`);
+    await logBatch(batchId, 'info', `batch finalized: 0 failures, all payments + unused pushed to QB`, 'qb-push');
   } else {
     await db().query(
       `UPDATE payment_batches SET failure_reason=$2 WHERE id=$1`,
       [batchId, `${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason`],
     );
     console.log(`[auto-upload] batch ${batchId} left pending with ${failed} failures after 3 sweeps.`);
+    await logBatch(batchId, 'error', `batch left pending: ${failed} per-row failures after 3 sweeps — see payment_uploads.failure_reason for each`, 'qb-push', { failed_count: failed });
   }
 
   // J markers are flushed per-chunk (and per sweep success) above. No

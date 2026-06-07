@@ -460,3 +460,13 @@ CREATE INDEX IF NOT EXISTS idx_invoice_snapshots_as_of
 ALTER TABLE payment_batches
   ADD COLUMN IF NOT EXISTS invoice_snapshot_id uuid
     REFERENCES invoice_snapshots(id);
+
+-- Per-batch structured log buffer. Every meaningful event during the
+-- upload (start, dup-check result, each chunk push, error, retry,
+-- finalize) appends one row of jsonb here. Operator opens the batch
+-- detail page later and reads the trail for debugging.
+-- Shape: [{ ts, level: "info"|"warn"|"error", message, source, ... }]
+ALTER TABLE payment_batches
+  ADD COLUMN IF NOT EXISTS logs jsonb NOT NULL DEFAULT '[]'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_payment_batches_logs_gin
+  ON payment_batches USING gin (logs);
