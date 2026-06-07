@@ -253,11 +253,25 @@ function parseSheetTs(s) {
   return new Date(Date.UTC(+y, +mo - 1, +d, +hh - 3, +mm, +(ss || 0)));
 }
 
+// Cache the parsed sheet rows per tab so the series endpoint doesn't re-fetch
+// 100k rows from Google Sheets for every day in the window. TTL is short
+// because operator imports new bank rows continuously throughout the day.
+const _sheetTabCache = new Map();
+const SHEET_TAB_TTL_MS = 3 * 60 * 1000;
+async function getSheetRows(sheetId, tab) {
+  const key = `${sheetId}|${tab}`;
+  const cached = _sheetTabCache.get(key);
+  if (cached && Date.now() - cached.ts < SHEET_TAB_TTL_MS) return cached.rows;
+  const sheet = await readSheet(sheetId, `${tab}!A1:H100000`);
+  const rows = sheet.values || sheet.data || [];
+  _sheetTabCache.set(key, { rows, ts: Date.now() });
+  return rows;
+}
+
 async function readSheetTab(sheetId, tab, windowStart, windowEnd) {
   const out = { rows: 0, total: 0, unused_rows: 0, unused_total: 0 };
   try {
-    const sheet = await readSheet(sheetId, `${tab}!A1:H100000`);
-    const data = sheet.values || sheet.data || [];
+    const data = await getSheetRows(sheetId, tab);
     for (let i = 1; i < data.length; i++) {
       const r = data[i] || [];
       const ts = parseSheetTs(r[1]);
@@ -506,6 +520,46 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // ── Bulk QB range queries ────────────────────────────────────────────────
+  // For the series endpoint we fire ONE Payment + ONE Purchase query that
+  // spans the full date range, then bucket by TxnDate in memory. This cuts
+  // QB roundtrips from O(days) down to O(1) for the heavy parts.
+
+  async function fetchAllPaymentsInRange(from, to) {
+    const all = [];
+    const BATCH = 1000;
+    let start = 1;
+    while (true) {
+      const r = await qbQuery(
+        `SELECT Id, TotalAmt, TxnDate, DepositToAccountRef ` +
+        `FROM Payment WHERE TxnDate >= '${from}' AND TxnDate <= '${to}' ` +
+        `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+      );
+      const rows = r.QueryResponse?.Payment || [];
+      all.push(...rows);
+      if (rows.length < BATCH) break;
+      start += BATCH;
+    }
+    return all;
+  }
+  async function fetchAllExpensesInRange(from, to) {
+    const all = [];
+    const BATCH = 1000;
+    let start = 1;
+    while (true) {
+      const r = await qbQuery(
+        `SELECT Id, TotalAmt, TxnDate, AccountRef ` +
+        `FROM Purchase WHERE TxnDate >= '${from}' AND TxnDate <= '${to}' ` +
+        `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+      );
+      const rows = r.QueryResponse?.Purchase || [];
+      all.push(...rows);
+      if (rows.length < BATCH) break;
+      start += BATCH;
+    }
+    return all;
+  }
+
   // ── In-process caches + request throttle for /api/mega-report/series ────
   // The dashboard pages have ~30 TrendCells each, every hover fans out a
   // week or month of QB queries. Without these guards the QB calls swamp
@@ -617,25 +671,116 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
       }
       await acquireSeriesSlot();
       try {
-        // Process dates with limited concurrency (2 at a time inside one
-        // request) AND share results across overlapping requests via the
-        // memo+coalesce in computeDaySummary.
-        const out = new Array(dates.length);
-        const CONCURRENCY = 2;
-        let idx = 0;
-        const worker = async () => {
+        // FAST PATH: one bulk Payment query + one bulk Purchase query for the
+        // full range, bucketed by TxnDate. Sheet reads are also cached per
+        // tab so we don't re-fetch 100k rows per day. Officers data is still
+        // per-day via aggregateOfficers() since it depends on snapshot rows
+        // keyed by date — but those are pure DB queries (cheap).
+        const ids = await getAccountIds([PARENT_ACCOUNT_NAME, ...SUB_ACCOUNT_NAMES]);
+        const targetAcctIds = new Set(Object.values(ids).map(String));
+        const [allPayments, allExpenses] = await Promise.all([
+          fetchAllPaymentsInRange(from, to),
+          fetchAllExpensesInRange(from, to),
+        ]);
+        // Bucket by TxnDate.
+        const paymentsByDate = new Map();
+        for (const p of allPayments) {
+          if (!targetAcctIds.has(String(p.DepositToAccountRef?.value || ''))) continue;
+          const d = String(p.TxnDate || '').slice(0, 10);
+          const cur = paymentsByDate.get(d) || { total: 0, count: 0 };
+          cur.total += Number(p.TotalAmt || 0); cur.count++;
+          paymentsByDate.set(d, cur);
+        }
+        const expensesByDate = new Map();
+        for (const p of allExpenses) {
+          if (!targetAcctIds.has(String(p.AccountRef?.value || ''))) continue;
+          const d = String(p.TxnDate || '').slice(0, 10);
+          const cur = expensesByDate.get(d) || { total: 0, count: 0 };
+          cur.total += Number(p.TotalAmt || 0); cur.count++;
+          expensesByDate.set(d, cur);
+        }
+        // Sheets: read each tab ONCE (cached); then filter per day in memory.
+        const channelData = {};
+        for (const [channel, cfg] of Object.entries(CHANNEL_TABS)) {
+          const [passed, failed] = await Promise.all([
+            getSheetRows(cfg.sheetId, cfg.passed),
+            cfg.failed ? getSheetRows(cfg.sheetId, cfg.failed) : Promise.resolve([]),
+          ]);
+          channelData[channel] = { passed, failed };
+        }
+        // Officers data — still per-day (DB queries) and parallelized.
+        const officersByDate = new Map();
+        const OFFICER_CONC = 4;
+        let oIdx = 0;
+        const officerWorker = async () => {
           while (true) {
-            const i = idx++;
+            const i = oIdx++;
             if (i >= dates.length) return;
             const d = dates[i];
             try {
-              out[i] = await computeDaySummary(d, officerId);
-            } catch (err) {
-              out[i] = { date: d, error: err.message };
-            }
+              const r = await aggregateOfficers(d, d, officerId);
+              officersByDate.set(d, r);
+            } catch { officersByDate.set(d, null); }
           }
         };
-        await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+        await Promise.all(Array.from({ length: OFFICER_CONC }, () => officerWorker()));
+
+        const out = dates.map((d) => {
+          const pay = paymentsByDate.get(d) || { total: 0, count: 0 };
+          const exp = expensesByDate.get(d) || { total: 0, count: 0 };
+          // Sheet totals for this day: filter cached rows by EAT window.
+          const winStart = new Date(d + 'T00:00:00+03:00');
+          const winEnd = new Date(winStart); winEnd.setUTCDate(winEnd.getUTCDate() + 1);
+          const sheetsByChannel = {};
+          let gPassed = 0, gFailed = 0, gUnused = 0;
+          for (const [ch, td] of Object.entries(channelData)) {
+            let pT = 0, fT = 0, uT = 0;
+            for (let i = 1; i < td.passed.length; i++) {
+              const r = td.passed[i] || [];
+              const ts = parseSheetTs(r[1]); if (!ts) continue;
+              if (ts < winStart || ts >= winEnd) continue;
+              const amt = parseAmount(r[4]);
+              pT += amt;
+              if (isUnusedRow(r[5], r[6])) uT += amt;
+            }
+            for (let i = 1; i < td.failed.length; i++) {
+              const r = td.failed[i] || [];
+              const ts = parseSheetTs(r[1]); if (!ts) continue;
+              if (ts < winStart || ts >= winEnd) continue;
+              const amt = parseAmount(r[4]);
+              fT += amt;
+              if (isUnusedRow(r[5], r[6])) uT += amt;
+            }
+            sheetsByChannel[ch] = { passed_total: pT, failed_total: fT, unused_total: uT };
+            gPassed += pT; gFailed += fT; gUnused += uT;
+          }
+          const officers = officersByDate.get(d);
+          return {
+            date: d,
+            account: {
+              payments_total: pay.total, payments_count: pay.count,
+              expenses_total: exp.total, expenses_count: exp.count,
+              net_movement: pay.total - exp.total,
+              opening_balance: null, closing_live: null, // not needed in series
+            },
+            sheets: {
+              passed_total: gPassed, failed_total: gFailed, unused_total: gUnused,
+              by_channel: sheetsByChannel,
+            },
+            officers: officers ? {
+              total_invoice_amount: officers.grand.total_invoice_amount || 0,
+              today_balance_remain: officers.grand.today_balance_remain || 0,
+              open: officers.grand.open || 0,
+              collected: officers.grand.collected || 0,
+              pct_collected: officers.grand.pct_collected,
+              arrears_morning: officers.grand.arrears_morning || 0,
+              arrears_realtime: officers.grand.arrears_realtime || 0,
+              arrear_collected: officers.grand.arrear_collected || 0,
+              arrear_pct_collected: officers.grand.arrear_pct_collected,
+              officer_count: officers.officers.length,
+            } : null,
+          };
+        });
         res.json({
           from, to, officer_id_filter: officerId,
           days: out,
