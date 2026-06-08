@@ -4518,18 +4518,64 @@ async function fetchAllArrears(asOf) {
   const arrears = [];
   let start = 1;
   const asOfParam = asOf ? `&asOf=${encodeURIComponent(asOf)}` : '';
+
+  // Frank 2026-06-08: QB intermittently returns 500 "Request timeout 30000ms"
+  // on specific page boundaries (we saw page 4000 die while 1-3000 + 5000+
+  // were healthy). Cause is QB's internal query timeout on that chunk —
+  // happens when one customer/invoice in the page triggers a slow lookup.
+  //
+  // Strategy: retry the SAME page up to 3 times. If still failing, HALVE
+  // the pageSize and continue. A 1000-row page that fails will split into
+  // two 500-row pages; if those still fail, two 250-row pages each, etc.
+  // Bottom floor is 50 rows per call. This trades one slow QB invocation
+  // for several fast ones — net same wall time, but completes vs throws.
   while (true) {
-    const r = await fetchImpl(`${base}/arrears?pageSize=1000&start=${start}${asOfParam}`);
-    if (!r.ok) throw new Error(`arrears ${r.status}: ${await r.text()}`);
-    const j = await r.json();
-    const invs = j.invoices || [];
+    let pageSize = 1000;
+    let invs = null;
+    let nextStart = null;
+    let lastErr = null;
+    while (pageSize >= 50) {
+      let success = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const r = await fetchImpl(`${base}/arrears?pageSize=${pageSize}&start=${start}${asOfParam}`);
+          if (r.ok) {
+            const j = await r.json();
+            invs = j.invoices || [];
+            nextStart = j.page?.nextStart || null;
+            success = true;
+            if (pageSize < 1000) {
+              console.warn(`[fetchAllArrears] start=${start} succeeded at pageSize=${pageSize} (after halving)`);
+            }
+            break;
+          }
+          lastErr = `${r.status}: ${(await r.text()).slice(0, 200)}`;
+          // 5xx → retry. 4xx → throw immediately (auth/bad-request bugs).
+          if (r.status < 500) throw new Error(`arrears ${lastErr}`);
+          console.warn(`[fetchAllArrears] start=${start} pageSize=${pageSize} attempt ${attempt}/3 got ${r.status}, retrying`);
+          await new Promise((res) => setTimeout(res, 1500 * attempt));
+        } catch (e) {
+          lastErr = String(e.message || e);
+          if (attempt === 3) break;
+          console.warn(`[fetchAllArrears] start=${start} pageSize=${pageSize} attempt ${attempt}/3 threw: ${lastErr.slice(0, 120)}`);
+          await new Promise((res) => setTimeout(res, 1500 * attempt));
+        }
+      }
+      if (success) break;
+      // 3 attempts at this pageSize failed — halve and try again.
+      pageSize = Math.max(50, Math.floor(pageSize / 2));
+      if (pageSize < 50) break;
+      console.warn(`[fetchAllArrears] start=${start} 3 attempts failed at pageSize=${pageSize * 2}, halving to ${pageSize}`);
+    }
+    if (invs === null) {
+      throw new Error(`arrears irrecoverable at start=${start}: ${lastErr || 'unknown'}`);
+    }
     if (!invs.length) break;
     arrears.push(...invs);
-    if (!j.page?.nextStart) break;
-    start = j.page.nextStart;
+    if (!nextStart) break;
+    start = nextStart;
   }
   _arrearsCache.set(cacheKey, { rows: arrears, expires: Date.now() + ARREARS_TTL_MS });
-  // Prune to keep memory bounded — keep last 4 AS_OFs.
   if (_arrearsCache.size > 4) {
     const oldest = [...(_arrearsCache.entries())].sort((a, b) => a[1].expires - b[1].expires)[0];
     if (oldest) _arrearsCache.delete(oldest[0]);
