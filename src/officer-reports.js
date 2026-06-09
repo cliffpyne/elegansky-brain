@@ -752,6 +752,135 @@ export async function getLiveOfficerArrears(date) {
   return out;
 }
 
+/**
+ * Frank 2026-06-09 — agent arrear report, no snapshot, no morning/realtime
+ * mismatch. One date boundary: midnight EAT.
+ *
+ * For a given date:
+ *   overdue_set         = { Invoice WHERE Balance > 0 AND DueDate < date }
+ *                          (the same set whether queried at 6am or 6pm —
+ *                           the date boundary IS the calendar day rollover)
+ *   arrears_now         = Σ Balance for overdue_set                   (what's still owed RIGHT NOW)
+ *   arrear_collected    = Σ Line.Amount for today's QB Payments where
+ *                          LinkedTxn invoice ∈ overdue_set            (today's TZS landing on overdue)
+ *   open_inv_collection = Σ Line.Amount for today's QB Payments where
+ *                          LinkedTxn invoice ∉ overdue_set            (today's TZS landing on today/future invoices)
+ *   arrears_morning     = arrears_now + arrear_collected              (derived — what was overdue at midnight)
+ *   arrear_pct          = arrear_collected / arrears_morning × 100
+ *
+ * Identity (guaranteed by construction):
+ *   arrear_collected + open_inv_collection = sum(today's payment lines)
+ *
+ * The OLD code (replaced) computed two different DueDate cutoffs (morning <
+ * date, realtime < date+1) which dragged invoices-due-today into the realtime
+ * bucket but NOT the morning bucket, producing fake negative collections.
+ * This function uses the same cutoff (DueDate < date) consistently and
+ * derives the morning baseline from today's actual payments.
+ *
+ * Returns Map<officer_id, {
+ *   officer_id, officer_name,
+ *   arrears_now, arrears_morning, arrear_collected, open_invoice_collection,
+ *   overdue_invoice_count
+ * }>
+ */
+export async function getLiveOfficerArrearMath(date) {
+  // 1. Pull all overdue invoices (DueDate < date, Balance > 0) — paginated.
+  const overdueInvoices = [];
+  const BATCH = 1000;
+  let start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT Id, CustomerRef, Balance, DueDate ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate < '${date}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Invoice || [];
+    overdueInvoices.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+  const overdueIdSet = new Set(overdueInvoices.map((inv) => String(inv.Id)));
+
+  // 2. Pull today's QB Payments. SELECT * to get the Line[] / LinkedTxn[] tree
+  //    (QB doesn't return nested fields when listed individually).
+  const todayPayments = [];
+  start = 1;
+  while (true) {
+    const r = await qbQuery(
+      `SELECT * FROM Payment WHERE TxnDate = '${date}' ` +
+      `STARTPOSITION ${start} MAXRESULTS ${BATCH}`,
+    );
+    const rows = r.QueryResponse?.Payment || [];
+    todayPayments.push(...rows);
+    if (rows.length < BATCH) break;
+    start += BATCH;
+  }
+
+  // 3. Customer → officer map for every customer we touched.
+  const customerIds = new Set();
+  for (const inv of overdueInvoices) customerIds.add(String(inv.CustomerRef?.value || ''));
+  for (const p of todayPayments)     customerIds.add(String(p.CustomerRef?.value || ''));
+  customerIds.delete('');
+  const mapRows = customerIds.size ? await db().query(
+    `SELECT customer_id, officer_id, officer_name
+       FROM customer_officer_map WHERE customer_id = ANY($1)`,
+    [[...customerIds]],
+  ) : { rows: [] };
+  const cidToOfficer = new Map(mapRows.rows.map((r) => [r.customer_id, r]));
+
+  // 4. Aggregate per officer.
+  const out = new Map();
+  const ensure = (off) => {
+    if (!out.has(off.officer_id)) {
+      out.set(off.officer_id, {
+        officer_id: off.officer_id,
+        officer_name: off.officer_name,
+        arrears_now: 0,
+        arrear_collected: 0,
+        open_invoice_collection: 0,
+        overdue_invoice_count: 0,
+      });
+    }
+    return out.get(off.officer_id);
+  };
+
+  // 4a. arrears_now + overdue counts from overdueInvoices.
+  for (const inv of overdueInvoices) {
+    const off = cidToOfficer.get(String(inv.CustomerRef?.value || ''));
+    if (!off) continue;
+    const p = ensure(off);
+    p.arrears_now += Number(inv.Balance || 0);
+    p.overdue_invoice_count += 1;
+  }
+
+  // 4b. Bucket today's payment lines by whether their linked invoice was overdue.
+  for (const pay of todayPayments) {
+    const off = cidToOfficer.get(String(pay.CustomerRef?.value || ''));
+    if (!off) continue;
+    const p = ensure(off);
+    for (const line of pay.Line || []) {
+      const amt = Number(line.Amount || 0);
+      if (!amt) continue;
+      for (const lt of line.LinkedTxn || []) {
+        if (lt.TxnType !== 'Invoice') continue;
+        if (overdueIdSet.has(String(lt.TxnId))) {
+          p.arrear_collected += amt;
+        } else {
+          p.open_invoice_collection += amt;
+        }
+      }
+    }
+  }
+
+  // 4c. Derived: arrears_morning = arrears_now + arrear_collected.
+  for (const p of out.values()) {
+    p.arrears_morning = p.arrears_now + p.arrear_collected;
+  }
+
+  return out;
+}
+
+
 export async function getOfficerArrears(snapshotDate) {
   const r = await db().query(
     `SELECT officer_id, officer_name, total_arrears, overdue_invoice_count, cached_at

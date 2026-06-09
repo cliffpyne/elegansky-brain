@@ -27,6 +27,7 @@ import {
   getOfficerArrears,
   getLiveOfficerInvoiceTotals,
   getLiveOfficerArrears,
+  getLiveOfficerArrearMath,    // Frank 2026-06-09: snapshot-free agent arrear math
   getOfficerOfflineCounts,
 } from './officer-reports.js';
 
@@ -372,17 +373,35 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   };
   // LIVE QB queries — works for any date, no snapshot dependency.
   // Morning arrears = overdue invoices as of the start (`from`) day.
-  // Real-time arrears = overdue invoices as of right NOW (today + 1 = strict <
-  // bound includes everything overdue today). For multi-day windows we use
-  // `to + 1` so the comparison reflects state at the end of the chosen window.
-  const tomorrow = new Date(to + 'T00:00:00Z');
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-  const arrearsNowCutoff = tomorrow.toISOString().slice(0, 10);
-  const [morningArrears, realtimeArrears, offlineCounts] = await Promise.all([
-    getLiveOfficerArrears(from),
-    getLiveOfficerArrears(arrearsNowCutoff),
+  // Frank 2026-06-09 — agent arrear math, snapshot-free.
+  //
+  // OLD CODE BUG: pulled two arrear queries with DIFFERENT DueDate cutoffs
+  // (`< from` for "morning", `< to+1` for "realtime"). For a single-day
+  // window where from=to=today, the realtime query included invoices
+  // due TODAY (fresh, unpaid installments). Result: realtime > morning
+  // for every officer → fake "negative arrear collected" on the dashboard.
+  //
+  // NEW: one query, one cutoff (DueDate < from). arrears_morning is derived
+  // from arrears_now + today's payments-to-overdue. No timing dependence,
+  // no cache staleness, identity holds: arrear_collected +
+  // open_invoice_collection = total_collection_today.
+  const [arrearMath, offlineCounts] = await Promise.all([
+    getLiveOfficerArrearMath(from),
     getOfficerOfflineCounts(from), // motos snapshot (refreshed live by operator)
   ]);
+  // Adapter shims so the downstream aggregation code below stays unchanged.
+  // arrears_morning / arrears_realtime keys preserved for frontend compat —
+  // arrears_realtime is now "arrears_now" semantically (overdue balance right now).
+  const morningArrears = new Map(
+    Array.from(arrearMath.entries()).map(([id, p]) => [id, {
+      officer_id: id, officer_name: p.officer_name, total_arrears: p.arrears_morning,
+    }]),
+  );
+  const realtimeArrears = new Map(
+    Array.from(arrearMath.entries()).map(([id, p]) => [id, {
+      officer_id: id, officer_name: p.officer_name, total_arrears: p.arrears_now,
+    }]),
+  );
   // Collections — sum payment_uploads.amount per officer across the window.
   const collectionsRes = await db().query(
     `SELECT m.officer_id, m.officer_name,
@@ -458,10 +477,17 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     cur.open = Math.max(0, cur.total_invoice_amount - cur.adjustment);
     cur.collection = Number(collections.get(id)?.collection || 0);
   }
+  // Frank 2026-06-09: arrear_collected + open_invoice_collection come DIRECTLY
+  // from today's QB Payments bucketed by their invoice's overdue status — no
+  // more snapshot-delta math. Identity guaranteed: arrear_collected +
+  // open_invoice_collection = sum of today's payment lines.
+  if (!grand.open_invoice_collection) grand.open_invoice_collection = 0;
   const officers = Array.from(byOfficer.values()).map((o) => {
     const collected = o.total_invoice_amount - o.today_balance_remain;
     const pct_collected = o.open > 0 ? (collected / o.open) * 100 : null;
-    const arrear_collected = o.arrears_morning - o.arrears_realtime;
+    const m = arrearMath.get(o.officer_id);
+    const arrear_collected         = Number(m?.arrear_collected || 0);
+    const open_invoice_collection  = Number(m?.open_invoice_collection || 0);
     const arrear_pct_collected = o.arrears_morning > 0
       ? (arrear_collected / o.arrears_morning) * 100 : null;
     grand.total_invoice_amount += o.total_invoice_amount;
@@ -473,10 +499,13 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     grand.collection += o.collection;
     grand.arrears_morning += o.arrears_morning;
     grand.arrears_realtime += o.arrears_realtime;
-    return { ...o, collected, pct_collected, arrear_collected, arrear_pct_collected };
+    grand.open_invoice_collection += open_invoice_collection;
+    return { ...o, collected, pct_collected, arrear_collected, open_invoice_collection, arrear_pct_collected };
   });
   const grandCollected = grand.total_invoice_amount - grand.today_balance_remain;
-  const grandArrearCollected = grand.arrears_morning - grand.arrears_realtime;
+  // Frank 2026-06-09: grand arrear_collected = sum across officers (direct from
+  // payment lines), NOT the snapshot delta. Identity still holds at grand level.
+  const grandArrearCollected = officers.reduce((s, o) => s + (o.arrear_collected || 0), 0);
   return {
     officers: officers.sort((a, b) => (b.open || 0) - (a.open || 0)),
     grand: {
