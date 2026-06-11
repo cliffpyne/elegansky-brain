@@ -345,8 +345,15 @@ async function readSheetTab(sheetId, tab, windowStart, windowEnd) {
 }
 
 async function getSheetTotals(fromDate, toDate) {
-  return cached(`sheetTotals|${fromDate}|${toDate}`, SECTION_B_TTL_MS,
-    () => _getSheetTotalsUncached(fromDate, toDate));
+  return cached(`sheetTotals|${fromDate}|${toDate}`, SECTION_B_TTL_MS, async () => {
+    const { getSnapshotSheetTotals } = await import('./sheet-totals-snapshotter.js');
+    const snap = await getSnapshotSheetTotals(fromDate, toDate);
+    if (snap) return snap;
+    return _getSheetTotalsUncached(fromDate, toDate);
+  });
+}
+export async function computeSheetTotalsForSnapshot(fromDate, toDate) {
+  return _getSheetTotalsUncached(fromDate, toDate);
 }
 async function _getSheetTotalsUncached(fromDate, toDate) {
   // Window: [fromDate 00:00 EAT, (toDate + 1 day) 00:00 EAT) in UTC.

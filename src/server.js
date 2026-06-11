@@ -22,9 +22,10 @@ import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recover
 import { mountQbMirrorApi } from './qb-mirror-api.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
-import { getPrewarmHooks, computeAccountBalanceForSnapshot } from './mega-report.js';
+import { getPrewarmHooks, computeAccountBalanceForSnapshot, computeSheetTotalsForSnapshot } from './mega-report.js';
 import { startMegaReportPrewarmer } from './mega-report-prewarmer.js';
 import { startAccountBalanceSnapshotter } from './account-balance-snapshotter.js';
+import { startSheetTotalsSnapshotter } from './sheet-totals-snapshotter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1052,5 +1053,11 @@ app.listen(PORT, () => {
   // Section A cold-path is also a pure SELECT (not a live QB call).
   if (process.env.ACCT_BAL_SNAPSHOTTER_ENABLED !== 'false') {
     startAccountBalanceSnapshotter(computeAccountBalanceForSnapshot);
+  }
+  // Section B snapshotter: same idea for sheet totals (per-channel
+  // PASSED/FAILED/UNUSED). After warmup, dashboard hot path for the
+  // whole report is a pure Postgres SELECT.
+  if (process.env.SHEET_TOTALS_SNAPSHOTTER_ENABLED !== 'false') {
+    startSheetTotalsSnapshotter(computeSheetTotalsForSnapshot);
   }
 });
