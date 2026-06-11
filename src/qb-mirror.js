@@ -315,11 +315,14 @@ export async function backfillEntity(entity, opts = {}) {
 // ── CDC delta sync ───────────────────────────────────────────────────────
 
 /**
- * Pull entities changed since (last_cdc_at - overlap). Uses QB's CDC endpoint
- * which returns inserts, updates, AND soft-deletes (status='Deleted').
- *
- * Returns { entity, rows, deleted, max_last_updated, took_ms }.
+ * Pull rows changed since (last_cdc_at - overlap), upsert into mirror,
+ * advance the high-water mark. Bounded per call: at most CDC_MAX_ROWS so
+ * each tick fits inside Supabase's 60s statement timeout and Render's
+ * healthcheck window. If QB returns the cap, the next tick picks up the
+ * remainder automatically (last_cdc_at advances each call).
  */
+const CDC_MAX_ROWS = 200;
+
 export async function cdcSync(entity) {
   if (!['Invoice', 'Payment'].includes(entity)) throw new Error('bad entity: ' + entity);
   const t0 = Date.now();
@@ -328,41 +331,51 @@ export async function cdcSync(entity) {
     [entity],
   );
   if (!stateRes.rows.length) {
-    // No high-water mark — caller should run backfill first.
     throw new Error(`cdcSync(${entity}): no qb_mirror_state row; run backfillEntity first`);
   }
   const baseline = new Date(stateRes.rows[0].last_cdc_at);
   const since = new Date(baseline.getTime() - CDC_OVERLAP_MS);
   const sinceIso = since.toISOString();
-  // QB CDC endpoint format. Returns { CDCResponse: [{ QueryResponse: [{ Invoice: [...], ... }] }] }
-  const r = await qbQuery(`SELECT * FROM ${entity} WHERE MetaData.LastUpdatedTime >= '${sinceIso}' ORDER BY MetaData.LastUpdatedTime`);
+  // Bounded query: ORDER BY + MAXRESULTS cap means QB returns ONE bounded
+  // page even if thousands of rows changed. Next tick picks up the rest.
+  // Drop SELECT * for Invoice (we don't need nested Line[]); keep it for
+  // Payment because Line[].LinkedTxn[] is the whole point of mirroring.
+  const sel = entity === 'Payment' ? '*' : 'Id, CustomerRef, TxnDate, DueDate, TotalAmt, Balance, DocNumber, SyncToken, MetaData';
+  const r = await qbQuery(
+    `SELECT ${sel} FROM ${entity} ` +
+    `WHERE MetaData.LastUpdatedTime >= '${sinceIso}' ` +
+    `ORDER BY MetaData.LastUpdatedTime ` +
+    `MAXRESULTS ${CDC_MAX_ROWS}`,
+  );
   const list = r.QueryResponse?.[entity] || [];
   let rows = 0;
-  let deleted = 0;
   let maxLastUpdated = null;
-  const client = await db().connect();
-  try {
-    await client.query('BEGIN');
-    for (const row of list) {
-      // QB returns soft-deleted entities with status='Deleted' in CDC, but
-      // the plain query above usually excludes them. If we add CDC endpoint
-      // later we'll handle delete here. For now upsert all.
-      if (entity === 'Invoice') await upsertInvoice(row, client);
-      else                       await upsertPayment(row, client);
-      const lu = row.MetaData?.LastUpdatedTime;
-      if (lu && (!maxLastUpdated || lu > maxLastUpdated)) maxLastUpdated = lu;
-      rows++;
+  if (list.length > 0) {
+    const client = await db().connect();
+    try {
+      await client.query('BEGIN');
+      // SET LOCAL must be inside the transaction. Caps each Postgres
+      // operation to 45 s so we fail fast and let the next tick retry,
+      // instead of waiting for Supabase to cancel at 60 s.
+      await client.query(`SET LOCAL statement_timeout = 45000`);
+      if (entity === 'Invoice') await upsertInvoicesBatch(list, client);
+      else                       await upsertPaymentsBatch(list, client);
+      await client.query('COMMIT');
+      for (const row of list) {
+        const lu = row.MetaData?.LastUpdatedTime;
+        if (lu && (!maxLastUpdated || lu > maxLastUpdated)) maxLastUpdated = lu;
+        rows++;
+      }
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      await db().query(
+        `UPDATE qb_mirror_state SET last_error = $1, last_error_at = now() WHERE entity = $2`,
+        [String(e.message || e).slice(0, 500), entity],
+      );
+      throw e;
+    } finally {
+      client.release();
     }
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    await db().query(
-      `UPDATE qb_mirror_state SET last_error = $1, last_error_at = now() WHERE entity = $2`,
-      [String(e.message || e).slice(0, 500), entity],
-    );
-    throw e;
-  } finally {
-    client.release();
   }
   if (maxLastUpdated) {
     await db().query(
@@ -375,7 +388,7 @@ export async function cdcSync(entity) {
       [maxLastUpdated, rows, entity],
     );
   }
-  return { entity, rows, deleted, max_last_updated: maxLastUpdated, took_ms: Date.now() - t0 };
+  return { entity, rows, deleted: 0, max_last_updated: maxLastUpdated, took_ms: Date.now() - t0 };
 }
 
 // ── State inspection ────────────────────────────────────────────────────

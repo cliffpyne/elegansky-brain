@@ -16,7 +16,12 @@ export function db() {
   _pool = new Pool({
     connectionString: url,
     ssl: { rejectUnauthorized: false }, // Supabase requires TLS
-    max: 4, // BRAIN handles few req/s; small pool is plenty
+    // 4 was too small once the CDC poller + snapshot refresher run
+    // alongside report endpoints + the agent. Healthcheck would hang
+    // waiting for a connection while CDC held one for >60s, and
+    // Render would restart the dyno. 10 leaves headroom even under
+    // backfill + CDC + reporting concurrency.
+    max: 10,
     idleTimeoutMillis: 30_000,
   });
   _pool.on('error', (err) => {

@@ -13,6 +13,11 @@ const ENTITIES = ['Invoice', 'Payment'];
 
 let _started = false;
 let _timer = null;
+// In-flight guard PER ENTITY. cdcSync on Payment can take 60-130 s
+// (QB SELECT * + 100 nested-line upserts). If a new tick fires while the
+// previous is still running we end up with overlapping calls, pool
+// exhaustion, and the dyno gets restarted by Render. Skip overlapping ticks.
+const _inFlight = { Invoice: false, Payment: false };
 let _state = {
   last_ok_at: null,
   last_run_at: null,
@@ -20,25 +25,37 @@ let _state = {
   invoice_rows: 0,
   payment_rows: 0,
   runs: 0,
+  skipped: 0,
 };
 
-async function tick() {
-  _state.last_run_at = new Date().toISOString();
-  for (const entity of ENTITIES) {
-    try {
-      const r = await cdcSync(entity);
-      if (entity === 'Invoice') _state.invoice_rows += r.rows;
-      else                       _state.payment_rows += r.rows;
-      _state.last_ok_at = new Date().toISOString();
-      _state.last_error = null;
-      if (r.rows > 0) {
-        console.log(`[qb-mirror-poller] ${entity}: synced ${r.rows} row(s) in ${r.took_ms}ms`);
-      }
-    } catch (err) {
-      _state.last_error = `${entity}: ${err.message}`;
-      console.error(`[qb-mirror-poller] ${entity} sync failed:`, err.message);
-    }
+async function syncOne(entity) {
+  if (_inFlight[entity]) {
+    _state.skipped += 1;
+    return;
   }
+  _inFlight[entity] = true;
+  try {
+    const r = await cdcSync(entity);
+    if (entity === 'Invoice') _state.invoice_rows += r.rows;
+    else                       _state.payment_rows += r.rows;
+    _state.last_ok_at = new Date().toISOString();
+    _state.last_error = null;
+    if (r.rows > 0) {
+      console.log(`[qb-mirror-poller] ${entity}: synced ${r.rows} row(s) in ${r.took_ms}ms`);
+    }
+  } catch (err) {
+    _state.last_error = `${entity}: ${err.message}`;
+    console.error(`[qb-mirror-poller] ${entity} sync failed:`, err.message);
+  } finally {
+    _inFlight[entity] = false;
+  }
+}
+
+function tick() {
+  _state.last_run_at = new Date().toISOString();
+  // Fire both entities in parallel. The in-flight guard inside syncOne
+  // means a slow Payment cycle won't block Invoice ticks from running.
+  for (const entity of ENTITIES) syncOne(entity);
   _state.runs += 1;
 }
 

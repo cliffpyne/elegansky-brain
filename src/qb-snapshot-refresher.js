@@ -13,8 +13,14 @@
 
 import { db } from './db/pool.js';
 
-const REFRESH_INTERVAL_MS = 30_000;
+// 60 s is plenty for the dashboard "≤ 1 min freshness" target and stops
+// the refresher from competing with CDC poller every 30 s for the same
+// 4-connection pool. Settable via env if Frank wants to dial it.
+const REFRESH_INTERVAL_MS = Number(process.env.SNAPSHOT_REFRESH_MS || 60_000);
 const HISTORICAL_DAYS_ON_BOOT = 7;
+// In-flight guard: a refresh tick under contention can take >30 s; never
+// allow two to overlap.
+let _inFlight = false;
 
 let _started = false;
 let _timer = null;
@@ -128,6 +134,8 @@ function isoNDaysAgo(n) {
 }
 
 async function tick() {
+  if (_inFlight) return;
+  _inFlight = true;
   _state.last_run_at = new Date().toISOString();
   try {
     const today = eatTodayStr();
@@ -136,13 +144,14 @@ async function tick() {
     _state.last_ok_at = new Date().toISOString();
     _state.last_error = null;
     _state.refreshes += 1;
-    // Light log to avoid console spam — only when meaningful.
     if (r.rows > 0 && _state.refreshes <= 3) {
       console.log(`[snapshot-refresher] ${today}: upserted ${r.rows} officers in ${r.took_ms}ms`);
     }
   } catch (err) {
     _state.last_error = err.message;
     console.error('[snapshot-refresher] tick failed:', err.message);
+  } finally {
+    _inFlight = false;
   }
 }
 
