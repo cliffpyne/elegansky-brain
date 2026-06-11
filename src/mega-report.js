@@ -595,6 +595,13 @@ function resolveWindow({ granularity, anchor, from, to }) {
 
 // ── HTTP mount ────────────────────────────────────────────────────────────
 
+// Prewarmer hook: same three section-helpers the HTTP endpoint composes,
+// exposed so the pre-warmer can keep the cache hot for common windows
+// (today, yesterday, this week, last week) without going through HTTP.
+export function getPrewarmHooks() {
+  return { getAccountBalance, getSheetTotals, aggregateOfficers };
+}
+
 export function mountMegaReportApi(app, { requireSecretOrJwt }) {
   // GET /api/mega-report?granularity=day|week|month|range&anchor=YYYY-MM-DD&from=&to=&officer_id=
   app.get('/api/mega-report', requireSecretOrJwt, async (req, res) => {
@@ -660,6 +667,10 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
   // QB roundtrips from O(days) down to O(1) for the heavy parts.
 
   async function fetchAllPaymentsInRange(from, to) {
+    return cached(`fetchAllPaymentsInRange|${from}|${to}`, 60_000,
+      () => _fetchAllPaymentsInRangeUncached(from, to));
+  }
+  async function _fetchAllPaymentsInRangeUncached(from, to) {
     const all = [];
     const BATCH = 1000;
     let start = 1;
@@ -677,6 +688,10 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
     return all;
   }
   async function fetchAllExpensesInRange(from, to) {
+    return cached(`fetchAllExpensesInRange|${from}|${to}`, 60_000,
+      () => _fetchAllExpensesInRangeUncached(from, to));
+  }
+  async function _fetchAllExpensesInRangeUncached(from, to) {
     const all = [];
     const BATCH = 1000;
     let start = 1;
@@ -803,8 +818,14 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
       if (dates.length > 62) {
         return res.status(400).json({ error: `series range too wide (${dates.length} days, max 62)` });
       }
-      await acquireSeriesSlot();
-      try {
+      // Cache the WHOLE series response so KPI click-through modals
+      // (Payments monthly view, Expenses monthly view, etc.) return
+      // instantly after the first compute. 60 s TTL = same freshness
+      // budget as the rest of the report.
+      const seriesKey = `series|${from}|${to}|${officerId || ''}`;
+      const payload = await cached(seriesKey, 60_000, async () => {
+        await acquireSeriesSlot();
+        try {
         // FAST PATH: one bulk Payment query + one bulk Purchase query for the
         // full range, bucketed by TxnDate. Sheet reads are also cached per
         // tab so we don't re-fetch 100k rows per day. Officers data is still
@@ -915,14 +936,16 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
             } : null,
           };
         });
-        res.json({
+        return {
           from, to, officer_id_filter: officerId,
           days: out,
           generated_at: new Date().toISOString(),
-        });
+        };
       } finally {
         releaseSeriesSlot();
       }
+      });
+      res.json(payload);
     } catch (err) {
       console.error('[mega-report/series] failed:', err);
       res.status(500).json({ error: err.message });

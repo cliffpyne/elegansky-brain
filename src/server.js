@@ -22,6 +22,8 @@ import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recover
 import { mountQbMirrorApi } from './qb-mirror-api.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
+import { getPrewarmHooks } from './mega-report.js';
+import { startMegaReportPrewarmer } from './mega-report-prewarmer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1038,5 +1040,11 @@ app.listen(PORT, () => {
   // Refreshes today every 30 s + previous 7 days on boot.
   if (process.env.QB_SNAPSHOT_REFRESHER_ENABLED !== 'false') {
     startSnapshotRefresher();
+  }
+  // Mega-report pre-warmer: keeps the 30 s response cache hot for the
+  // most-common windows (today, yesterday, current week, last week) so
+  // even the first dashboard visitor sees sub-second loads.
+  if (process.env.MEGA_REPORT_PREWARMER_ENABLED !== 'false') {
+    startMegaReportPrewarmer(getPrewarmHooks());
   }
 });
