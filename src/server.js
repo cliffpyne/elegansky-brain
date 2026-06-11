@@ -22,8 +22,9 @@ import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recover
 import { mountQbMirrorApi } from './qb-mirror-api.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
-import { getPrewarmHooks } from './mega-report.js';
+import { getPrewarmHooks, computeAccountBalanceForSnapshot } from './mega-report.js';
 import { startMegaReportPrewarmer } from './mega-report-prewarmer.js';
+import { startAccountBalanceSnapshotter } from './account-balance-snapshotter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1046,5 +1047,10 @@ app.listen(PORT, () => {
   // even the first dashboard visitor sees sub-second loads.
   if (process.env.MEGA_REPORT_PREWARMER_ENABLED !== 'false') {
     startMegaReportPrewarmer(getPrewarmHooks());
+  }
+  // Section A snapshotter: writes Postgres rows so the dashboard's
+  // Section A cold-path is also a pure SELECT (not a live QB call).
+  if (process.env.ACCT_BAL_SNAPSHOTTER_ENABLED !== 'false') {
+    startAccountBalanceSnapshotter(computeAccountBalanceForSnapshot);
   }
 });

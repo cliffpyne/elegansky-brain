@@ -232,8 +232,20 @@ async function sumExpensesInWindow(accountIds, fromDate, toDate) {
  *  - Live closing balance (parent + sub-accounts, right now)
  */
 async function getAccountBalance(fromDate, toDate) {
-  return cached(`accountBalance|${fromDate}|${toDate}`, SECTION_A_TTL_MS,
-    () => _getAccountBalanceUncached(fromDate, toDate));
+  return cached(`accountBalance|${fromDate}|${toDate}`, SECTION_A_TTL_MS, async () => {
+    // Reporting-only path: try the pre-computed daily_account_balance
+    // snapshot first. Falls through to live compute on miss (cold day, etc).
+    const { getSnapshotAccountBalance } = await import('./account-balance-snapshotter.js');
+    const snap = await getSnapshotAccountBalance(fromDate, toDate);
+    if (snap) return snap;
+    return _getAccountBalanceUncached(fromDate, toDate);
+  });
+}
+// Hook for the snapshotter — same body the cached wrapper above invokes
+// on a miss, but exposed plain so the background loop can populate the
+// snapshot table without going through cache.
+export async function computeAccountBalanceForSnapshot(fromDate, toDate) {
+  return _getAccountBalanceUncached(fromDate, toDate);
 }
 async function _getAccountBalanceUncached(fromDate, toDate) {
   const allNames = [PARENT_ACCOUNT_NAME, ...SUB_ACCOUNT_NAMES];

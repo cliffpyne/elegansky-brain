@@ -538,6 +538,26 @@ CREATE TABLE IF NOT EXISTS qb_mirror_state (
   last_error_at     timestamptz
 );
 
+-- Phase 5+ — pre-computed daily Section A account balance per date.
+-- Populated by account-balance-snapshotter every 60 s for today + N
+-- historical days on boot. mega-report's getAccountBalance reads here
+-- first, falls back to live QB BalanceSheet only on miss. Once this
+-- table is warm, dashboard cold-path is pure Postgres SELECT.
+CREATE TABLE IF NOT EXISTS daily_account_balance (
+  date            date         PRIMARY KEY,
+  parent_account  text         NOT NULL,
+  opening_balance numeric,
+  closing_live    numeric,
+  payments_total  numeric      NOT NULL DEFAULT 0,
+  payments_count  int          NOT NULL DEFAULT 0,
+  expenses_total  numeric      NOT NULL DEFAULT 0,
+  expenses_count  int          NOT NULL DEFAULT 0,
+  net_movement    numeric      NOT NULL DEFAULT 0,
+  computed_at     timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_daily_account_balance_date
+  ON daily_account_balance (date DESC);
+
 -- Phase 4 — pre-computed daily aggregates per (date, officer). Lets
 -- multi-day windows and trend comparisons avoid re-aggregating raw
 -- mirror rows. Refreshed by snapshot-refresher every 30 s for today,
