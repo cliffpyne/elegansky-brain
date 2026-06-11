@@ -470,3 +470,96 @@ ALTER TABLE payment_batches
   ADD COLUMN IF NOT EXISTS logs jsonb NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_payment_batches_logs_gin
   ON payment_batches USING gin (logs);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- QB MIRROR (Phase 1) — local copies of Invoice + Payment + LinkedTxn rows
+-- so report queries hit Postgres (sub-second) instead of QB API (minutes).
+-- Kept current by CDC polling every 30s + webhook upserts (Phase 2).
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS qb_invoices (
+  id                text          PRIMARY KEY,        -- QB Invoice.Id
+  customer_id       text          NOT NULL,
+  txn_date          date          NOT NULL,
+  due_date          date,
+  total_amt         numeric       NOT NULL,
+  balance           numeric       NOT NULL,
+  doc_number        text,
+  sync_token        text,
+  qb_last_updated   timestamptz,                       -- MetaData.LastUpdatedTime
+  mirror_synced_at  timestamptz   NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_txn_date
+  ON qb_invoices (txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_due_overdue
+  ON qb_invoices (due_date) WHERE balance > 0;
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_customer
+  ON qb_invoices (customer_id);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_balance_pos
+  ON qb_invoices (balance) WHERE balance > 0;
+
+CREATE TABLE IF NOT EXISTS qb_payments (
+  id                text          PRIMARY KEY,        -- QB Payment.Id
+  customer_id       text          NOT NULL,
+  txn_date          date          NOT NULL,
+  total_amt         numeric       NOT NULL,
+  sync_token        text,
+  qb_last_updated   timestamptz,
+  mirror_synced_at  timestamptz   NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_qb_payments_txn_date
+  ON qb_payments (txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_payments_customer
+  ON qb_payments (customer_id);
+
+-- One row per Payment.Line[] entry that links to an Invoice. Used by the
+-- arrear math (bucket today's payment lines by linked invoice's overdue
+-- status). Other line types (deposits, discounts) skipped — they don't
+-- show up in our reports.
+CREATE TABLE IF NOT EXISTS qb_payment_lines (
+  payment_id        text          NOT NULL REFERENCES qb_payments(id) ON DELETE CASCADE,
+  line_no           int           NOT NULL,          -- 0-indexed position in Line[]
+  amount            numeric       NOT NULL,
+  linked_invoice_id text,                            -- LinkedTxn[].TxnId where TxnType='Invoice'
+  PRIMARY KEY (payment_id, line_no)
+);
+CREATE INDEX IF NOT EXISTS idx_qb_payment_lines_invoice
+  ON qb_payment_lines (linked_invoice_id) WHERE linked_invoice_id IS NOT NULL;
+
+-- High-water mark + audit per entity for CDC polling.
+-- last_cdc_at = highest LastUpdatedTime we've ingested. The CDC poll asks
+-- QB for everything changedSince last_cdc_at - 60s (overlap to absorb
+-- clock skew + missed webhooks).
+CREATE TABLE IF NOT EXISTS qb_mirror_state (
+  entity            text          PRIMARY KEY,       -- 'Invoice' | 'Payment'
+  last_cdc_at       timestamptz   NOT NULL,
+  last_backfill_at  timestamptz,
+  rows_synced       bigint        NOT NULL DEFAULT 0,
+  last_error        text,
+  last_error_at     timestamptz
+);
+
+-- Phase 4 — pre-computed daily aggregates per (date, officer). Lets
+-- multi-day windows and trend comparisons avoid re-aggregating raw
+-- mirror rows. Refreshed by snapshot-refresher every 30 s for today,
+-- sealed by nightly job for historical days.
+CREATE TABLE IF NOT EXISTS daily_officer_snapshot (
+  date                     date     NOT NULL,
+  officer_id               text     NOT NULL,
+  officer_name             text     NOT NULL,
+  -- Section C: today's invoices.
+  total_invoice_amount     numeric  NOT NULL DEFAULT 0,
+  today_balance_remain     numeric  NOT NULL DEFAULT 0,
+  open_invoice_count       int      NOT NULL DEFAULT 0,
+  -- Section D: arrears + collection math.
+  arrears_now              numeric  NOT NULL DEFAULT 0,
+  arrears_morning          numeric  NOT NULL DEFAULT 0,
+  arrear_collected         numeric  NOT NULL DEFAULT 0,
+  open_invoice_collection  numeric  NOT NULL DEFAULT 0,
+  overdue_invoice_count    int      NOT NULL DEFAULT 0,
+  computed_at              timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (date, officer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_date
+  ON daily_officer_snapshot (date DESC);
+CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_officer
+  ON daily_officer_snapshot (officer_id, date DESC);

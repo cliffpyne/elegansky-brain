@@ -19,6 +19,9 @@ import { mountOfficerReportsApi } from './officer-reports.js';
 import { mountMegaReportApi } from './mega-report.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
+import { mountQbMirrorApi } from './qb-mirror-api.js';
+import { startQbMirrorPoller } from './qb-mirror-poller.js';
+import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -574,6 +577,7 @@ mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey })
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
 mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
+mountQbMirrorApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
@@ -1023,4 +1027,16 @@ app.listen(PORT, () => {
   // status='pending' with zero uploads. Runs once 5s after boot. Real
   // incident: NMB 91c0fa9e locked 418 refs after a killed --confirm.
   startLimboRecoveryOnBoot();
+  // QB mirror CDC poller — keeps qb_invoices/qb_payments within ~30s of QB
+  // so the reporting hot path can read from Postgres (sub-second) instead of
+  // QB API (minutes). Set QB_MIRROR_POLLER_ENABLED=false to disable.
+  if (process.env.QB_MIRROR_POLLER_ENABLED !== 'false') {
+    startQbMirrorPoller();
+  }
+  // Phase 4 — daily_officer_snapshot refresher. Maintains pre-computed
+  // per-(date, officer) aggregates so multi-day windows are instant.
+  // Refreshes today every 30 s + previous 7 days on boot.
+  if (process.env.QB_SNAPSHOT_REFRESHER_ENABLED !== 'false') {
+    startSnapshotRefresher();
+  }
 });

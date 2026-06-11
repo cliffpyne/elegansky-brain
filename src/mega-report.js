@@ -28,8 +28,21 @@ import {
   getLiveOfficerInvoiceTotals,
   getLiveOfficerArrears,
   getLiveOfficerArrearMath,    // Frank 2026-06-09: snapshot-free agent arrear math
+  getMirrorOfficerInvoiceTotals,
+  getMirrorOfficerArrears,
+  getMirrorOfficerArrearMath,  // Phase 3: Postgres-backed mirror reads (sub-second)
   getOfficerOfflineCounts,
 } from './officer-reports.js';
+
+// Phase 3 flag: when true, /api/mega-report reads from the qb_invoices /
+// qb_payments mirror (sub-second) instead of QB API (10+ minutes). Mirror
+// is kept fresh by the CDC poller (every 30 s) so freshness ≤ 1 min.
+//
+// Default: ON. Set USE_QB_MIRROR=false to revert to live QB reads while
+// debugging mirror staleness.
+const USE_QB_MIRROR = process.env.USE_QB_MIRROR !== 'false';
+const officerInvoiceTotalsFn = USE_QB_MIRROR ? getMirrorOfficerInvoiceTotals : getLiveOfficerInvoiceTotals;
+const officerArrearMathFn    = USE_QB_MIRROR ? getMirrorOfficerArrearMath    : getLiveOfficerArrearMath;
 
 // Parent + sub-accounts that operator's Account QuickReport rolls up.
 // "Elegansky Collection AC" is the parent; "Kijichi Collection AC" is the
@@ -386,7 +399,7 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   // no cache staleness, identity holds: arrear_collected +
   // open_invoice_collection = total_collection_today.
   const [arrearMath, offlineCounts] = await Promise.all([
-    getLiveOfficerArrearMath(from),
+    officerArrearMathFn(from),
     getOfficerOfflineCounts(from), // motos snapshot (refreshed live by operator)
   ]);
   // Adapter shims so the downstream aggregation code below stays unchanged.
@@ -419,7 +432,7 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   }]));
   // Invoices — sum live per-day, accumulating across the window.
   for (const d of dates) {
-    const inv = await getLiveOfficerInvoiceTotals(d);
+    const inv = await officerInvoiceTotalsFn(d);
     for (const [officer_id, row] of inv.entries()) {
       if (officerIdFilter && String(officer_id) !== String(officerIdFilter)) continue;
       const cur = byOfficer.get(officer_id) || {
