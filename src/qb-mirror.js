@@ -327,13 +327,11 @@ export async function backfillEntity(entity, opts = {}) {
  * healthcheck window. If QB returns the cap, the next tick picks up the
  * remainder automatically (last_cdc_at advances each call).
  */
-// One CDC tick budget. Was 200 — too small when one payment session
-// updates 500+ invoices at once (each invoice's Balance changes), the
-// poller couldn't keep up and steady-state lag drifted to 20 min.
-// 1500 fits inside our 45 s statement_timeout for the upsert step and
-// drains 3000 rows/min × per entity, which is well above natural QB
-// activity even during heisenberg fires.
-const CDC_MAX_ROWS = 1500;
+// One CDC tick budget. QB caps MAXRESULTS at 1000 hard — 1500 returns
+// HTTP 400 ("value 1500 is too large"). 1000 × 30s = 2000 rows/min per
+// entity, sufficient for natural QB activity. If a burst exceeds that,
+// the next tick drains the remainder (last_cdc_at advances each call).
+const CDC_MAX_ROWS = 1000;
 
 export async function cdcSync(entity) {
   if (!['Invoice', 'Payment'].includes(entity)) throw new Error('bad entity: ' + entity);

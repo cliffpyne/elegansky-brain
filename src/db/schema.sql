@@ -538,6 +538,24 @@ CREATE TABLE IF NOT EXISTS qb_mirror_state (
   last_error_at     timestamptz
 );
 
+-- Phase 5+ — pre-computed daily Section B sheet totals per (date, channel).
+-- mega-report's getSheetTotals reads this table when present; falls back
+-- to live Google Sheets read only on miss.
+CREATE TABLE IF NOT EXISTS daily_sheet_totals (
+  date            date         NOT NULL,
+  channel         text         NOT NULL,
+  passed_rows     int          NOT NULL DEFAULT 0,
+  passed_total    numeric      NOT NULL DEFAULT 0,
+  failed_rows     int          NOT NULL DEFAULT 0,
+  failed_total    numeric      NOT NULL DEFAULT 0,
+  unused_rows     int          NOT NULL DEFAULT 0,
+  unused_total    numeric      NOT NULL DEFAULT 0,
+  computed_at     timestamptz  NOT NULL DEFAULT now(),
+  PRIMARY KEY (date, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_sheet_totals_date
+  ON daily_sheet_totals (date DESC);
+
 -- Phase 5+ — pre-computed daily Section A account balance per date.
 -- Populated by account-balance-snapshotter every 60 s for today + N
 -- historical days on boot. mega-report's getAccountBalance reads here
