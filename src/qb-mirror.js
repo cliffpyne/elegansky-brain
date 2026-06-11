@@ -147,6 +147,10 @@ export async function upsertInvoicesBatch(invoices, client) {
     );
   }
   const placeholders = buildPlaceholders(invoices.length, cols);
+  // Only bump mirror_synced_at when something ACTUALLY changed — the
+  // CDC 5-min overlap re-fetches unchanged rows every tick; treating
+  // those as "newly mirrored" inflated our lag metric to 600+ seconds
+  // even though first-mirror was <30 s.
   await client.query(
     `INSERT INTO qb_invoices
        (id, customer_id, txn_date, due_date, total_amt, balance,
@@ -161,7 +165,8 @@ export async function upsertInvoicesBatch(invoices, client) {
        doc_number       = EXCLUDED.doc_number,
        sync_token       = EXCLUDED.sync_token,
        qb_last_updated  = EXCLUDED.qb_last_updated,
-       mirror_synced_at = now()`,
+       mirror_synced_at = now()
+     WHERE qb_invoices.qb_last_updated IS DISTINCT FROM EXCLUDED.qb_last_updated`,
     values,
   );
 }
@@ -192,7 +197,8 @@ export async function upsertPaymentsBatch(payments, client) {
        total_amt        = EXCLUDED.total_amt,
        sync_token       = EXCLUDED.sync_token,
        qb_last_updated  = EXCLUDED.qb_last_updated,
-       mirror_synced_at = now()`,
+       mirror_synced_at = now()
+     WHERE qb_payments.qb_last_updated IS DISTINCT FROM EXCLUDED.qb_last_updated`,
     values,
   );
   // 2. Replace lines for every payment in this batch.
