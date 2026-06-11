@@ -25,24 +25,43 @@ import { readSheet } from './sheets.js';
 import {
   computeOfficerReport,
   getOfficerArrears,
-  getLiveOfficerInvoiceTotals,
-  getLiveOfficerArrears,
-  getLiveOfficerArrearMath,    // Frank 2026-06-09: snapshot-free agent arrear math
   getMirrorOfficerInvoiceTotals,
   getMirrorOfficerArrears,
-  getMirrorOfficerArrearMath,  // Phase 3: Postgres-backed mirror reads (sub-second)
+  getMirrorOfficerArrearMath,
   getOfficerOfflineCounts,
 } from './officer-reports.js';
 
-// Phase 3 flag: when true, /api/mega-report reads from the qb_invoices /
-// qb_payments mirror (sub-second) instead of QB API (10+ minutes). Mirror
-// is kept fresh by the CDC poller (every 30 s) so freshness ≤ 1 min.
-//
-// Default: ON. Set USE_QB_MIRROR=false to revert to live QB reads while
-// debugging mirror staleness.
-const USE_QB_MIRROR = process.env.USE_QB_MIRROR !== 'false';
-const officerInvoiceTotalsFn = USE_QB_MIRROR ? getMirrorOfficerInvoiceTotals : getLiveOfficerInvoiceTotals;
-const officerArrearMathFn    = USE_QB_MIRROR ? getMirrorOfficerArrearMath    : getLiveOfficerArrearMath;
+// Phase 5: report path reads MIRROR ONLY. The live-QB fallback is gone —
+// the qb_invoices/qb_payments mirror is the single source of truth for
+// reports, kept fresh by cdc-poller (≤30 s) + snapshot-refresher (≤60 s).
+const officerInvoiceTotalsFn = getMirrorOfficerInvoiceTotals;
+const officerArrearMathFn    = getMirrorOfficerArrearMath;
+
+// Tiny TTL cache shared by the per-section helpers AND the top-level
+// /api/mega-report response. Keeps every section under "≤ 1 min" freshness
+// while making 99% of dashboard hits return instantly from memory.
+const _cache = new Map();
+function cached(key, ttlMs, factory) {
+  const hit = _cache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.ts < ttlMs) return Promise.resolve(hit.value);
+  if (hit?.inflight) return hit.inflight;
+  const p = (async () => {
+    try {
+      const value = await factory();
+      _cache.set(key, { ts: Date.now(), value });
+      return value;
+    } catch (e) {
+      _cache.delete(key);
+      throw e;
+    }
+  })();
+  _cache.set(key, { ...hit, inflight: p });
+  return p;
+}
+const RESPONSE_TTL_MS  = 30_000; // /api/mega-report whole response
+const SECTION_A_TTL_MS = 45_000; // QB BalanceSheet ×2 + Payment/Expense window sums
+const SECTION_B_TTL_MS = 45_000; // Google Sheets passes (per channel)
 
 // Parent + sub-accounts that operator's Account QuickReport rolls up.
 // "Elegansky Collection AC" is the parent; "Kijichi Collection AC" is the
@@ -213,6 +232,10 @@ async function sumExpensesInWindow(accountIds, fromDate, toDate) {
  *  - Live closing balance (parent + sub-accounts, right now)
  */
 async function getAccountBalance(fromDate, toDate) {
+  return cached(`accountBalance|${fromDate}|${toDate}`, SECTION_A_TTL_MS,
+    () => _getAccountBalanceUncached(fromDate, toDate));
+}
+async function _getAccountBalanceUncached(fromDate, toDate) {
   const allNames = [PARENT_ACCOUNT_NAME, ...SUB_ACCOUNT_NAMES];
   const ids = await getAccountIds(allNames);
   const targetIds = Object.values(ids);
@@ -310,6 +333,10 @@ async function readSheetTab(sheetId, tab, windowStart, windowEnd) {
 }
 
 async function getSheetTotals(fromDate, toDate) {
+  return cached(`sheetTotals|${fromDate}|${toDate}`, SECTION_B_TTL_MS,
+    () => _getSheetTotalsUncached(fromDate, toDate));
+}
+async function _getSheetTotalsUncached(fromDate, toDate) {
   // Window: [fromDate 00:00 EAT, (toDate + 1 day) 00:00 EAT) in UTC.
   const winStart = new Date(fromDate + 'T00:00:00+03:00');
   const winEndExclusive = new Date(toDate + 'T00:00:00+03:00');
@@ -579,6 +606,12 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
         to: req.query.to,
       });
       const officerId = req.query.officer_id || null;
+      // Wrap the WHOLE response in a 30 s cache keyed on the query params.
+      // First hit per (window, officer) does the full compute; subsequent
+      // hits within 30 s return instantly. Dashboard freshness ≤ 30 s plus
+      // mirror lag (≤ 30 s) = well inside the 1-min target.
+      const responseKey = `mega-report|${window.from}|${window.to}|${officerId || ''}`;
+      const payload = await cached(responseKey, RESPONSE_TTL_MS, async () => {
       const [accountBalance, sheetTotals, officersAgg] = await Promise.all([
         getAccountBalance(window.from, window.to),
         getSheetTotals(window.from, window.to),
@@ -604,7 +637,7 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
         direction: curArr === prevArr ? 'flat' : (curArr > prevArr ? 'up' : 'down'),
         pct_change: prevArr > 0 ? ((curArr - prevArr) / prevArr) * 100 : null,
       };
-      res.json({
+      return {
         window,
         officer_id_filter: officerId,
         section_a_account_balance: accountBalance,
@@ -612,7 +645,9 @@ export function mountMegaReportApi(app, { requireSecretOrJwt }) {
         section_c_d_officers: officersAgg,
         section_e_company_arrear_trend: arrear_trend,
         generated_at: new Date().toISOString(),
+      };
       });
+      res.json(payload);
     } catch (err) {
       console.error('[mega-report] failed:', err);
       res.status(500).json({ error: err.message });

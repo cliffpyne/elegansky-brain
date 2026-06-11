@@ -170,12 +170,16 @@ export function mountPaymentBatchesApi(app, deps) {
     // get reclaimed by the next caller so a crashed worker doesn't block
     // forever.
     const lockHolder = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    // Stale-reclaim window: 5 min. Was 30 min, but Render dyno restarts can
+    // leave a zombie lock for that long with no batch ever created, blocking
+    // operator and agent uploads. 2026-06-11 incident: NMB blocked 18 min by
+    // a zombie from a CDC-poller-fix restart.
     const lockResult = await db().query(
       `INSERT INTO auto_upload_locks (channel, locked_at, holder)
        VALUES ($1, now(), $2)
        ON CONFLICT (channel) DO UPDATE
          SET locked_at = now(), holder = EXCLUDED.holder
-         WHERE auto_upload_locks.locked_at < now() - interval '30 minutes'
+         WHERE auto_upload_locks.locked_at < now() - interval '5 minutes'
        RETURNING holder`,
       [channel, lockHolder],
     );
