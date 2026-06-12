@@ -171,6 +171,71 @@ export async function upsertInvoicesBatch(invoices, client) {
   );
 }
 
+// CreditMemo upsert (parallels payment upsert; CreditMemos are
+// money-OUT entities applied against customer balance / invoices).
+export async function upsertCreditMemosBatch(memos, client) {
+  if (!memos.length) return;
+  const cols = 6;
+  const values = [];
+  for (const m of memos) {
+    values.push(
+      String(m.Id),
+      String(m.CustomerRef?.value || ''),
+      m.TxnDate,
+      Number(m.TotalAmt || 0),
+      m.SyncToken || null,
+      m.MetaData?.LastUpdatedTime || null,
+    );
+  }
+  const placeholders = buildPlaceholders(memos.length, cols);
+  await client.query(
+    `INSERT INTO qb_credit_memos
+       (id, customer_id, txn_date, total_amt, sync_token, qb_last_updated)
+     VALUES ${placeholders}
+     ON CONFLICT (id) DO UPDATE SET
+       customer_id      = EXCLUDED.customer_id,
+       txn_date         = EXCLUDED.txn_date,
+       total_amt        = EXCLUDED.total_amt,
+       sync_token       = EXCLUDED.sync_token,
+       qb_last_updated  = EXCLUDED.qb_last_updated,
+       mirror_synced_at = now()
+     WHERE qb_credit_memos.qb_last_updated IS DISTINCT FROM EXCLUDED.qb_last_updated`,
+    values,
+  );
+  const ids = memos.map((m) => String(m.Id));
+  await client.query(`DELETE FROM qb_credit_memo_lines WHERE credit_memo_id = ANY($1)`, [ids]);
+  const lineVals = [];
+  for (const m of memos) {
+    const lines = m.Line || [];
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      const amt = Number(ln.Amount || 0);
+      const invoiceLinks = (ln.LinkedTxn || [])
+        .filter((lt) => lt.TxnType === 'Invoice')
+        .map((lt) => String(lt.TxnId));
+      if (invoiceLinks.length === 0) {
+        lineVals.push(String(m.Id), i, amt, null);
+      } else {
+        for (let k = 0; k < invoiceLinks.length; k++) {
+          lineVals.push(String(m.Id), i + k * 10000, amt, invoiceLinks[k]);
+        }
+      }
+    }
+  }
+  if (lineVals.length) {
+    const lineRows = lineVals.length / 4;
+    const linePh = buildPlaceholders(lineRows, 4);
+    await client.query(
+      `INSERT INTO qb_credit_memo_lines (credit_memo_id, line_no, amount, linked_invoice_id)
+       VALUES ${linePh}
+       ON CONFLICT (credit_memo_id, line_no) DO UPDATE SET
+         amount = EXCLUDED.amount,
+         linked_invoice_id = EXCLUDED.linked_invoice_id`,
+      lineVals,
+    );
+  }
+}
+
 export async function upsertPaymentsBatch(payments, client) {
   if (!payments.length) return;
   // 1. Bulk upsert qb_payments header rows.
@@ -252,7 +317,7 @@ export async function upsertPaymentsBatch(payments, client) {
  * Returns { entity, pages, rows, max_last_updated, took_ms }.
  */
 export async function backfillEntity(entity, opts = {}) {
-  if (!['Invoice', 'Payment'].includes(entity)) throw new Error('bad entity: ' + entity);
+  if (!['Invoice', 'Payment', 'CreditMemo'].includes(entity)) throw new Error('bad entity: ' + entity);
   const t0 = Date.now();
   let start = 1;
   let pages = 0;
@@ -282,8 +347,9 @@ export async function backfillEntity(entity, opts = {}) {
     const client = await db().connect();
     try {
       await client.query('BEGIN');
-      if (entity === 'Invoice') await upsertInvoicesBatch(list, client);
-      else                       await upsertPaymentsBatch(list, client);
+      if (entity === 'Invoice')         await upsertInvoicesBatch(list, client);
+      else if (entity === 'Payment')    await upsertPaymentsBatch(list, client);
+      else                              await upsertCreditMemosBatch(list, client);
       for (const row of list) {
         const lu = row.MetaData?.LastUpdatedTime;
         if (lu && (!maxLastUpdated || lu > maxLastUpdated)) maxLastUpdated = lu;
@@ -334,7 +400,7 @@ export async function backfillEntity(entity, opts = {}) {
 const CDC_MAX_ROWS = 1000;
 
 export async function cdcSync(entity) {
-  if (!['Invoice', 'Payment'].includes(entity)) throw new Error('bad entity: ' + entity);
+  if (!['Invoice', 'Payment', 'CreditMemo'].includes(entity)) throw new Error('bad entity: ' + entity);
   const t0 = Date.now();
   const stateRes = await db().query(
     `SELECT last_cdc_at FROM qb_mirror_state WHERE entity = $1`,
@@ -350,7 +416,12 @@ export async function cdcSync(entity) {
   // page even if thousands of rows changed. Next tick picks up the rest.
   // Drop SELECT * for Invoice (we don't need nested Line[]); keep it for
   // Payment because Line[].LinkedTxn[] is the whole point of mirroring.
-  const sel = entity === 'Payment' ? '*' : 'Id, CustomerRef, TxnDate, DueDate, TotalAmt, Balance, DocNumber, SyncToken, MetaData';
+  // SELECT * for entities whose nested Line[]/LinkedTxn[] is essential
+  // (Payment, CreditMemo). Invoice uses a column list — faster + no nested
+  // tree needed.
+  const sel = (entity === 'Payment' || entity === 'CreditMemo')
+    ? '*'
+    : 'Id, CustomerRef, TxnDate, DueDate, TotalAmt, Balance, DocNumber, SyncToken, MetaData';
   const r = await qbQuery(
     `SELECT ${sel} FROM ${entity} ` +
     `WHERE MetaData.LastUpdatedTime >= '${sinceIso}' ` +
@@ -368,8 +439,9 @@ export async function cdcSync(entity) {
       // operation to 45 s so we fail fast and let the next tick retry,
       // instead of waiting for Supabase to cancel at 60 s.
       await client.query(`SET LOCAL statement_timeout = 45000`);
-      if (entity === 'Invoice') await upsertInvoicesBatch(list, client);
-      else                       await upsertPaymentsBatch(list, client);
+      if (entity === 'Invoice')         await upsertInvoicesBatch(list, client);
+      else if (entity === 'Payment')    await upsertPaymentsBatch(list, client);
+      else                              await upsertCreditMemosBatch(list, client);
       await client.query('COMMIT');
       for (const row of list) {
         const lu = row.MetaData?.LastUpdatedTime;

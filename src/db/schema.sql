@@ -525,6 +525,35 @@ CREATE TABLE IF NOT EXISTS qb_payment_lines (
 CREATE INDEX IF NOT EXISTS idx_qb_payment_lines_invoice
   ON qb_payment_lines (linked_invoice_id) WHERE linked_invoice_id IS NOT NULL;
 
+-- 2026-06-11 — QB CreditMemo mirror. CreditMemos are money OUT (refunds,
+-- writeoffs) issued against customer balance and applied to invoices.
+-- They reduce per-officer collection totals — without mirroring them
+-- the dashboard overcounts what an officer actually delivered (e.g.
+-- PERIS THOMAS OKALA shows +34.5k on the dashboard vs -891k in the QB
+-- Account QuickReport because today's CreditMemos against PERIS's
+-- customers aren't visible to the report).
+CREATE TABLE IF NOT EXISTS qb_credit_memos (
+  id                text         PRIMARY KEY,
+  customer_id       text         NOT NULL,
+  txn_date          date         NOT NULL,
+  total_amt         numeric      NOT NULL,
+  sync_token        text,
+  qb_last_updated   timestamptz,
+  mirror_synced_at  timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_qb_credit_memos_txn_date ON qb_credit_memos (txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_credit_memos_customer ON qb_credit_memos (customer_id);
+
+CREATE TABLE IF NOT EXISTS qb_credit_memo_lines (
+  credit_memo_id    text         NOT NULL REFERENCES qb_credit_memos(id) ON DELETE CASCADE,
+  line_no           int          NOT NULL,
+  amount            numeric      NOT NULL,
+  linked_invoice_id text,
+  PRIMARY KEY (credit_memo_id, line_no)
+);
+CREATE INDEX IF NOT EXISTS idx_qb_credit_memo_lines_invoice
+  ON qb_credit_memo_lines (linked_invoice_id) WHERE linked_invoice_id IS NOT NULL;
+
 -- High-water mark + audit per entity for CDC polling.
 -- last_cdc_at = highest LastUpdatedTime we've ingested. The CDC poll asks
 -- QB for everything changedSince last_cdc_at - 60s (overlap to absorb

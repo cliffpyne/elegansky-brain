@@ -68,14 +68,38 @@ export async function refreshSnapshotForDate(date) {
          JOIN inv_bucket ib       ON ib.id = l.linked_invoice_id
         WHERE p.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
      ),
-     pay_per_officer AS (
+     cm_lines_today AS (
+       SELECT m.customer_id, l.amount, ib.bucket
+         FROM qb_credit_memos m
+         JOIN qb_credit_memo_lines l ON l.credit_memo_id = m.id
+         JOIN inv_bucket ib          ON ib.id = l.linked_invoice_id
+        WHERE m.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
+     ),
+     pay_per_officer_gross AS (
        SELECT m.officer_id, m.officer_name,
-              COALESCE(SUM(CASE WHEN pl.bucket = 'arrear' THEN pl.amount END), 0) AS arrear_collected,
-              COALESCE(SUM(CASE WHEN pl.bucket = 'today'  THEN pl.amount END), 0) AS today_invoice_collection,
-              COALESCE(SUM(CASE WHEN pl.bucket = 'future' THEN pl.amount END), 0) AS future_invoice_collection
+              COALESCE(SUM(CASE WHEN pl.bucket = 'arrear' THEN pl.amount END), 0) AS arrear_gross,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'today'  THEN pl.amount END), 0) AS today_gross,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'future' THEN pl.amount END), 0) AS future_gross
          FROM pay_lines_today pl
          JOIN customer_officer_map m ON m.customer_id = pl.customer_id
         GROUP BY m.officer_id, m.officer_name
+     ),
+     cm_per_officer AS (
+       SELECT m.officer_id,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'arrear' THEN cl.amount END), 0) AS arrear_cm,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'today'  THEN cl.amount END), 0) AS today_cm,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm
+         FROM cm_lines_today cl
+         JOIN customer_officer_map m ON m.customer_id = cl.customer_id
+        GROUP BY m.officer_id
+     ),
+     pay_per_officer AS (
+       SELECT g.officer_id, g.officer_name,
+              g.arrear_gross - COALESCE(c.arrear_cm, 0) AS arrear_collected,
+              g.today_gross  - COALESCE(c.today_cm, 0)  AS today_invoice_collection,
+              g.future_gross - COALESCE(c.future_cm, 0) AS future_invoice_collection
+         FROM pay_per_officer_gross g
+         LEFT JOIN cm_per_officer c ON c.officer_id = g.officer_id
      ),
      today_inv_per_officer AS (
        SELECT m.officer_id, m.officer_name,

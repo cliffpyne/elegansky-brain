@@ -995,6 +995,17 @@ export async function getMirrorOfficerArrearMath(date) {
          JOIN inv_bucket ib       ON ib.id = l.linked_invoice_id
         WHERE p.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
      ),
+     -- CreditMemos issued today are money OUT (refunds applied to invoices).
+     -- We subtract them so the per-officer collection number reflects the
+     -- NET applied to invoices, not the gross before any refunds. Identity
+     -- still holds inside each bucket.
+     cm_lines_today AS (
+       SELECT m.customer_id, l.amount, ib.bucket
+         FROM qb_credit_memos m
+         JOIN qb_credit_memo_lines l ON l.credit_memo_id = m.id
+         JOIN inv_bucket ib          ON ib.id = l.linked_invoice_id
+        WHERE m.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
+     ),
      pay_per_officer AS (
        SELECT m.officer_id, m.officer_name,
               COALESCE(SUM(CASE WHEN pl.bucket = 'arrear' THEN pl.amount END), 0) AS arrear_collected,
@@ -1003,16 +1014,26 @@ export async function getMirrorOfficerArrearMath(date) {
          FROM pay_lines_today pl
          JOIN customer_officer_map m ON m.customer_id = pl.customer_id
         GROUP BY m.officer_id, m.officer_name
+     ),
+     cm_per_officer AS (
+       SELECT m.officer_id,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'arrear' THEN cl.amount END), 0) AS arrear_cm,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'today'  THEN cl.amount END), 0) AS today_cm,
+              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm
+         FROM cm_lines_today cl
+         JOIN customer_officer_map m ON m.customer_id = cl.customer_id
+        GROUP BY m.officer_id
      )
-     SELECT COALESCE(o.officer_id, p.officer_id)              AS officer_id,
-            COALESCE(o.officer_name, p.officer_name)          AS officer_name,
-            COALESCE(o.arrears_now, 0)                        AS arrears_now,
-            COALESCE(o.overdue_count, 0)                      AS overdue_invoice_count,
-            COALESCE(p.arrear_collected, 0)                   AS arrear_collected,
-            COALESCE(p.today_invoice_collection, 0)           AS today_invoice_collection,
-            COALESCE(p.future_invoice_collection, 0)          AS future_invoice_collection
+     SELECT COALESCE(o.officer_id, p.officer_id)                          AS officer_id,
+            COALESCE(o.officer_name, p.officer_name)                      AS officer_name,
+            COALESCE(o.arrears_now, 0)                                    AS arrears_now,
+            COALESCE(o.overdue_count, 0)                                  AS overdue_invoice_count,
+            COALESCE(p.arrear_collected, 0)            - COALESCE(c.arrear_cm, 0) AS arrear_collected,
+            COALESCE(p.today_invoice_collection, 0)    - COALESCE(c.today_cm, 0)  AS today_invoice_collection,
+            COALESCE(p.future_invoice_collection, 0)   - COALESCE(c.future_cm, 0) AS future_invoice_collection
        FROM overdue_per_officer o
-       FULL OUTER JOIN pay_per_officer p ON p.officer_id = o.officer_id`,
+       FULL OUTER JOIN pay_per_officer p ON p.officer_id = o.officer_id
+       LEFT JOIN cm_per_officer c ON c.officer_id = COALESCE(o.officer_id, p.officer_id)`,
     [date],
   );
   const out = new Map();
