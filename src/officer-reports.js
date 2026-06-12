@@ -954,11 +954,31 @@ export async function getMirrorOfficerArrears(date) {
  * total Σ Line.Amount for payments with txn_date = date.
  */
 export async function getMirrorOfficerArrearMath(date) {
+  // Three-bucket classification of every today's-payment line's linked
+  // invoice:
+  //   arrear: DueDate < today              (overdue, what Frank calls arrears)
+  //   future: TxnDate > today              (prepayment / future installments)
+  //   today: anything else                 (today's installments + the rare
+  //                                         past-not-overdue case)
+  // Identity: arrear_collected + today_invoice_collection +
+  // future_invoice_collection = sum of all today's payment lines linked to
+  // invoices (per officer-mapped customer). open_invoice_collection is
+  // preserved as a back-compat alias = today + future, so older API consumers
+  // don't break.
   const r = await db().query(
     `WITH overdue AS (
        SELECT id, customer_id, balance
          FROM qb_invoices
         WHERE balance > 0 AND due_date < $1
+     ),
+     inv_bucket AS (
+       SELECT id,
+         CASE
+           WHEN due_date < $1 THEN 'arrear'
+           WHEN txn_date > $1 THEN 'future'
+           ELSE 'today'
+         END AS bucket
+         FROM qb_invoices
      ),
      overdue_per_officer AS (
        SELECT m.officer_id, m.officer_name,
@@ -969,26 +989,28 @@ export async function getMirrorOfficerArrearMath(date) {
         GROUP BY m.officer_id, m.officer_name
      ),
      pay_lines_today AS (
-       SELECT p.customer_id, l.amount,
-              (l.linked_invoice_id IN (SELECT id FROM overdue)) AS is_arrear
+       SELECT p.customer_id, l.amount, ib.bucket
          FROM qb_payments p
          JOIN qb_payment_lines l ON l.payment_id = p.id
+         JOIN inv_bucket ib       ON ib.id = l.linked_invoice_id
         WHERE p.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
      ),
      pay_per_officer AS (
        SELECT m.officer_id, m.officer_name,
-              COALESCE(SUM(CASE WHEN pl.is_arrear THEN pl.amount END), 0) AS arrear_collected,
-              COALESCE(SUM(CASE WHEN NOT pl.is_arrear THEN pl.amount END), 0) AS open_invoice_collection
+              COALESCE(SUM(CASE WHEN pl.bucket = 'arrear' THEN pl.amount END), 0) AS arrear_collected,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'today'  THEN pl.amount END), 0) AS today_invoice_collection,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'future' THEN pl.amount END), 0) AS future_invoice_collection
          FROM pay_lines_today pl
          JOIN customer_officer_map m ON m.customer_id = pl.customer_id
         GROUP BY m.officer_id, m.officer_name
      )
-     SELECT COALESCE(o.officer_id, p.officer_id)         AS officer_id,
-            COALESCE(o.officer_name, p.officer_name)     AS officer_name,
-            COALESCE(o.arrears_now, 0)                   AS arrears_now,
-            COALESCE(o.overdue_count, 0)                 AS overdue_invoice_count,
-            COALESCE(p.arrear_collected, 0)              AS arrear_collected,
-            COALESCE(p.open_invoice_collection, 0)       AS open_invoice_collection
+     SELECT COALESCE(o.officer_id, p.officer_id)              AS officer_id,
+            COALESCE(o.officer_name, p.officer_name)          AS officer_name,
+            COALESCE(o.arrears_now, 0)                        AS arrears_now,
+            COALESCE(o.overdue_count, 0)                      AS overdue_invoice_count,
+            COALESCE(p.arrear_collected, 0)                   AS arrear_collected,
+            COALESCE(p.today_invoice_collection, 0)           AS today_invoice_collection,
+            COALESCE(p.future_invoice_collection, 0)          AS future_invoice_collection
        FROM overdue_per_officer o
        FULL OUTER JOIN pay_per_officer p ON p.officer_id = o.officer_id`,
     [date],
@@ -997,12 +1019,18 @@ export async function getMirrorOfficerArrearMath(date) {
   for (const row of r.rows) {
     const arrears_now = Number(row.arrears_now);
     const arrear_collected = Number(row.arrear_collected);
+    const today_invoice_collection = Number(row.today_invoice_collection);
+    const future_invoice_collection = Number(row.future_invoice_collection);
     out.set(row.officer_id, {
       officer_id: row.officer_id,
       officer_name: row.officer_name,
       arrears_now,
       arrear_collected,
-      open_invoice_collection: Number(row.open_invoice_collection),
+      today_invoice_collection,
+      future_invoice_collection,
+      // Back-compat alias — sum of today + future. Older API consumers
+      // (older dashboard JS bundles in browser cache) still read this.
+      open_invoice_collection: today_invoice_collection + future_invoice_collection,
       overdue_invoice_count: Number(row.overdue_invoice_count),
       arrears_morning: arrears_now + arrear_collected,
     });
@@ -1029,6 +1057,7 @@ export async function readDailyOfficerSnapshot(from, to, officerIdFilter) {
     `SELECT date, officer_id, officer_name,
             total_invoice_amount, today_balance_remain, open_invoice_count,
             arrears_now, arrears_morning, arrear_collected,
+            today_invoice_collection, future_invoice_collection,
             open_invoice_collection, overdue_invoice_count, computed_at
        FROM daily_officer_snapshot
       WHERE date BETWEEN $1 AND $2${officerClause}
@@ -1045,6 +1074,8 @@ export async function readDailyOfficerSnapshot(from, to, officerIdFilter) {
     arrears_now: Number(row.arrears_now),
     arrears_morning: Number(row.arrears_morning),
     arrear_collected: Number(row.arrear_collected),
+    today_invoice_collection: Number(row.today_invoice_collection ?? 0),
+    future_invoice_collection: Number(row.future_invoice_collection ?? 0),
     open_invoice_collection: Number(row.open_invoice_collection),
     overdue_invoice_count: Number(row.overdue_invoice_count),
     computed_at: row.computed_at,

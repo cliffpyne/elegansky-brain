@@ -52,17 +52,27 @@ export async function refreshSnapshotForDate(date) {
          JOIN customer_officer_map m ON m.customer_id = o.customer_id
         GROUP BY m.officer_id, m.officer_name
      ),
+     inv_bucket AS (
+       SELECT id,
+         CASE
+           WHEN due_date < $1 THEN 'arrear'
+           WHEN txn_date > $1 THEN 'future'
+           ELSE 'today'
+         END AS bucket
+         FROM qb_invoices
+     ),
      pay_lines_today AS (
-       SELECT p.customer_id, l.amount,
-              (l.linked_invoice_id IN (SELECT id FROM overdue)) AS is_arrear
+       SELECT p.customer_id, l.amount, ib.bucket
          FROM qb_payments p
          JOIN qb_payment_lines l ON l.payment_id = p.id
+         JOIN inv_bucket ib       ON ib.id = l.linked_invoice_id
         WHERE p.txn_date = $1 AND l.linked_invoice_id IS NOT NULL
      ),
      pay_per_officer AS (
        SELECT m.officer_id, m.officer_name,
-              COALESCE(SUM(CASE WHEN pl.is_arrear THEN pl.amount END), 0) AS arrear_collected,
-              COALESCE(SUM(CASE WHEN NOT pl.is_arrear THEN pl.amount END), 0) AS open_invoice_collection
+              COALESCE(SUM(CASE WHEN pl.bucket = 'arrear' THEN pl.amount END), 0) AS arrear_collected,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'today'  THEN pl.amount END), 0) AS today_invoice_collection,
+              COALESCE(SUM(CASE WHEN pl.bucket = 'future' THEN pl.amount END), 0) AS future_invoice_collection
          FROM pay_lines_today pl
          JOIN customer_officer_map m ON m.customer_id = pl.customer_id
         GROUP BY m.officer_id, m.officer_name
@@ -87,7 +97,9 @@ export async function refreshSnapshotForDate(date) {
      INSERT INTO daily_officer_snapshot (
        date, officer_id, officer_name,
        total_invoice_amount, today_balance_remain, open_invoice_count,
-       arrears_now, arrears_morning, arrear_collected, open_invoice_collection,
+       arrears_now, arrears_morning, arrear_collected,
+       today_invoice_collection, future_invoice_collection,
+       open_invoice_collection,
        overdue_invoice_count, computed_at
      )
      SELECT
@@ -100,7 +112,10 @@ export async function refreshSnapshotForDate(date) {
        COALESCE(o.arrears_now, 0),
        COALESCE(o.arrears_now, 0) + COALESCE(p.arrear_collected, 0),
        COALESCE(p.arrear_collected, 0),
-       COALESCE(p.open_invoice_collection, 0),
+       COALESCE(p.today_invoice_collection, 0),
+       COALESCE(p.future_invoice_collection, 0),
+       -- Back-compat: open_invoice_collection = today + future
+       COALESCE(p.today_invoice_collection, 0) + COALESCE(p.future_invoice_collection, 0),
        COALESCE(o.overdue_count, 0),
        now()
      FROM all_officers a
@@ -108,16 +123,18 @@ export async function refreshSnapshotForDate(date) {
      LEFT JOIN pay_per_officer      p ON p.officer_id = a.officer_id
      LEFT JOIN today_inv_per_officer t ON t.officer_id = a.officer_id
      ON CONFLICT (date, officer_id) DO UPDATE SET
-       officer_name             = EXCLUDED.officer_name,
-       total_invoice_amount     = EXCLUDED.total_invoice_amount,
-       today_balance_remain     = EXCLUDED.today_balance_remain,
-       open_invoice_count       = EXCLUDED.open_invoice_count,
-       arrears_now              = EXCLUDED.arrears_now,
-       arrears_morning          = EXCLUDED.arrears_morning,
-       arrear_collected         = EXCLUDED.arrear_collected,
-       open_invoice_collection  = EXCLUDED.open_invoice_collection,
-       overdue_invoice_count    = EXCLUDED.overdue_invoice_count,
-       computed_at              = now()`,
+       officer_name              = EXCLUDED.officer_name,
+       total_invoice_amount      = EXCLUDED.total_invoice_amount,
+       today_balance_remain      = EXCLUDED.today_balance_remain,
+       open_invoice_count        = EXCLUDED.open_invoice_count,
+       arrears_now               = EXCLUDED.arrears_now,
+       arrears_morning           = EXCLUDED.arrears_morning,
+       arrear_collected          = EXCLUDED.arrear_collected,
+       today_invoice_collection  = EXCLUDED.today_invoice_collection,
+       future_invoice_collection = EXCLUDED.future_invoice_collection,
+       open_invoice_collection   = EXCLUDED.open_invoice_collection,
+       overdue_invoice_count     = EXCLUDED.overdue_invoice_count,
+       computed_at               = now()`,
     [date],
   );
   return { date, rows: r.rowCount, took_ms: Date.now() - t0 };

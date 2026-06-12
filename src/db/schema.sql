@@ -597,6 +597,15 @@ CREATE TABLE IF NOT EXISTS daily_officer_snapshot (
   computed_at              timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (date, officer_id)
 );
+
+-- 2026-06-11 — split open_invoice_collection into today vs future buckets.
+-- Identity now: arrear_collected + today_invoice_collection +
+-- future_invoice_collection = total payment lines linked to invoices, per
+-- officer. Lets the dashboard show prepayment (future installments) vs
+-- "paid today's open" cleanly instead of lumping both into open_invoice_collection.
+ALTER TABLE daily_officer_snapshot
+  ADD COLUMN IF NOT EXISTS today_invoice_collection  numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS future_invoice_collection numeric NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_date
   ON daily_officer_snapshot (date DESC);
 CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_officer

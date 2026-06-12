@@ -76,34 +76,49 @@ export function ArrearsPage() {
                   <TableHead className="text-right">Arrear morning</TableHead>
                   <TableHead className="text-right">Arrear now</TableHead>
                   <TableHead className="text-right">Arrear collected</TableHead>
+                  <TableHead className="text-right">Today inv collected</TableHead>
+                  <TableHead className="text-right">Future inv collected</TableHead>
+                  <TableHead className="text-right">Total collected</TableHead>
                   <TableHead className="text-right">% arrear collected</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {c?.officers.map((o) => (
-                  <TableRow key={o.officer_id}>
-                    <TableCell className="whitespace-nowrap font-medium">{o.officer_name}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(o.arrears_morning)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(o.arrears_realtime)}</TableCell>
-                    <TableCell className="text-right font-mono">{fmt(o.arrear_collected)}</TableCell>
-                    <TableCell className="text-right">{fmtPct(o.arrear_pct_collected)}</TableCell>
-                  </TableRow>
-                ))}
-                {c && (
-                  <TableRow className="bg-muted/30 font-semibold">
-                    <TableCell>TOTAL</TableCell>
-                    <TableCell className="text-right">
-                      <TrendCell label="Total arrears morning" value={c.grand.arrears_morning} invertDirection extractor={(d) => d.officers?.arrears_morning ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <TrendCell label="Total arrears now" value={c.grand.arrears_realtime} invertDirection extractor={(d) => d.officers?.arrears_realtime ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <TrendCell label="Total arrear collected" value={c.grand.arrear_collected} extractor={(d) => d.officers?.arrear_collected ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
-                    </TableCell>
-                    <TableCell className="text-right">{fmtPct(c.grand.arrear_pct_collected)}</TableCell>
-                  </TableRow>
-                )}
+                {c?.officers.map((o) => {
+                  const totalCol = (o.arrear_collected || 0) + (o.today_invoice_collection || 0) + (o.future_invoice_collection || 0);
+                  return (
+                    <TableRow key={o.officer_id}>
+                      <TableCell className="whitespace-nowrap font-medium">{o.officer_name}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(o.arrears_morning)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(o.arrears_realtime)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(o.arrear_collected)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(o.today_invoice_collection ?? 0)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(o.future_invoice_collection ?? 0)}</TableCell>
+                      <TableCell className="text-right font-mono font-semibold">{fmt(totalCol)}</TableCell>
+                      <TableCell className="text-right">{fmtPct(o.arrear_pct_collected)}</TableCell>
+                    </TableRow>
+                  );
+                })}
+                {c && (() => {
+                  const grandTotalCol = (c.grand.arrear_collected || 0) + (c.grand.today_invoice_collection || 0) + (c.grand.future_invoice_collection || 0);
+                  return (
+                    <TableRow className="bg-muted/30 font-semibold">
+                      <TableCell>TOTAL</TableCell>
+                      <TableCell className="text-right">
+                        <TrendCell label="Total arrears morning" value={c.grand.arrears_morning} invertDirection extractor={(d) => d.officers?.arrears_morning ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <TrendCell label="Total arrears now" value={c.grand.arrears_realtime} invertDirection extractor={(d) => d.officers?.arrears_realtime ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <TrendCell label="Total arrear collected" value={c.grand.arrear_collected} extractor={(d) => d.officers?.arrear_collected ?? null} anchor={state.anchor} officerId={state.officerId || undefined} />
+                      </TableCell>
+                      <TableCell className="text-right font-mono">{fmt(c.grand.today_invoice_collection ?? 0)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(c.grand.future_invoice_collection ?? 0)}</TableCell>
+                      <TableCell className="text-right font-mono">{fmt(grandTotalCol)}</TableCell>
+                      <TableCell className="text-right">{fmtPct(c.grand.arrear_pct_collected)}</TableCell>
+                    </TableRow>
+                  );
+                })()}
               </TableBody>
             </Table>
           </div>

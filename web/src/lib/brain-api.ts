@@ -609,6 +609,14 @@ export interface MegaOfficerRow {
   arrears_morning: number;
   arrears_realtime: number;
   arrear_collected: number;
+  // Split of today's payments by linked-invoice bucket (Frank 2026-06-11).
+  // Identity: arrear_collected + today_invoice_collection +
+  // future_invoice_collection = sum of today's payment lines linked to
+  // invoices (per officer-mapped customer). open_invoice_collection is
+  // a back-compat alias = today + future.
+  today_invoice_collection?: number;
+  future_invoice_collection?: number;
+  open_invoice_collection?: number;
   arrear_pct_collected: number | null;
 }
 export interface MegaOfficersAgg {
