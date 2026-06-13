@@ -617,6 +617,14 @@ export interface MegaOfficerRow {
   today_invoice_collection?: number;
   future_invoice_collection?: number;
   open_invoice_collection?: number;
+  // Frank 2026-06-13 — full cash-flow per officer.
+  // Identity: total_received = arrear + today + future + unapplied
+  //           net_cash_flow  = total_received − disbursement
+  // Verified against QB Account QuickReport (PERIS THOMAS OKALA net ≈ −891k).
+  unapplied_received?: number;
+  disbursement_total?: number;
+  total_received?: number;
+  net_cash_flow?: number;
   arrear_pct_collected: number | null;
 }
 export interface MegaOfficersAgg {

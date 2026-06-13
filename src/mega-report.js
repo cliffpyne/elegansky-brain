@@ -28,6 +28,7 @@ import {
   getMirrorOfficerInvoiceTotals,
   getMirrorOfficerArrears,
   getMirrorOfficerArrearMath,
+  getOfficerCashFlowAdditions,
   getOfficerOfflineCounts,
 } from './officer-reports.js';
 
@@ -444,9 +445,16 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   // from arrears_now + today's payments-to-overdue. No timing dependence,
   // no cache staleness, identity holds: arrear_collected +
   // open_invoice_collection = total_collection_today.
-  const [arrearMath, offlineCounts] = await Promise.all([
+  const [arrearMath, offlineCounts, cashFlowAdditions] = await Promise.all([
     officerArrearMathFn(from),
     getOfficerOfflineCounts(from), // motos snapshot (refreshed live by operator)
+    // Frank 2026-06-13: unapplied_received + disbursement_total per officer.
+    // Wrapped in catch so even if the helper times out the rest of the report
+    // still loads; the new columns just show 0 on failure.
+    getOfficerCashFlowAdditions(from).catch((e) => {
+      console.error('[mega-report] cashFlowAdditions failed:', e.message);
+      return new Map();
+    }),
   ]);
   // Adapter shims so the downstream aggregation code below stays unchanged.
   // arrears_morning / arrears_realtime keys preserved for frontend compat —
@@ -543,14 +551,23 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   if (!grand.open_invoice_collection) grand.open_invoice_collection = 0;
   if (!grand.today_invoice_collection) grand.today_invoice_collection = 0;
   if (!grand.future_invoice_collection) grand.future_invoice_collection = 0;
+  if (!grand.unapplied_received) grand.unapplied_received = 0;
+  if (!grand.disbursement_total) grand.disbursement_total = 0;
+  if (!grand.total_received) grand.total_received = 0;
+  if (!grand.net_cash_flow) grand.net_cash_flow = 0;
   const officers = Array.from(byOfficer.values()).map((o) => {
     const collected = o.total_invoice_amount - o.today_balance_remain;
     const pct_collected = o.open > 0 ? (collected / o.open) * 100 : null;
     const m = arrearMath.get(o.officer_id);
+    const cf = cashFlowAdditions.get(o.officer_id);
     const arrear_collected            = Number(m?.arrear_collected || 0);
     const today_invoice_collection    = Number(m?.today_invoice_collection || 0);
     const future_invoice_collection   = Number(m?.future_invoice_collection || 0);
     const open_invoice_collection     = today_invoice_collection + future_invoice_collection;
+    const unapplied_received          = Number(cf?.unapplied_received || 0);
+    const disbursement_total          = Number(cf?.disbursement_total || 0);
+    const total_received              = arrear_collected + today_invoice_collection + future_invoice_collection + unapplied_received;
+    const net_cash_flow               = total_received - disbursement_total;
     const arrear_pct_collected = o.arrears_morning > 0
       ? (arrear_collected / o.arrears_morning) * 100 : null;
     grand.total_invoice_amount += o.total_invoice_amount;
@@ -565,6 +582,10 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     grand.today_invoice_collection += today_invoice_collection;
     grand.future_invoice_collection += future_invoice_collection;
     grand.open_invoice_collection += open_invoice_collection;
+    grand.unapplied_received += unapplied_received;
+    grand.disbursement_total += disbursement_total;
+    grand.total_received += total_received;
+    grand.net_cash_flow += net_cash_flow;
     return {
       ...o,
       collected,
@@ -573,6 +594,10 @@ async function aggregateOfficers(from, to, officerIdFilter) {
       today_invoice_collection,
       future_invoice_collection,
       open_invoice_collection,
+      unapplied_received,
+      disbursement_total,
+      total_received,
+      net_cash_flow,
       arrear_pct_collected,
     };
   });

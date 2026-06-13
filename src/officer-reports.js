@@ -953,6 +953,72 @@ export async function getMirrorOfficerArrears(date) {
  * Identity guaranteed: arrear_collected + open_invoice_collection = today's
  * total Σ Line.Amount for payments with txn_date = date.
  */
+/**
+ * Frank 2026-06-13 — full cash-flow additions per officer.
+ *
+ * Computed in TWO small INDEPENDENT queries, merged in JS. This is the
+ * SAFE form of the 6-bucket report — the previous attempt put everything
+ * in one giant CTE that timed out and crashed the dyno. The deployed
+ * getMirrorOfficerArrearMath stays untouched and keeps doing its
+ * arrear/today/future buckets; this helper adds the missing pieces:
+ *
+ *   unapplied_received  = Σ Payment.TotalAmt − Σ Payment.Line.Amount today
+ *                         (money that landed but isn't applied to any invoice)
+ *   disbursement_total  = Σ qb_purchases.total_amt today where the EntityRef
+ *                         is a customer mapped to this officer (iPhone loan
+ *                         disbursements; vendor purchases excluded)
+ *
+ * Identity (per officer):
+ *   total_received = arrear_collected + today + future + unapplied_received
+ *   net_cash_flow  = total_received − credit_memo_issued − disbursement_total
+ *
+ * Returns Map<officer_id, { officer_id, officer_name, unapplied_received, disbursement_total }>
+ */
+export async function getOfficerCashFlowAdditions(date) {
+  const [u, d] = await Promise.all([
+    db().query(
+      `WITH line_sums AS (
+         SELECT l.payment_id, SUM(l.amount) AS lines_total
+           FROM qb_payment_lines l
+           JOIN qb_payments p ON p.id = l.payment_id
+          WHERE p.txn_date = $1
+          GROUP BY l.payment_id
+       )
+       SELECT m.officer_id, m.officer_name,
+              COALESCE(SUM(p.total_amt - COALESCE(ls.lines_total, 0)), 0) AS unapplied_received
+         FROM qb_payments p
+         JOIN customer_officer_map m ON m.customer_id = p.customer_id
+         LEFT JOIN line_sums ls ON ls.payment_id = p.id
+        WHERE p.txn_date = $1
+        GROUP BY m.officer_id, m.officer_name`,
+      [date],
+    ),
+    db().query(
+      `SELECT m.officer_id, COALESCE(SUM(p.total_amt), 0) AS disbursement_total
+         FROM qb_purchases p
+         JOIN customer_officer_map m ON m.customer_id = p.entity_id
+        WHERE p.txn_date = $1 AND p.entity_type = 'Customer'
+        GROUP BY m.officer_id`,
+      [date],
+    ),
+  ]);
+  const out = new Map();
+  const ensure = (id, name) => {
+    if (!out.has(id)) {
+      out.set(id, {
+        officer_id: id,
+        officer_name: name,
+        unapplied_received: 0,
+        disbursement_total: 0,
+      });
+    }
+    return out.get(id);
+  };
+  for (const r of u.rows) ensure(r.officer_id, r.officer_name).unapplied_received = Number(r.unapplied_received);
+  for (const r of d.rows) ensure(r.officer_id, null).disbursement_total = Number(r.disbursement_total);
+  return out;
+}
+
 export async function getMirrorOfficerArrearMath(date) {
   // Three-bucket classification of every today's-payment line's linked
   // invoice:
