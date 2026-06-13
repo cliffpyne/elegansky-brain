@@ -88,30 +88,9 @@ export async function refreshSnapshotForDate(date) {
        SELECT m.officer_id,
               COALESCE(SUM(CASE WHEN cl.bucket = 'arrear' THEN cl.amount END), 0) AS arrear_cm,
               COALESCE(SUM(CASE WHEN cl.bucket = 'today'  THEN cl.amount END), 0) AS today_cm,
-              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm,
-              COALESCE(SUM(cl.amount), 0)                                          AS total_cm
+              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm
          FROM cm_lines_today cl
          JOIN customer_officer_map m ON m.customer_id = cl.customer_id
-        GROUP BY m.officer_id
-     ),
-     pay_unapplied_per_officer AS (
-       SELECT m.officer_id,
-              COALESCE(SUM(p.total_amt - COALESCE(line_sums.lines_total, 0)), 0) AS unapplied_received
-         FROM qb_payments p
-         JOIN customer_officer_map m ON m.customer_id = p.customer_id
-         LEFT JOIN (
-           SELECT payment_id, SUM(amount) AS lines_total
-             FROM qb_payment_lines GROUP BY payment_id
-         ) line_sums ON line_sums.payment_id = p.id
-        WHERE p.txn_date = $1
-        GROUP BY m.officer_id
-     ),
-     disbursement_per_officer AS (
-       SELECT m.officer_id,
-              COALESCE(SUM(p.total_amt), 0) AS disbursement_total
-         FROM qb_purchases p
-         JOIN customer_officer_map m ON m.customer_id = p.entity_id
-        WHERE p.txn_date = $1 AND p.entity_type = 'Customer'
         GROUP BY m.officer_id
      ),
      pay_per_officer AS (
@@ -132,23 +111,12 @@ export async function refreshSnapshotForDate(date) {
         WHERE i.txn_date = $1
         GROUP BY m.officer_id, m.officer_name
      ),
-     -- One row per officer; officer_name picked from whichever CTE has it.
-     -- Without MAX() and GROUP BY, a UNION of (id, name) and (id, NULL)
-     -- would surface two rows for the same officer.
      all_officers AS (
-       SELECT officer_id, MAX(officer_name) AS officer_name
-         FROM (
-           SELECT officer_id, officer_name FROM overdue_per_officer
-           UNION ALL
-           SELECT officer_id, officer_name FROM pay_per_officer
-           UNION ALL
-           SELECT officer_id, officer_name FROM today_inv_per_officer
-           UNION ALL
-           SELECT officer_id, NULL FROM pay_unapplied_per_officer
-           UNION ALL
-           SELECT officer_id, NULL FROM disbursement_per_officer
-         ) u
-        GROUP BY officer_id
+       SELECT officer_id, officer_name FROM overdue_per_officer
+       UNION
+       SELECT officer_id, officer_name FROM pay_per_officer
+       UNION
+       SELECT officer_id, officer_name FROM today_inv_per_officer
      )
      INSERT INTO daily_officer_snapshot (
        date, officer_id, officer_name,
@@ -156,15 +124,12 @@ export async function refreshSnapshotForDate(date) {
        arrears_now, arrears_morning, arrear_collected,
        today_invoice_collection, future_invoice_collection,
        open_invoice_collection,
-       unapplied_received, credit_memo_issued, disbursement_total,
        overdue_invoice_count, computed_at
      )
      SELECT
        $1::date,
        a.officer_id,
-       -- officer_name may be NULL when officer was discovered only via
-       -- unapplied/disbursement CTE — fall back to customer_officer_map.
-       COALESCE(a.officer_name, (SELECT MAX(officer_name) FROM customer_officer_map WHERE officer_id = a.officer_id), 'Unknown'),
+       a.officer_name,
        COALESCE(t.total_invoice_amount, 0),
        COALESCE(t.today_balance_remain, 0),
        COALESCE(t.open_invoice_count, 0),
@@ -175,18 +140,12 @@ export async function refreshSnapshotForDate(date) {
        COALESCE(p.future_invoice_collection, 0),
        -- Back-compat: open_invoice_collection = today + future
        COALESCE(p.today_invoice_collection, 0) + COALESCE(p.future_invoice_collection, 0),
-       COALESCE(u.unapplied_received, 0),
-       COALESCE(cm.total_cm, 0),
-       COALESCE(d.disbursement_total, 0),
        COALESCE(o.overdue_count, 0),
        now()
      FROM all_officers a
-     LEFT JOIN overdue_per_officer          o  ON o.officer_id  = a.officer_id
-     LEFT JOIN pay_per_officer              p  ON p.officer_id  = a.officer_id
-     LEFT JOIN today_inv_per_officer        t  ON t.officer_id  = a.officer_id
-     LEFT JOIN pay_unapplied_per_officer    u  ON u.officer_id  = a.officer_id
-     LEFT JOIN disbursement_per_officer     d  ON d.officer_id  = a.officer_id
-     LEFT JOIN cm_per_officer               cm ON cm.officer_id = a.officer_id
+     LEFT JOIN overdue_per_officer  o ON o.officer_id = a.officer_id
+     LEFT JOIN pay_per_officer      p ON p.officer_id = a.officer_id
+     LEFT JOIN today_inv_per_officer t ON t.officer_id = a.officer_id
      ON CONFLICT (date, officer_id) DO UPDATE SET
        officer_name              = EXCLUDED.officer_name,
        total_invoice_amount      = EXCLUDED.total_invoice_amount,
@@ -198,9 +157,6 @@ export async function refreshSnapshotForDate(date) {
        today_invoice_collection  = EXCLUDED.today_invoice_collection,
        future_invoice_collection = EXCLUDED.future_invoice_collection,
        open_invoice_collection   = EXCLUDED.open_invoice_collection,
-       unapplied_received        = EXCLUDED.unapplied_received,
-       credit_memo_issued        = EXCLUDED.credit_memo_issued,
-       disbursement_total        = EXCLUDED.disbursement_total,
        overdue_invoice_count     = EXCLUDED.overdue_invoice_count,
        computed_at               = now()`,
     [date],
