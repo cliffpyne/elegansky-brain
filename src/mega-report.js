@@ -543,6 +543,11 @@ async function aggregateOfficers(from, to, officerIdFilter) {
   if (!grand.open_invoice_collection) grand.open_invoice_collection = 0;
   if (!grand.today_invoice_collection) grand.today_invoice_collection = 0;
   if (!grand.future_invoice_collection) grand.future_invoice_collection = 0;
+  if (!grand.unapplied_received) grand.unapplied_received = 0;
+  if (!grand.credit_memo_issued) grand.credit_memo_issued = 0;
+  if (!grand.disbursement_total) grand.disbursement_total = 0;
+  if (!grand.total_received) grand.total_received = 0;
+  if (!grand.net_cash_flow) grand.net_cash_flow = 0;
   const officers = Array.from(byOfficer.values()).map((o) => {
     const collected = o.total_invoice_amount - o.today_balance_remain;
     const pct_collected = o.open > 0 ? (collected / o.open) * 100 : null;
@@ -550,7 +555,13 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     const arrear_collected            = Number(m?.arrear_collected || 0);
     const today_invoice_collection    = Number(m?.today_invoice_collection || 0);
     const future_invoice_collection   = Number(m?.future_invoice_collection || 0);
+    const unapplied_received          = Number(m?.unapplied_received || 0);
+    const credit_memo_issued          = Number(m?.credit_memo_issued || 0);
+    const disbursement_total          = Number(m?.disbursement_total || 0);
     const open_invoice_collection     = today_invoice_collection + future_invoice_collection;
+    const total_received              = arrear_collected + today_invoice_collection
+                                       + future_invoice_collection + unapplied_received;
+    const net_cash_flow               = total_received - credit_memo_issued - disbursement_total;
     const arrear_pct_collected = o.arrears_morning > 0
       ? (arrear_collected / o.arrears_morning) * 100 : null;
     grand.total_invoice_amount += o.total_invoice_amount;
@@ -564,6 +575,11 @@ async function aggregateOfficers(from, to, officerIdFilter) {
     grand.arrears_realtime += o.arrears_realtime;
     grand.today_invoice_collection += today_invoice_collection;
     grand.future_invoice_collection += future_invoice_collection;
+    grand.unapplied_received += unapplied_received;
+    grand.credit_memo_issued += credit_memo_issued;
+    grand.disbursement_total += disbursement_total;
+    grand.total_received += total_received;
+    grand.net_cash_flow += net_cash_flow;
     grand.open_invoice_collection += open_invoice_collection;
     return {
       ...o,
@@ -572,6 +588,11 @@ async function aggregateOfficers(from, to, officerIdFilter) {
       arrear_collected,
       today_invoice_collection,
       future_invoice_collection,
+      unapplied_received,
+      credit_memo_issued,
+      disbursement_total,
+      total_received,
+      net_cash_flow,
       open_invoice_collection,
       arrear_pct_collected,
     };

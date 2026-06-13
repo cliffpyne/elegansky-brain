@@ -171,6 +171,57 @@ export async function upsertInvoicesBatch(invoices, client) {
   );
 }
 
+// Purchase upsert — flat header table only (no lines because QB
+// Purchase.Line[] is account-based, not invoice-linked). EntityRef
+// is collapsed onto the header so the report can aggregate per
+// customer / officer in one SELECT.
+export async function upsertPurchasesBatch(purchases, client) {
+  if (!purchases.length) return;
+  const cols = 13;
+  const values = [];
+  for (const p of purchases) {
+    values.push(
+      String(p.Id),
+      p.TxnDate,
+      Number(p.TotalAmt || 0),
+      p.AccountRef?.value || null,
+      p.AccountRef?.name || null,
+      p.EntityRef?.type || null,
+      p.EntityRef?.value || null,
+      p.EntityRef?.name || null,
+      p.PaymentType || null,
+      p.DocNumber || null,
+      p.PrivateNote || null,
+      p.SyncToken || null,
+      p.MetaData?.LastUpdatedTime || null,
+    );
+  }
+  const placeholders = buildPlaceholders(purchases.length, cols);
+  await client.query(
+    `INSERT INTO qb_purchases
+       (id, txn_date, total_amt, account_ref, account_name,
+        entity_type, entity_id, entity_name, payment_type, doc_number,
+        private_note, sync_token, qb_last_updated)
+     VALUES ${placeholders}
+     ON CONFLICT (id) DO UPDATE SET
+       txn_date         = EXCLUDED.txn_date,
+       total_amt        = EXCLUDED.total_amt,
+       account_ref      = EXCLUDED.account_ref,
+       account_name     = EXCLUDED.account_name,
+       entity_type      = EXCLUDED.entity_type,
+       entity_id        = EXCLUDED.entity_id,
+       entity_name      = EXCLUDED.entity_name,
+       payment_type     = EXCLUDED.payment_type,
+       doc_number       = EXCLUDED.doc_number,
+       private_note     = EXCLUDED.private_note,
+       sync_token       = EXCLUDED.sync_token,
+       qb_last_updated  = EXCLUDED.qb_last_updated,
+       mirror_synced_at = now()
+     WHERE qb_purchases.qb_last_updated IS DISTINCT FROM EXCLUDED.qb_last_updated`,
+    values,
+  );
+}
+
 // CreditMemo upsert (parallels payment upsert; CreditMemos are
 // money-OUT entities applied against customer balance / invoices).
 export async function upsertCreditMemosBatch(memos, client) {
@@ -317,7 +368,7 @@ export async function upsertPaymentsBatch(payments, client) {
  * Returns { entity, pages, rows, max_last_updated, took_ms }.
  */
 export async function backfillEntity(entity, opts = {}) {
-  if (!['Invoice', 'Payment', 'CreditMemo'].includes(entity)) throw new Error('bad entity: ' + entity);
+  if (!['Invoice', 'Payment', 'CreditMemo', 'Purchase'].includes(entity)) throw new Error('bad entity: ' + entity);
   const t0 = Date.now();
   let start = 1;
   let pages = 0;
@@ -347,9 +398,10 @@ export async function backfillEntity(entity, opts = {}) {
     const client = await db().connect();
     try {
       await client.query('BEGIN');
-      if (entity === 'Invoice')         await upsertInvoicesBatch(list, client);
+      if      (entity === 'Invoice')    await upsertInvoicesBatch(list, client);
       else if (entity === 'Payment')    await upsertPaymentsBatch(list, client);
-      else                              await upsertCreditMemosBatch(list, client);
+      else if (entity === 'CreditMemo') await upsertCreditMemosBatch(list, client);
+      else                              await upsertPurchasesBatch(list, client);
       for (const row of list) {
         const lu = row.MetaData?.LastUpdatedTime;
         if (lu && (!maxLastUpdated || lu > maxLastUpdated)) maxLastUpdated = lu;
@@ -400,7 +452,7 @@ export async function backfillEntity(entity, opts = {}) {
 const CDC_MAX_ROWS = 1000;
 
 export async function cdcSync(entity) {
-  if (!['Invoice', 'Payment', 'CreditMemo'].includes(entity)) throw new Error('bad entity: ' + entity);
+  if (!['Invoice', 'Payment', 'CreditMemo', 'Purchase'].includes(entity)) throw new Error('bad entity: ' + entity);
   const t0 = Date.now();
   const stateRes = await db().query(
     `SELECT last_cdc_at FROM qb_mirror_state WHERE entity = $1`,
@@ -439,9 +491,10 @@ export async function cdcSync(entity) {
       // operation to 45 s so we fail fast and let the next tick retry,
       // instead of waiting for Supabase to cancel at 60 s.
       await client.query(`SET LOCAL statement_timeout = 45000`);
-      if (entity === 'Invoice')         await upsertInvoicesBatch(list, client);
+      if      (entity === 'Invoice')    await upsertInvoicesBatch(list, client);
       else if (entity === 'Payment')    await upsertPaymentsBatch(list, client);
-      else                              await upsertCreditMemosBatch(list, client);
+      else if (entity === 'CreditMemo') await upsertCreditMemosBatch(list, client);
+      else                              await upsertPurchasesBatch(list, client);
       await client.query('COMMIT');
       for (const row of list) {
         const lu = row.MetaData?.LastUpdatedTime;

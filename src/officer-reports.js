@@ -1019,21 +1019,53 @@ export async function getMirrorOfficerArrearMath(date) {
        SELECT m.officer_id,
               COALESCE(SUM(CASE WHEN cl.bucket = 'arrear' THEN cl.amount END), 0) AS arrear_cm,
               COALESCE(SUM(CASE WHEN cl.bucket = 'today'  THEN cl.amount END), 0) AS today_cm,
-              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm
+              COALESCE(SUM(CASE WHEN cl.bucket = 'future' THEN cl.amount END), 0) AS future_cm,
+              COALESCE(SUM(cl.amount), 0)                                          AS total_cm
          FROM cm_lines_today cl
          JOIN customer_officer_map m ON m.customer_id = cl.customer_id
         GROUP BY m.officer_id
+     ),
+     -- Unapplied received per officer: money that landed on a customer's
+     -- account today but isn't applied to any invoice line. Computed as
+     -- Payment.TotalAmt minus Σ Line.Amount, grouped by mapped officer.
+     pay_unapplied_per_officer AS (
+       SELECT m.officer_id,
+              COALESCE(SUM(p.total_amt - COALESCE(line_sums.lines_total, 0)), 0) AS unapplied_received
+         FROM qb_payments p
+         JOIN customer_officer_map m ON m.customer_id = p.customer_id
+         LEFT JOIN (
+           SELECT payment_id, SUM(amount) AS lines_total
+             FROM qb_payment_lines GROUP BY payment_id
+         ) line_sums ON line_sums.payment_id = p.id
+        WHERE p.txn_date = $1
+        GROUP BY m.officer_id
+     ),
+     -- Disbursements per officer: today's QB Purchase rows whose
+     -- EntityRef is a Customer mapped to that officer. Vendor purchases
+     -- (CASHIER expenses, etc.) are excluded — they're not per-officer.
+     disbursement_per_officer AS (
+       SELECT m.officer_id,
+              COALESCE(SUM(p.total_amt), 0) AS disbursement_total
+         FROM qb_purchases p
+         JOIN customer_officer_map m ON m.customer_id = p.entity_id
+        WHERE p.txn_date = $1 AND p.entity_type = 'Customer'
+        GROUP BY m.officer_id
      )
-     SELECT COALESCE(o.officer_id, p.officer_id)                          AS officer_id,
-            COALESCE(o.officer_name, p.officer_name)                      AS officer_name,
-            COALESCE(o.arrears_now, 0)                                    AS arrears_now,
-            COALESCE(o.overdue_count, 0)                                  AS overdue_invoice_count,
-            COALESCE(p.arrear_collected, 0)            - COALESCE(c.arrear_cm, 0) AS arrear_collected,
-            COALESCE(p.today_invoice_collection, 0)    - COALESCE(c.today_cm, 0)  AS today_invoice_collection,
-            COALESCE(p.future_invoice_collection, 0)   - COALESCE(c.future_cm, 0) AS future_invoice_collection
+     SELECT COALESCE(o.officer_id, p.officer_id, u.officer_id, d.officer_id)        AS officer_id,
+            COALESCE(o.officer_name, p.officer_name)                                AS officer_name,
+            COALESCE(o.arrears_now, 0)                                              AS arrears_now,
+            COALESCE(o.overdue_count, 0)                                            AS overdue_invoice_count,
+            COALESCE(p.arrear_collected, 0)            - COALESCE(c.arrear_cm, 0)   AS arrear_collected,
+            COALESCE(p.today_invoice_collection, 0)    - COALESCE(c.today_cm, 0)    AS today_invoice_collection,
+            COALESCE(p.future_invoice_collection, 0)   - COALESCE(c.future_cm, 0)   AS future_invoice_collection,
+            COALESCE(u.unapplied_received, 0)                                       AS unapplied_received,
+            COALESCE(c.total_cm, 0)                                                 AS credit_memo_issued,
+            COALESCE(d.disbursement_total, 0)                                       AS disbursement_total
        FROM overdue_per_officer o
-       FULL OUTER JOIN pay_per_officer p ON p.officer_id = o.officer_id
-       LEFT JOIN cm_per_officer c ON c.officer_id = COALESCE(o.officer_id, p.officer_id)`,
+       FULL OUTER JOIN pay_per_officer            p ON p.officer_id = o.officer_id
+       FULL OUTER JOIN pay_unapplied_per_officer  u ON u.officer_id = COALESCE(o.officer_id, p.officer_id)
+       FULL OUTER JOIN disbursement_per_officer   d ON d.officer_id = COALESCE(o.officer_id, p.officer_id, u.officer_id)
+       LEFT JOIN cm_per_officer c ON c.officer_id = COALESCE(o.officer_id, p.officer_id, u.officer_id, d.officer_id)`,
     [date],
   );
   const out = new Map();
@@ -1042,6 +1074,16 @@ export async function getMirrorOfficerArrearMath(date) {
     const arrear_collected = Number(row.arrear_collected);
     const today_invoice_collection = Number(row.today_invoice_collection);
     const future_invoice_collection = Number(row.future_invoice_collection);
+    const unapplied_received = Number(row.unapplied_received);
+    const credit_memo_issued = Number(row.credit_memo_issued);
+    const disbursement_total = Number(row.disbursement_total);
+    // Identity: total_received = arrear + today + future + unapplied
+    // (this is the gross Σ Payment.TotalAmt the officer's customers paid
+    // today, BEFORE any CreditMemo writeoff)
+    const total_received = arrear_collected + today_invoice_collection
+                         + future_invoice_collection + unapplied_received;
+    // Net cash-flow per officer = received - refunds - disbursements
+    const net_cash_flow = total_received - credit_memo_issued - disbursement_total;
     out.set(row.officer_id, {
       officer_id: row.officer_id,
       officer_name: row.officer_name,
@@ -1049,6 +1091,11 @@ export async function getMirrorOfficerArrearMath(date) {
       arrear_collected,
       today_invoice_collection,
       future_invoice_collection,
+      unapplied_received,
+      credit_memo_issued,
+      disbursement_total,
+      total_received,
+      net_cash_flow,
       // Back-compat alias — sum of today + future. Older API consumers
       // (older dashboard JS bundles in browser cache) still read this.
       open_invoice_collection: today_invoice_collection + future_invoice_collection,
@@ -1079,28 +1126,46 @@ export async function readDailyOfficerSnapshot(from, to, officerIdFilter) {
             total_invoice_amount, today_balance_remain, open_invoice_count,
             arrears_now, arrears_morning, arrear_collected,
             today_invoice_collection, future_invoice_collection,
-            open_invoice_collection, overdue_invoice_count, computed_at
+            open_invoice_collection,
+            unapplied_received, credit_memo_issued, disbursement_total,
+            overdue_invoice_count, computed_at
        FROM daily_officer_snapshot
       WHERE date BETWEEN $1 AND $2${officerClause}
       ORDER BY date, officer_id`,
     params,
   );
-  return r.rows.map((row) => ({
-    date: row.date,
-    officer_id: row.officer_id,
-    officer_name: row.officer_name,
-    total_invoice_amount: Number(row.total_invoice_amount),
-    today_balance_remain: Number(row.today_balance_remain),
-    open_invoice_count: Number(row.open_invoice_count),
-    arrears_now: Number(row.arrears_now),
-    arrears_morning: Number(row.arrears_morning),
-    arrear_collected: Number(row.arrear_collected),
-    today_invoice_collection: Number(row.today_invoice_collection ?? 0),
-    future_invoice_collection: Number(row.future_invoice_collection ?? 0),
-    open_invoice_collection: Number(row.open_invoice_collection),
-    overdue_invoice_count: Number(row.overdue_invoice_count),
-    computed_at: row.computed_at,
-  }));
+  return r.rows.map((row) => {
+    const arrear_collected = Number(row.arrear_collected);
+    const today_invoice_collection = Number(row.today_invoice_collection ?? 0);
+    const future_invoice_collection = Number(row.future_invoice_collection ?? 0);
+    const unapplied_received = Number(row.unapplied_received ?? 0);
+    const credit_memo_issued = Number(row.credit_memo_issued ?? 0);
+    const disbursement_total = Number(row.disbursement_total ?? 0);
+    const total_received = arrear_collected + today_invoice_collection
+                         + future_invoice_collection + unapplied_received;
+    const net_cash_flow = total_received - credit_memo_issued - disbursement_total;
+    return {
+      date: row.date,
+      officer_id: row.officer_id,
+      officer_name: row.officer_name,
+      total_invoice_amount: Number(row.total_invoice_amount),
+      today_balance_remain: Number(row.today_balance_remain),
+      open_invoice_count: Number(row.open_invoice_count),
+      arrears_now: Number(row.arrears_now),
+      arrears_morning: Number(row.arrears_morning),
+      arrear_collected,
+      today_invoice_collection,
+      future_invoice_collection,
+      open_invoice_collection: Number(row.open_invoice_collection),
+      unapplied_received,
+      credit_memo_issued,
+      disbursement_total,
+      total_received,
+      net_cash_flow,
+      overdue_invoice_count: Number(row.overdue_invoice_count),
+      computed_at: row.computed_at,
+    };
+  });
 }
 
 export async function getOfficerArrears(snapshotDate) {

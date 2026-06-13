@@ -554,6 +554,44 @@ CREATE TABLE IF NOT EXISTS qb_credit_memo_lines (
 CREATE INDEX IF NOT EXISTS idx_qb_credit_memo_lines_invoice
   ON qb_credit_memo_lines (linked_invoice_id) WHERE linked_invoice_id IS NOT NULL;
 
+-- 2026-06-12 — QB Purchase mirror. Purchase is money OUT of an account:
+-- iPhone loan disbursements (EntityRef.type=Customer) and operating
+-- expenses (EntityRef.type=Vendor, e.g. CASHIER). Needed to reconcile
+-- the per-officer net cash flow on the Arrears dashboard — PERIS THOMAS
+-- OKALA shows +59k collections but -950k disbursements = -891k net
+-- in the QB Account QuickReport.
+--
+-- No nested lines table: Purchase.Line[] is account-based, not
+-- linked-invoice. We collapse to one row per Purchase header with
+-- customer_id resolved from EntityRef when entity_type='Customer'.
+CREATE TABLE IF NOT EXISTS qb_purchases (
+  id                text         PRIMARY KEY,
+  txn_date          date         NOT NULL,
+  total_amt         numeric      NOT NULL,
+  account_ref       text,                            -- AccountRef.value (the bank account paid FROM)
+  account_name      text,                            -- e.g. 'Elegansky Collection AC:Kijichi Collection AC'
+  entity_type       text,                            -- 'Customer' | 'Vendor' | 'Employee' | NULL
+  entity_id         text,                            -- EntityRef.value
+  entity_name       text,                            -- full path
+  payment_type      text,                            -- 'Cash' | 'Check' | 'CreditCard'
+  doc_number        text,
+  private_note      text,
+  sync_token        text,
+  qb_last_updated   timestamptz,
+  mirror_synced_at  timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_qb_purchases_txn_date ON qb_purchases (txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_purchases_entity   ON qb_purchases (entity_id) WHERE entity_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_qb_purchases_account  ON qb_purchases (account_ref);
+
+-- Extended officer snapshot — Spec section 3 (Frank 2026-06-12).
+-- Adds the full cash-flow breakdown so the dashboard reconciles to
+-- bank deposits.
+ALTER TABLE daily_officer_snapshot
+  ADD COLUMN IF NOT EXISTS unapplied_received  numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS credit_memo_issued  numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS disbursement_total  numeric NOT NULL DEFAULT 0;
+
 -- High-water mark + audit per entity for CDC polling.
 -- last_cdc_at = highest LastUpdatedTime we've ingested. The CDC poll asks
 -- QB for everything changedSince last_cdc_at - 60s (overlap to absorb
