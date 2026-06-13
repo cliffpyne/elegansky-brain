@@ -1001,7 +1001,20 @@ app.post('/api/admin/sort-sheet-by-date', async (req, res) => {
 const DASHBOARD_DIR = path.join(__dirname, '..', 'web', 'dist');
 if (existsSync(DASHBOARD_DIR)) {
   console.log(`Dashboard: serving ${DASHBOARD_DIR}`);
-  app.use(express.static(DASHBOARD_DIR, { index: false, maxAge: '1d' }));
+  // /assets/* (hashed bundles) cache for 1 year — content-hashed so safe.
+  // index.html and other shell files are NOT cached so each page load
+  // discovers the new bundle hash without users needing to hard-refresh.
+  // Frank 2026-06-13 incident: stale browser cache held a broken bundle
+  // for hours after env-var fix.
+  app.use(express.static(DASHBOARD_DIR, {
+    index: false,
+    maxAge: '1d',
+    setHeaders(res, filePath) {
+      if (filePath.endsWith('index.html') || filePath.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      }
+    },
+  }));
   // SPA fallback — anything not already handled by an /api/* / OAuth / QB
   // legacy route gets the React shell so the client router can resolve.
   app.get(
@@ -1009,6 +1022,7 @@ if (existsSync(DASHBOARD_DIR)) {
     (_req, res, next) => {
       const indexFile = path.join(DASHBOARD_DIR, 'index.html');
       if (!existsSync(indexFile)) return next();
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.sendFile(indexFile);
     },
   );
