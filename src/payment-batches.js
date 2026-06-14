@@ -437,6 +437,205 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // ── POST /api/payment-batches/start/:channel ─────────────────────────────
+  // Frank 2026-06-14: "the start button". Read the channel's sheet, compute
+  // the catchup plan (computeCatchupPlan), and execute every window in the
+  // plan SEQUENTIALLY using the existing prepareAutoUpload + runAutoUpload-
+  // Background pipeline. One channel lock held across the whole sequence —
+  // a second click while running gets 409.
+  //
+  // No human in the loop deciding "what windows do I fire today" — every day
+  // is the same code path. K-marker → today produces 0..N windows; we fire
+  // them all in order, awaiting each so the K-marker advances correctly
+  // between entries.
+  //
+  // Body: { dry_run?: boolean, tick_name?: string }
+  //   tick_name optional — defaults to 'start_button'. Used for Column K
+  //   marker AND payment_batches.created_by attribution.
+  app.post('/api/payment-batches/start/:channel', requireSecretOrJwt, async (req, res) => {
+    const channel = req.params.channel;
+    if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
+      return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
+    }
+    const dryRun = req.body?.dry_run === true;
+    const buttonTickName = String(req.body?.tick_name || 'start_button').toLowerCase();
+
+    // Same kill-switch logic as the single-window endpoint — JWT bypasses,
+    // heisenberg bypasses, otherwise honour app_settings.auto_upload_enabled.
+    if (!req.user && buttonTickName !== 'heisenberg' && buttonTickName !== 'start_button') {
+      try {
+        const r = await db().query(`SELECT value FROM app_settings WHERE key = 'auto_upload_enabled'`);
+        const v = r.rows[0]?.value;
+        if (v && String(v).toLowerCase() === 'false') {
+          return res.status(503).json({
+            error: `auto-upload disabled for scheduled-tick automation (app_settings.auto_upload_enabled=false). tick_name='${buttonTickName}'.`,
+            remedy: 'fire from dashboard (Supabase JWT) or set auto_upload_enabled=true',
+          });
+        }
+      } catch (err) {
+        console.error('[start-channel kill-switch check failed — failing OPEN]:', err.message);
+      }
+    }
+
+    // Acquire channel lock (5-min stale reclaim same as single-window endpoint).
+    const lockHolder = `${process.pid}-${Math.random().toString(36).slice(2, 8)}-start`;
+    const lockResult = await db().query(
+      `INSERT INTO auto_upload_locks (channel, locked_at, holder)
+       VALUES ($1, now(), $2)
+       ON CONFLICT (channel) DO UPDATE
+         SET locked_at = now(), holder = EXCLUDED.holder
+         WHERE auto_upload_locks.locked_at < now() - interval '5 minutes'
+       RETURNING holder`,
+      [channel, lockHolder],
+    );
+    if (!lockResult.rows.length) {
+      const held = await db().query(
+        `SELECT holder, locked_at FROM auto_upload_locks WHERE channel=$1`,
+        [channel],
+      );
+      return res.status(409).json({
+        error: 'another auto-upload for this channel is already running',
+        channel,
+        held_by: held.rows[0]?.holder,
+        since: held.rows[0]?.locked_at,
+      });
+    }
+
+    let releasedSync = false;
+    const releaseLock = async () => {
+      if (releasedSync) return;
+      releasedSync = true;
+      await db().query(
+        `DELETE FROM auto_upload_locks WHERE channel=$1 AND holder=$2`,
+        [channel, lockHolder],
+      ).catch(() => {});
+    };
+
+    try {
+      // Read sheet + compute plan synchronously (cheap — single sheet read).
+      const cfg = CHANNEL_SHEETS[channel];
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L80000`);
+      const sheet = sheetData.values || sheetData.data || [];
+      const planResult = computeCatchupPlan({ channel, sheet, nowUtcMs: Date.now() });
+
+      if (planResult.plan.length === 0) {
+        await releaseLock();
+        return res.status(200).json({
+          status: 'up_to_date',
+          channel,
+          marker: planResult.marker,
+          reason: planResult.reason,
+        });
+      }
+
+      // Hand off to background — the per-entry sequence can take minutes for
+      // a multi-day catchup. HTTP returns 202 immediately with the plan so the
+      // dashboard can render progress + poll batch states.
+      setImmediate(async () => {
+        const batchIds = [];
+        try {
+          for (let pi = 0; pi < planResult.plan.length; pi++) {
+            const entry = planResult.plan[pi];
+            const entryTickName = `${buttonTickName}:${entry.tick_label}`;
+            console.log(`[start-channel ${channel}] (${pi + 1}/${planResult.plan.length}) ${entry.tick_label} window=${entry.since_iso}→${entry.until_iso} as_of=${entry.as_of} txn_date=${entry.txn_date} rows=${entry.row_count}`);
+
+            const result = await prepareAutoUpload({
+              channel,
+              sinceIso: entry.since_iso,
+              untilIso: entry.until_iso,
+              asOf: entry.as_of,
+              tickName: entryTickName,
+              txnDate: entry.txn_date,
+              qbPreflightDedup: dryRun ? null : qbPreflightDedup,
+            });
+            if (result.skipped) {
+              console.log(`[start-channel ${channel}] ${entry.tick_label} skipped: ${result.reason}`);
+              continue;
+            }
+            if (result.aborted) {
+              console.error(`[start-channel ${channel}] ${entry.tick_label} ABORTED: ${result.reason}`);
+              break; // QB pre-flight failure — stop, don't continue to next windows
+            }
+
+            // Safety: same per-fire max as single-window endpoint.
+            const maxPaid = Number(process.env.AUTO_UPLOAD_MAX_PAID || 200);
+            if (result.paid.length > maxPaid) {
+              console.error(`[start-channel ${channel}] ${entry.tick_label} too big: paid=${result.paid.length} > max=${maxPaid} — cleaning up + stopping`);
+              await db().query(`DELETE FROM consumed_transactions WHERE batch_id=$1`, [result.batchId]).catch(() => {});
+              await db().query(`DELETE FROM payment_batches WHERE id=$1`, [result.batchId]).catch(() => {});
+              break;
+            }
+
+            batchIds.push(result.batchId);
+
+            if (dryRun) {
+              // Mirror the single-window dry-run path: clear consumed_transactions
+              // so refs stay eligible for a real fire, mark batch dry_run, write
+              // (DRY_RUN) sheet markers, no QB push.
+              await db().query(`DELETE FROM consumed_transactions WHERE batch_id = $1`, [result.batchId]).catch(() => {});
+              await db().query(
+                `UPDATE payment_batches SET status='finalized', finalized_at=now(),
+                   failure_reason='dry_run (catchup plan; no QB calls)' WHERE id=$1`,
+                [result.batchId],
+              ).catch(() => {});
+              for (const p of result.paid) {
+                await db().query(
+                  `INSERT INTO payment_uploads (
+                     batch_id, kind, bank_ref, customer_id, customer_name,
+                     invoice_qb_id, invoice_no, amount, memo, status
+                   ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'dry_run')`,
+                  [result.batchId, p.memoWithSuffix, p.customerId, p.customerName,
+                   p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix],
+                ).catch(() => {});
+              }
+              continue; // next window
+            }
+
+            // REAL push — await runAutoUploadBackground so K marker advances
+            // before we compute the next entry's plan (NB: the plan we already
+            // computed is sequential by design, but Column I/J/K writes must
+            // land before the next prepareAutoUpload to keep the sheet honest).
+            await runAutoUploadBackground({
+              batchId: result.batchId,
+              paid: result.paid,
+              unused: result.unused,
+              txnDate: entry.txn_date,
+              qbCreatePayment,
+              qbBatchCreatePayments,
+              qbCreateUnappliedPayment,
+              qbBatchCreateUnappliedPayments,
+              qbBatchLookupCustomers,
+              qbCreateCreditMemo,
+              cfg: result.cfg,
+              tickName: entryTickName,
+            }).catch((err) => {
+              console.error(`[start-channel ${channel}] ${entry.tick_label} runAutoUploadBackground threw:`, err);
+            });
+          }
+          console.log(`[start-channel ${channel}] all ${planResult.plan.length} window(s) done; batches=${batchIds.join(',')}`);
+        } catch (err) {
+          console.error(`[start-channel ${channel}] background orchestrator threw:`, err);
+        } finally {
+          await releaseLock();
+        }
+      });
+
+      res.status(202).json({
+        status: dryRun ? 'planning_dry_run' : 'planning',
+        channel,
+        marker: planResult.marker,
+        plan: planResult.plan,
+        plan_size: planResult.plan.length,
+        reason: planResult.reason,
+        message: 'background sequence started; poll /api/payment-batches for batch_ids as they appear',
+      });
+    } catch (err) {
+      console.error('[POST /api/payment-batches/start]', err);
+      await releaseLock();
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── POST /api/payment-batches/:id/recall ─────────────────────────────────
   // Either Supabase JWT (operator clicking dashboard button) or shared secret
   // (CLI / service-to-service) is accepted.
