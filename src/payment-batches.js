@@ -569,13 +569,19 @@ export function mountPaymentBatchesApi(app, deps) {
             batchIds.push(result.batchId);
 
             if (dryRun) {
-              // Mirror the single-window dry-run path: clear consumed_transactions
-              // so refs stay eligible for a real fire, mark batch dry_run, write
-              // (DRY_RUN) sheet markers, no QB push.
+              // Frank 2026-06-14 dry-run rule for start-button catchup:
+              //   - NO QB calls
+              //   - NO sheet Column I / J / K / L writes (preserve for the
+              //     real fire later)
+              //   - DB rows ARE written (payment_batches + payment_uploads
+              //     for both paid AND unused) so the operator can query the
+              //     full per-window outcome
+              //   - consumed_transactions cleared so refs stay eligible for
+              //     the eventual real fire
               await db().query(`DELETE FROM consumed_transactions WHERE batch_id = $1`, [result.batchId]).catch(() => {});
               await db().query(
                 `UPDATE payment_batches SET status='finalized', finalized_at=now(),
-                   failure_reason='dry_run (catchup plan; no QB calls)' WHERE id=$1`,
+                   failure_reason='dry_run (start-button catchup; no QB calls; no sheet writes)' WHERE id=$1`,
                 [result.batchId],
               ).catch(() => {});
               for (const p of result.paid) {
@@ -586,6 +592,15 @@ export function mountPaymentBatchesApi(app, deps) {
                    ) VALUES ($1,'payment',$2,$3,$4,$5,$6,$7,$8,'dry_run')`,
                   [result.batchId, p.memoWithSuffix, p.customerId, p.customerName,
                    p.qbId, p.invoiceNo, round2(p.amount), p.memoWithSuffix],
+                ).catch(() => {});
+              }
+              for (const u of result.unused) {
+                await db().query(
+                  `INSERT INTO payment_uploads (
+                     batch_id, kind, bank_ref, customer_id, customer_name,
+                     amount, memo, status
+                   ) VALUES ($1,'credit_memo',$2,NULL,$3,$4,$5,'dry_run')`,
+                  [result.batchId, u.memoWithSuffix, u.customerName, round2(u.transactionAmount), u.memoWithSuffix],
                 ).catch(() => {});
               }
               continue; // next window
