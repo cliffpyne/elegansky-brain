@@ -1192,6 +1192,22 @@ app.get('/api/admin/batch-uploads-csv', async (req, res) => {
   }
 });
 
+app.get('/api/admin/recent-batches', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const sinceMin = Math.min(720, Math.max(1, parseInt(req.query.since_min, 10) || 60));
+    const pool = (await import('./db/pool.js')).db();
+    const rows = (await pool.query(
+      `SELECT id, channel, created_by, status, paid_count, unused_count, created_at, finalized_at, recalled_at, failure_reason
+         FROM payment_batches WHERE created_at > now() - ($1::int || ' min')::interval
+         ORDER BY created_at DESC`,
+      [sinceMin],
+    )).rows;
+    res.json({ rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/admin/batch-summary', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) {
