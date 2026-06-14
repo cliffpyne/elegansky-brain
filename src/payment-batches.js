@@ -537,6 +537,16 @@ export function mountPaymentBatchesApi(app, deps) {
           for (let pi = 0; pi < planResult.plan.length; pi++) {
             const entry = planResult.plan[pi];
             const entryTickName = `${buttonTickName}:${entry.tick_label}`;
+            // Frank 2026-06-14 rule: invalidate arrears cache between windows.
+            // Cache is keyed by asOf. W2 and W3 share asOf=today, so without
+            // this clear, W3 would re-use W2's pre-W2-Payment arrears and could
+            // re-pay invoices W2 just closed. Cheap (sub-second clear) — the
+            // refetch on next prepareAutoUpload call takes 15-25s for ~12k
+            // invoices but guarantees correctness.
+            if (pi > 0) {
+              _arrearsCache.clear();
+              console.log(`[start-channel ${channel}] cleared arrears cache before window ${pi + 1}`);
+            }
             console.log(`[start-channel ${channel}] (${pi + 1}/${planResult.plan.length}) ${entry.tick_label} window=${entry.since_iso}→${entry.until_iso} as_of=${entry.as_of} txn_date=${entry.txn_date} rows=${entry.row_count}`);
 
             const result = await prepareAutoUpload({
