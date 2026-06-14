@@ -1111,6 +1111,29 @@ const ALL_CHANNEL_SHEETS = [
  * orchestrator outcomes via curl + shared secret (the existing /api/payment-
  * batches/:id endpoint requires a Supabase JWT). Pure SELECTs, no writes.
  */
+app.get('/api/admin/batch-uploads-csv', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const id = String(req.query.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const pool = (await import('./db/pool.js')).db();
+    const r = (await pool.query(
+      `SELECT kind, bank_ref, customer_name, invoice_no, amount, status
+         FROM payment_uploads WHERE batch_id = $1::uuid ORDER BY kind, bank_ref, invoice_no`,
+      [id],
+    )).rows;
+    res.type('text/csv');
+    res.send('kind,bank_ref,customer_name,invoice_no,amount,status\n' +
+      r.map((x) => `${x.kind},${x.bank_ref || ''},"${(x.customer_name || '').replace(/"/g,'""')}",${x.invoice_no || ''},${x.amount},${x.status}`).join('\n'));
+  } catch (err) {
+    console.error('[GET /api/admin/batch-uploads-csv]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/batch-summary', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) {
