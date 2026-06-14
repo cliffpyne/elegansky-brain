@@ -1104,6 +1104,48 @@ const ALL_CHANNEL_SHEETS = [
   { channel: 'iphone_bank', sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
 ];
 
+/**
+ * GET /api/admin/batch-summary?ids=uuid1,uuid2,uuid3
+ *
+ * Read-only diagnostic. Returns a small per-batch summary so we can verify
+ * orchestrator outcomes via curl + shared secret (the existing /api/payment-
+ * batches/:id endpoint requires a Supabase JWT). Pure SELECTs, no writes.
+ */
+app.get('/api/admin/batch-summary', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (ids.length === 0) return res.status(400).json({ error: 'ids query param required (comma-separated UUIDs)' });
+    if (ids.length > 50) return res.status(400).json({ error: 'max 50 ids per call' });
+    const pool = (await import('./db/pool.js')).db();
+    const rows = (await pool.query(
+      `SELECT id, channel, created_by, status, paid_count, unused_count, sheet_sum,
+              failure_reason, created_at, finalized_at
+         FROM payment_batches WHERE id = ANY($1::uuid[])
+         ORDER BY created_at`,
+      [ids],
+    )).rows;
+    const uploads = (await pool.query(
+      `SELECT batch_id, kind, status, COUNT(*)::int AS n, COALESCE(SUM(amount),0)::float AS sum_amount
+         FROM payment_uploads WHERE batch_id = ANY($1::uuid[])
+         GROUP BY batch_id, kind, status ORDER BY batch_id, kind, status`,
+      [ids],
+    )).rows;
+    const byBatch = {};
+    for (const r of rows) byBatch[r.id] = { ...r, uploads: [] };
+    for (const u of uploads) {
+      if (byBatch[u.batch_id]) byBatch[u.batch_id].uploads.push({ kind: u.kind, status: u.status, n: u.n, sum_amount: u.sum_amount });
+    }
+    res.json({ batches: ids.map((id) => byBatch[id] || { id, missing: true }) });
+  } catch (err) {
+    console.error('[GET /api/admin/batch-summary]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/catchup-plan', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) {
