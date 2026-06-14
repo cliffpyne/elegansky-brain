@@ -4283,6 +4283,181 @@ const CHANNEL_SHEETS = {
   iphone_bank: { sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// Catchup planner (Frank 2026-06-14)
+//
+// Business-day boundary = 16:16 EAT (= 13:16 UTC). Everything 16:16→16:15:59
+// of next clock-day belongs to ONE business day for portfolio/reporting.
+//
+// For a channel's PASSED tab, find the last "end of {tick}" K marker and
+// produce the chronologically-ordered list of catchup fires needed to bring
+// the channel current. Each fire is a strict (window, AS_OF, payment_date)
+// tuple matching operator's rule:
+//   - rows in [00:00, 16:15:59] EAT on date D → AS_OF=D, payment_date=D
+//   - rows in [16:16, 23:59:59] EAT on date D → AS_OF=D, payment_date=D+1
+//
+// Windows with ZERO matching sheet rows are pruned (skip-the-empty rule).
+// This keeps fires minimal even when a K marker is mid-afternoon and no
+// real transactions exist in the orphan window.
+//
+// DOES NOT touch processInvoicePayments. DOES NOT fire anything by itself
+// — pure read-only planner. Caller (orchestrator endpoint or operator)
+// decides whether to fire each entry in the returned plan.
+// ──────────────────────────────────────────────────────────────────────────
+function ymdInEat(utcMs) {
+  const dt = new Date(utcMs + 3 * 60 * 60 * 1000);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+function eatYmdHmsToUtcMs(ymd, hh, mm, ss) {
+  const [y, mo, d] = ymd.split('-').map(Number);
+  return Date.UTC(y, mo - 1, d, hh - 3, mm, ss);
+}
+
+function eatDateAfter(ymd) {
+  const [y, mo, d] = ymd.split('-').map(Number);
+  const n = new Date(Date.UTC(y, mo - 1, d + 1));
+  return `${n.getUTCFullYear()}-${String(n.getUTCMonth() + 1).padStart(2, '0')}-${String(n.getUTCDate()).padStart(2, '0')}`;
+}
+
+/**
+ * computeCatchupPlan({ channel, sheet, nowUtcMs }) → { plan, marker, reason }
+ *
+ *   plan[i] = {
+ *     kind:        'A' | 'B'            // A = business-day-D fire, B = D's tail (business-D+1)
+ *     tick_label:  'catchup_<YMD>_<phase>',
+ *     since_iso:   ISO (inclusive lower bound),
+ *     until_iso:   ISO (exclusive upper bound — matches prepareAutoUpload semantics),
+ *     as_of:       'YYYY-MM-DD',
+ *     txn_date:    'YYYY-MM-DD',
+ *     row_count:   number of sheet rows in this window (always > 0 — empty windows pruned),
+ *   }
+ *
+ *   marker = { row, tick, marker_row_date_raw, marker_row_ymd_eat } | null
+ *   reason = short human-readable string
+ *
+ * If `marker` is null (no K marker ever) or `markerYmdEat === nowYmdEat`,
+ * plan is [] — no catchup needed; caller runs the current tick's normal
+ * window via the existing prepareAutoUpload path.
+ */
+export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
+  // ── 1. Find last K marker (= last "end of {tick}" line in column K) ──
+  let maxKRow = -1;
+  let maxKTick = '';
+  for (let i = 1; i < sheet.length; i++) {
+    const k = String(sheet[i][10] || '').trim().toLowerCase();
+    if (k.startsWith('end of ') && !k.includes('(dry_run)')) {
+      maxKRow = i;
+      maxKTick = String(sheet[i][10] || '').trim();
+    }
+  }
+  if (maxKRow < 0) return { plan: [], marker: null, reason: 'no K marker — initial state; caller fires the normal window' };
+
+  // ── 2. Parse the marker row's transaction time ──
+  const markerRowB = sheet[maxKRow][1];
+  const markerDate = parseTsAny(markerRowB);
+  if (!markerDate) {
+    return {
+      plan: [],
+      marker: { row: maxKRow + 1, tick: maxKTick, marker_row_date_raw: markerRowB || null, marker_row_ymd_eat: null },
+      reason: `K marker row date unparseable: "${markerRowB}"; caller must intervene`,
+    };
+  }
+  const markerMs = markerDate.getTime();
+  const markerYmdEat = ymdInEat(markerMs);
+  const nowYmdEat = ymdInEat(nowUtcMs);
+
+  const markerSummary = {
+    row: maxKRow + 1,
+    tick: maxKTick,
+    marker_row_date_raw: String(markerRowB || '').trim(),
+    marker_row_ymd_eat: markerYmdEat,
+  };
+
+  if (markerYmdEat === nowYmdEat) {
+    return { plan: [], marker: markerSummary, reason: `marker date ${markerYmdEat} = today EAT; no catchup needed` };
+  }
+
+  // ── 3. Pre-parse every row BELOW the K marker so we can count fast ──
+  // Below-marker rows that fail parseTsAny are excluded from window counts
+  // (prepareAutoUpload would also exclude them via receivedTimestamp=null
+  // bad-format inclusion, but for plan visibility we don't count them).
+  const tsBelow = [];
+  for (let i = maxKRow + 1; i < sheet.length; i++) {
+    const ts = parseTsAny(sheet[i][1]);
+    if (!ts) continue;
+    tsBelow.push(ts.getTime());
+  }
+  const countRows = (loInc, hiExc) => {
+    let c = 0;
+    for (const t of tsBelow) if (t >= loInc && t < hiExc) c++;
+    return c;
+  };
+
+  // ── 4. Walk EAT clock dates from markerYmdEat → nowYmdEat (inclusive) ──
+  const dates = [];
+  let cur = markerYmdEat;
+  while (cur <= nowYmdEat) { dates.push(cur); cur = eatDateAfter(cur); }
+
+  const plan = [];
+  for (let di = 0; di < dates.length; di++) {
+    const D = dates[di];
+    const isFirstD = (di === 0);
+    const isLastD = (di === dates.length - 1);
+
+    // Sub-window A: business-day-D portion → [start, 16:15:59 EAT D]
+    // For the first date, start = marker time + 1ms (exclude the marker row itself).
+    // For later dates, start = 00:00:00 EAT D.
+    const aLoInc = isFirstD ? markerMs + 1 : eatYmdHmsToUtcMs(D, 0, 0, 0);
+    const aHiExc = Math.min(
+      eatYmdHmsToUtcMs(D, 16, 16, 0),   // 16:16:00 EAT D (exclusive)
+      isLastD ? nowUtcMs + 1 : Number.MAX_SAFE_INTEGER, // never plan beyond now
+    );
+    if (aLoInc < aHiExc) {
+      const c = countRows(aLoInc, aHiExc);
+      if (c > 0) {
+        plan.push({
+          kind: 'A',
+          tick_label: `catchup_${D}_business_${D}`,
+          since_iso: new Date(aLoInc).toISOString(),
+          until_iso: new Date(aHiExc).toISOString(),
+          as_of: D,
+          txn_date: D,
+          row_count: c,
+        });
+      }
+    }
+
+    // Sub-window B: business-day-(D+1) tail of D → [16:16:00 EAT D, 00:00:00 EAT D+1)
+    const bLoInc = Math.max(eatYmdHmsToUtcMs(D, 16, 16, 0), isFirstD ? markerMs + 1 : 0);
+    const bHiExc = Math.min(
+      eatYmdHmsToUtcMs(eatDateAfter(D), 0, 0, 0), // 24:00:00 EAT D = 00:00:00 EAT D+1
+      isLastD ? nowUtcMs + 1 : Number.MAX_SAFE_INTEGER,
+    );
+    if (bLoInc < bHiExc) {
+      const c = countRows(bLoInc, bHiExc);
+      if (c > 0) {
+        plan.push({
+          kind: 'B',
+          tick_label: `catchup_${D}_tail_to_${eatDateAfter(D)}`,
+          since_iso: new Date(bLoInc).toISOString(),
+          until_iso: new Date(bHiExc).toISOString(),
+          as_of: D,
+          txn_date: eatDateAfter(D),
+          row_count: c,
+        });
+      }
+    }
+  }
+
+  return {
+    plan,
+    marker: markerSummary,
+    reason: `${plan.length} non-empty window(s) across ${dates.length} day(s) from marker ${markerYmdEat} → today ${nowYmdEat}`,
+  };
+}
+
+
 function suffixOf(c) { return { bank: 'B', iphone_bank: 'P', nmbnew: 'N' }[c] || ''; }
 function appendSuf(t, c) { if (!t) return ''; const s = suffixOf(c); return s ? t + s : t; }
 function extractPhone(s) { const m = (s || '').match(/\d{10,}/); return m ? m[0] : null; }
