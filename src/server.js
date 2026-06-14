@@ -1085,6 +1085,83 @@ app.get('/api/admin/crdb-last-passed-date', (req, res) =>
   lastPassedDateHandler(CRDB_PASSED_SHEET_ID, CRDB_PASSED_TAB, 'crdb', req, res),
 );
 
+/**
+ * GET /api/admin/upload-gap-state
+ *
+ * Read-only diagnostic. For each upload channel, returns the last "end of
+ * {tick}" K-marker (row + tick + that row's Column B date) and a per-date
+ * count of rows BELOW that marker (= unprocessed work). Lets the auto-
+ * upload skip-detection logic show its work in one curl.
+ *
+ * Auth: X-Report-Secret.
+ */
+const ALL_CHANNEL_SHEETS = [
+  { channel: 'nmbnew',      sheetId: NMB_PASSED_SHEET_ID,  tab: NMB_PASSED_TAB },
+  { channel: 'bank',        sheetId: CRDB_PASSED_SHEET_ID, tab: CRDB_PASSED_TAB },
+  { channel: 'iphone_bank', sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+];
+
+function parseDdMmYyyyHhMmSs(s) {
+  const m = String(s || '').trim().match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  return { ymd: `${m[3]}-${m[2]}-${m[1]}`, raw: String(s).trim() };
+}
+
+app.get('/api/admin/upload-gap-state', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const out = {};
+    for (const { channel, sheetId, tab } of ALL_CHANNEL_SHEETS) {
+      const { values } = await readSheet(sheetId, `${tab}!A1:L80000`);
+      const sheet = values || [];
+      let lastKRow = -1;
+      let lastKTick = '';
+      for (let i = 1; i < sheet.length; i++) {
+        const k = String(sheet[i][10] || '').trim().toLowerCase();
+        if (k.startsWith('end of ') && !k.includes('(dry_run)')) {
+          lastKRow = i + 1;
+          lastKTick = String(sheet[i][10] || '').trim();
+        }
+      }
+      const channelOut = { channel, total_rows: sheet.length - 1 };
+      if (lastKRow < 0) {
+        channelOut.last_k_marker = null;
+        channelOut.rows_below_marker = sheet.length - 1;
+      } else {
+        const rowB = sheet[lastKRow - 1][1];
+        const parsed = parseDdMmYyyyHhMmSs(rowB);
+        channelOut.last_k_marker = {
+          row: lastKRow,
+          tick: lastKTick,
+          marker_row_date_raw: rowB || null,
+          marker_row_ymd: parsed?.ymd ?? null,
+        };
+        const buckets = {};
+        let empty = 0, unparseable = 0;
+        for (let i = lastKRow; i < sheet.length; i++) {
+          const b = String(sheet[i][1] || '').trim();
+          if (!b) { empty++; continue; }
+          const p = parseDdMmYyyyHhMmSs(b);
+          if (!p) { unparseable++; continue; }
+          buckets[p.ymd] = (buckets[p.ymd] || 0) + 1;
+        }
+        channelOut.rows_below_marker = sheet.length - lastKRow;
+        channelOut.by_date = buckets;
+        if (empty) channelOut.empty_date_cells = empty;
+        if (unparseable) channelOut.unparseable_dates = unparseable;
+      }
+      out[channel] = channelOut;
+    }
+    res.json(out);
+  } catch (err) {
+    console.error('[GET /api/admin/upload-gap-state]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Serve the Vite dashboard (build output) ────────────────────────────────
 // `web/dist/` is produced by `npm --prefix web run build`. In production we
 // serve it as static assets at root, with SPA fallback so client-side routes
