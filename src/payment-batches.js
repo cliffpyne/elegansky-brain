@@ -4751,14 +4751,12 @@ function processInvoicePayments(invoices, transactions) {
     const k = keys.find((key) => invByCust[key]);
     if (k) { (txByCust[k] ||= []).push(t); seen.add(uid); }
   });
-  // Frank 2026-06-14 rule update: NEWEST-first transaction order. The
-  // original invoice-payment-app sorted (a-b) = oldest-first; BRAIN
-  // faithfully inherited that. New rule per operator: newest transaction
-  // pays the newest invoice first, then spills into older invoices, then
-  // move to next-older transaction. Validated against manual upload —
-  // when a customer has multiple deposits, newest-first picks the deposit
-  // that best clears their balance.
-  Object.keys(txByCust).forEach((k) => txByCust[k].sort((a, b) => (b.receivedTimestamp || 0) - (a.receivedTimestamp || 0)));
+  // OLDEST-first transaction order — verbatim from invoice-payment-app.
+  // (Briefly flipped to newest-first 2026-06-14 in commit a5007b9 when a
+  // 1/359 divergence looked like a sort issue; turned out to be the
+  // QB_DUPLICATE Column L marker correctly filtering out an already-
+  // pushed ref. Reverted — sacred algorithm restored to original.)
+  Object.keys(txByCust).forEach((k) => txByCust[k].sort((a, b) => (a.receivedTimestamp || 0) - (b.receivedTimestamp || 0)));
   const out = [];
   Object.keys(invByCust).forEach((ck) => {
     const ci = invByCust[ck]; const ct = txByCust[ck] || [];
