@@ -1111,6 +1111,39 @@ const ALL_CHANNEL_SHEETS = [
  * orchestrator outcomes via curl + shared secret (the existing /api/payment-
  * batches/:id endpoint requires a Supabase JWT). Pure SELECTs, no writes.
  */
+app.get('/api/admin/sheet-ref-lookup', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const refs = String(req.query.refs || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (refs.length === 0) return res.status(400).json({ error: 'refs query param required' });
+    const { values } = await readSheet(NMB_PASSED_SHEET_ID, `${NMB_PASSED_TAB}!A1:L80000`);
+    const sheet = values || [];
+    const out = [];
+    for (const ref of refs) {
+      for (let i = 1; i < sheet.length; i++) {
+        const sheetRef = String(sheet[i][7] || '').trim();
+        if (sheetRef === ref) {
+          out.push({
+            ref,
+            row: i + 1,
+            date_col_b_raw: sheet[i][1],
+            customer_name: sheet[i][6],
+            amount: sheet[i][4],
+          });
+          break;
+        }
+      }
+    }
+    res.json({ found: out });
+  } catch (err) {
+    console.error('[GET /api/admin/sheet-ref-lookup]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/batch-uploads-csv', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) {
