@@ -1122,18 +1122,26 @@ app.get('/api/admin/sheet-ref-lookup', async (req, res) => {
     const { values } = await readSheet(NMB_PASSED_SHEET_ID, `${NMB_PASSED_TAB}!A1:L80000`);
     const sheet = values || [];
     const out = [];
-    for (const ref of refs) {
+    // Strip N suffix from refs to match raw bank refs in sheet (which don't have channel suffix)
+    const stripped = refs.map(r => r.endsWith('N') ? r.slice(0, -1) : r);
+    for (let r = 0; r < refs.length; r++) {
+      const exact = refs[r];
+      const bare = stripped[r];
       for (let i = 1; i < sheet.length; i++) {
-        const sheetRef = String(sheet[i][7] || '').trim();
-        if (sheetRef === ref) {
-          out.push({
-            ref,
-            row: i + 1,
-            date_col_b_raw: sheet[i][1],
-            customer_name: sheet[i][6],
-            amount: sheet[i][4],
-          });
-          break;
+        // Refs may be in column G (idx 6), H (idx 7), or elsewhere — scan all cols
+        for (let c = 0; c < sheet[i].length; c++) {
+          const v = String(sheet[i][c] || '').trim();
+          if (v === exact || v === bare) {
+            out.push({
+              ref: exact,
+              row: i + 1,
+              found_in_col: c,
+              date_col_b: sheet[i][1],
+              full_row: sheet[i].map((x) => String(x || '').slice(0, 60)),
+            });
+            i = sheet.length; // break outer
+            break;
+          }
         }
       }
     }
