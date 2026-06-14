@@ -437,6 +437,17 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // ── POST /api/admin/clear-arrears-cache ──────────────────────────────────
+  // Frank 2026-06-14: between cross-channel fires that share AS_OF, we need
+  // to flush the in-process arrears cache so the next prepareAutoUpload sees
+  // QB Payments the prior fire just pushed (otherwise W1's closed invoices
+  // appear "still open" to channel 2's matcher → double-pay risk).
+  app.post('/api/admin/clear-arrears-cache', requireSecretOrJwt, async (req, res) => {
+    const before = _arrearsCache.size;
+    _arrearsCache.clear();
+    res.json({ ok: true, cleared_entries: before });
+  });
+
   // ── POST /api/payment-batches/start/:channel ─────────────────────────────
   // Frank 2026-06-14: "the start button". Read the channel's sheet, compute
   // the catchup plan (computeCatchupPlan), and execute every window in the
