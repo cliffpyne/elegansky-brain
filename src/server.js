@@ -1122,7 +1122,7 @@ app.get('/api/admin/batch-summary', async (req, res) => {
     if (ids.length > 50) return res.status(400).json({ error: 'max 50 ids per call' });
     const pool = (await import('./db/pool.js')).db();
     const rows = (await pool.query(
-      `SELECT id, channel, created_by, status, paid_count, unused_count, sheet_sum,
+      `SELECT id, channel, created_by, status, paid_count, unused_count,
               failure_reason, created_at, finalized_at
          FROM payment_batches WHERE id = ANY($1::uuid[])
          ORDER BY created_at`,
