@@ -994,6 +994,97 @@ app.post('/api/admin/sort-sheet-by-date', async (req, res) => {
   }
 });
 
+/**
+ * GET /api/admin/nmb-last-passed-date
+ *
+ * Returns the most recent date stamped in the NMB sheet's PASSED tab,
+ * inspecting the last N (default 10) non-empty data rows of date column B.
+ * Used by the eleganskyCrdb scraper to compute the gap of missing days
+ * before pulling. Date col mirrors sortTabByDate's default (col B = idx 1).
+ *
+ * Auth: X-Report-Secret header (shared with sort-sheet-by-date).
+ * Query: ?rows=N (1..50, default 10).
+ * Response: { last_passed_date: "YYYY-MM-DD", rows_inspected, sample: [...] }.
+ */
+const NMB_PASSED_SHEET_ID = '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek';
+const NMB_PASSED_TAB = 'PASSED';
+const CRDB_PASSED_SHEET_ID = '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o';
+const CRDB_PASSED_TAB = 'PASSED';
+
+function parseSheetDateToYmd(txt) {
+  const s = String(txt || '').trim();
+  if (!s) return null;
+  // "DD.MM.YYYY", "DD/MM/YYYY", or "DD-MM-YYYY" (NMB uses dots, CRDB uses slashes).
+  let m = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})/);
+  if (m) {
+    const d = +m[1], mo = +m[2], y = +m[3];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    }
+  }
+  // "DD Mon YYYY"
+  m = s.match(/^(\d{1,2})[\s\-\/]+([A-Za-z]{3,9})[\s\-\/]+(\d{4})/);
+  if (m) {
+    const MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+    const mo = MONTHS[m[2].slice(0,3).toLowerCase()];
+    if (mo) return `${m[3]}-${String(mo).padStart(2,'0')}-${String(+m[1]).padStart(2,'0')}`;
+  }
+  // "YYYY-MM-DD ..."
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) {
+    return `${m[1]}-${String(+m[2]).padStart(2,'0')}-${String(+m[3]).padStart(2,'0')}`;
+  }
+  return null;
+}
+
+async function lastPassedDateHandler(sheetId, tab, label, req, res) {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const n = Math.min(50, Math.max(1, parseInt(req.query.rows, 10) || 10));
+    const { values } = await readSheet(sheetId, `${tab}!B1:B999999`);
+    if (!values || values.length < 2) {
+      return res.status(404).json({ error: `${tab} tab empty or header-only` });
+    }
+    const dataRows = values
+      .slice(1)
+      .filter((r) => r && r[0] && String(r[0]).trim().length)
+      .slice(-n);
+    if (dataRows.length === 0) {
+      return res.status(404).json({ error: 'no non-empty rows in date column' });
+    }
+    const parsed = [];
+    for (const row of dataRows) {
+      const ymd = parseSheetDateToYmd(row[0]);
+      if (ymd) parsed.push({ raw: String(row[0]).trim(), ymd });
+    }
+    if (parsed.length === 0) {
+      return res.status(422).json({
+        error: 'no parseable dates in inspected rows',
+        raw_samples: dataRows.map((r) => String(r[0]).slice(0, 60)),
+      });
+    }
+    parsed.sort((a, b) => a.ymd.localeCompare(b.ymd));
+    res.json({
+      last_passed_date: parsed[parsed.length - 1].ymd,
+      rows_inspected: dataRows.length,
+      sample: parsed.slice(-5),
+    });
+  } catch (err) {
+    console.error(`[GET /api/admin/${label}-last-passed-date]`, err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.get('/api/admin/nmb-last-passed-date', (req, res) =>
+  lastPassedDateHandler(NMB_PASSED_SHEET_ID, NMB_PASSED_TAB, 'nmb', req, res),
+);
+app.get('/api/admin/crdb-last-passed-date', (req, res) =>
+  lastPassedDateHandler(CRDB_PASSED_SHEET_ID, CRDB_PASSED_TAB, 'crdb', req, res),
+);
+
 // ── Serve the Vite dashboard (build output) ────────────────────────────────
 // `web/dist/` is produced by `npm --prefix web run build`. In production we
 // serve it as static assets at root, with SPA fallback so client-side routes
