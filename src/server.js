@@ -1111,6 +1111,23 @@ const ALL_CHANNEL_SHEETS = [
  * orchestrator outcomes via curl + shared secret (the existing /api/payment-
  * batches/:id endpoint requires a Supabase JWT). Pure SELECTs, no writes.
  */
+app.get('/api/admin/sheet-row-dump', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const row = parseInt(req.query.row, 10);
+    const channel = req.query.channel || 'nmbnew';
+    const sheets = { nmbnew: { id: NMB_PASSED_SHEET_ID, tab: NMB_PASSED_TAB }, bank: { id: CRDB_PASSED_SHEET_ID, tab: CRDB_PASSED_TAB }, iphone_bank: { id: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' } }[channel];
+    if (!sheets || !row) return res.status(400).json({ error: 'channel + row required' });
+    const { values } = await readSheet(sheets.id, `${sheets.tab}!A${row}:L${row+2}`);
+    res.json({ row, channel, rows: values });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/admin/sheet-ref-lookup', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) {
