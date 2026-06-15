@@ -1287,6 +1287,62 @@ app.get('/api/admin/auto-upload-lock-status', async (req, res) => {
   }
 });
 
+// Tightly-scoped admin tool: delete a dry-run batch + its uploads. Triple
+// safety: refuses if the batch isn't marked as dry_run in failure_reason,
+// or if ANY of its payment_uploads has a status that isn't 'dry_run'. So a
+// real batch (status='created' / 'sent' / 'pending') will never get
+// deleted even if the caller pastes the wrong UUID by accident.
+app.post('/api/admin/delete-dry-run-batch/:id', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  const id = String(req.params.id || '').trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return res.status(400).json({ error: 'id must be a UUID' });
+  }
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    // 1. Batch must exist and be a dry-run.
+    const batchRow = (await pool.query(
+      `SELECT id, channel, status, failure_reason, paid_count, unused_count
+         FROM payment_batches WHERE id = $1`, [id])).rows[0];
+    if (!batchRow) return res.status(404).json({ error: 'batch not found' });
+    const isDryRun = String(batchRow.failure_reason || '').toLowerCase().includes('dry_run');
+    if (!isDryRun) {
+      return res.status(409).json({
+        error: 'batch is not a dry-run (failure_reason does not contain "dry_run")',
+        batch: batchRow,
+      });
+    }
+    // 2. EVERY payment_upload row must have status='dry_run'. If ANY has a
+    //    different status, refuse — that means a real QB push happened.
+    const uploadStatuses = (await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM payment_uploads WHERE batch_id = $1 GROUP BY status`,
+      [id],
+    )).rows;
+    const nonDryRun = uploadStatuses.filter((r) => String(r.status) !== 'dry_run');
+    if (nonDryRun.length > 0) {
+      return res.status(409).json({
+        error: 'batch has payment_uploads with non-dry_run status — refusing to delete',
+        upload_statuses: uploadStatuses,
+      });
+    }
+    // 3. Safe to delete. Uploads first (FK), then the batch row.
+    const delUploads = await pool.query(`DELETE FROM payment_uploads WHERE batch_id = $1`, [id]);
+    const delBatch = await pool.query(`DELETE FROM payment_batches WHERE id = $1`, [id]);
+    res.json({
+      ok: true,
+      batch_id: id,
+      channel: batchRow.channel,
+      uploads_deleted: delUploads.rowCount,
+      batch_deleted: delBatch.rowCount,
+      pre_check: { upload_statuses: uploadStatuses, failure_reason: batchRow.failure_reason },
+    });
+  } catch (err) {
+    console.error('[POST /api/admin/delete-dry-run-batch]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Serve the Vite dashboard (build output) ────────────────────────────────
 // `web/dist/` is produced by `npm --prefix web run build`. In production we
 // serve it as static assets at root, with SPA fallback so client-side routes
