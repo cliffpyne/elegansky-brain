@@ -4571,9 +4571,14 @@ function eatDateAfter(ymd) {
  *   marker = { row, tick, marker_row_date_raw, marker_row_ymd_eat } | null
  *   reason = short human-readable string
  *
- * If `marker` is null (no K marker ever) or `markerYmdEat === nowYmdEat`,
- * plan is [] — no catchup needed; caller runs the current tick's normal
- * window via the existing prepareAutoUpload path.
+ * If `marker` is null (no K marker ever), plan is [] — caller fires the
+ * normal window via the existing prepareAutoUpload path.
+ *
+ * When marker date = today EAT, the plan contains the INCREMENTAL window
+ * from marker timestamp + 1ms → now (covered by the day-walk loop below).
+ * Previously this case short-circuited to [], causing scheduled ticks to
+ * skip incremental fires (Frank 2026-06-15 hanang0700 bug). The planner is
+ * now the single source of windows for both catchup and incremental cases.
  */
 export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
   // ── 1. Find last K marker (= last "end of {tick}" line in column K) ──
@@ -4609,9 +4614,11 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
     marker_row_ymd_eat: markerYmdEat,
   };
 
-  if (markerYmdEat === nowYmdEat) {
-    return { plan: [], marker: markerSummary, reason: `marker date ${markerYmdEat} = today EAT; no catchup needed` };
-  }
+  // Frank 2026-06-15: do NOT short-circuit when marker date = today.
+  // The day-walk loop below correctly produces the incremental window
+  // (marker_ms + 1 → now) when dates = [today]. The previous short-circuit
+  // here caused scheduled ticks (hanang0700 et al.) to skip firing
+  // payments for transactions added between meru0300 and the current tick.
 
   // ── 3. Pre-parse every row BELOW the K marker so we can count fast ──
   // Below-marker rows that fail parseTsAny are excluded from window counts
