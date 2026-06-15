@@ -1263,6 +1263,30 @@ app.get('/api/admin/catchup-plan', async (req, res) => {
   }
 });
 
+// Worker tick wiring uses this to know when /payment-batches/start/:channel
+// background work has fully completed — start endpoint returns 202 and runs
+// in setImmediate, so the only way to detect completion is the channel lock
+// release (which happens in the orchestrator's finally block).
+app.get('/api/admin/auto-upload-lock-status', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const channel = String(req.query.channel || '').trim();
+    if (!channel) return res.status(400).json({ error: 'channel query param required' });
+    const pool = (await import('./db/pool.js')).db();
+    const row = (await pool.query(
+      `SELECT channel, holder, locked_at FROM auto_upload_locks WHERE channel=$1`,
+      [channel],
+    )).rows[0] || null;
+    res.json({ channel, locked: !!row, holder: row?.holder || null, locked_at: row?.locked_at || null });
+  } catch (err) {
+    console.error('[GET /api/admin/auto-upload-lock-status]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Serve the Vite dashboard (build output) ────────────────────────────────
 // `web/dist/` is produced by `npm --prefix web run build`. In production we
 // serve it as static assets at root, with SPA fallback so client-side routes
