@@ -1287,6 +1287,74 @@ app.get('/api/admin/auto-upload-lock-status', async (req, res) => {
   }
 });
 
+// QB health check: query QB directly for today's Payments, group by
+// DepositToAccountRef, sum totals. Lets us reconcile what we INTENDED
+// to push (BRAIN's payment_uploads with status='created') vs what QB
+// ACTUALLY shows. A big delta = double-pushes or push failures.
+//
+// Pass ?date=YYYY-MM-DD (defaults to today EAT). Optionally ?accounts=1
+// to also dump the chart of accounts (bank/asset/liability entries).
+app.get('/api/admin/qb-health-check', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    let date = String(req.query.date || '').trim();
+    if (!date) {
+      // Default to today EAT.
+      const nowMs = Date.now();
+      const eatMs = nowMs + 3 * 60 * 60 * 1000;
+      const d = new Date(eatMs);
+      date = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    const includeAccounts = String(req.query.accounts || '').trim() === '1';
+
+    // Page through QB Payments for the requested TxnDate.
+    const payments = [];
+    let start = 1;
+    const pageSize = 200;
+    while (true) {
+      const sql = `SELECT Id, TotalAmt, TxnDate, DepositToAccountRef, CustomerRef, PaymentRefNum FROM Payment WHERE TxnDate = '${date}' STARTPOSITION ${start} MAXRESULTS ${pageSize}`;
+      const j = await qbQuery(sql);
+      const rows = (j?.QueryResponse?.Payment) || [];
+      payments.push(...rows);
+      if (rows.length < pageSize) break;
+      start += pageSize;
+      if (start > 5000) break; // safety rail
+    }
+
+    // Aggregate by DepositToAccountRef.
+    const byAccount = {};
+    let grandTotal = 0;
+    for (const p of payments) {
+      const acctId = p?.DepositToAccountRef?.value || 'UNDEPOSITED';
+      const acctName = p?.DepositToAccountRef?.name || 'Undeposited Funds';
+      const key = `${acctId} | ${acctName}`;
+      if (!byAccount[key]) byAccount[key] = { account_id: acctId, account_name: acctName, n: 0, total: 0 };
+      byAccount[key].n += 1;
+      byAccount[key].total += Number(p?.TotalAmt || 0);
+      grandTotal += Number(p?.TotalAmt || 0);
+    }
+
+    const out = {
+      qb_txn_date: date,
+      qb_payments_count: payments.length,
+      qb_payments_total: grandTotal,
+      qb_by_account: Object.values(byAccount).sort((a, b) => b.total - a.total),
+    };
+
+    if (includeAccounts) {
+      const acctsJ = await qbQuery(`SELECT Id, Name, AccountType, AccountSubType, CurrentBalance, Active FROM Account WHERE Active = true MAXRESULTS 200`);
+      out.qb_chart_of_accounts = (acctsJ?.QueryResponse?.Account) || [];
+    }
+
+    res.json(out);
+  } catch (err) {
+    console.error('[GET /api/admin/qb-health-check]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Tightly-scoped admin tool: delete a dry-run batch + its uploads. Triple
 // safety: refuses if the batch isn't marked as dry_run in failure_reason,
 // or if ANY of its payment_uploads has a status that isn't 'dry_run'. So a
