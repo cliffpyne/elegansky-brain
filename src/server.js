@@ -1355,6 +1355,118 @@ app.get('/api/admin/qb-health-check', async (req, res) => {
   }
 });
 
+// 3-way reconciliation: compare BRAIN's payment_uploads vs QB's Payments
+// vs the sheet's processed rows for a given TxnDate. Groups by channel
+// suffix (N=nmbnew, B=bank, P=iphone_bank — detected from the trailing
+// letter of payment_uploads.bank_ref AND QB Payment.PrivateNote).
+//
+// Pass ?date=YYYY-MM-DD (defaults to today EAT). Returns three side-by-
+// side totals per channel suffix so any drift is obvious at a glance.
+app.get('/api/admin/three-way-recon', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    let date = String(req.query.date || '').trim();
+    if (!date) {
+      const nowMs = Date.now();
+      const d = new Date(nowMs + 3 * 60 * 60 * 1000);
+      date = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+
+    const pool = (await import('./db/pool.js')).db();
+
+    // ── 1. BRAIN side: sum payment_uploads.amount for the given TxnDate,
+    //       grouped by channel + status. We use payment_batches.created_by
+    //       to filter, but actually the cleanest is to grab the txnDate
+    //       from payment_uploads.memo (kili1615:catchup_<asof>_business_<txn>)
+    //       — easier to use batches whose tick_label ends with the date.
+    //       Use a join: payment_uploads → payment_batches WHERE
+    //       created_by LIKE '%_<date>' (catchup_<asof>_business_<txn> ends
+    //       with txn_date).
+    const brainRows = (await pool.query(
+      `SELECT b.channel, u.status, u.kind, COUNT(*)::int AS n,
+              COALESCE(SUM(u.amount), 0)::float AS total
+         FROM payment_uploads u
+         JOIN payment_batches b ON u.batch_id = b.id
+        WHERE b.status = 'finalized'
+          AND b.failure_reason IS DISTINCT FROM 'recall'
+          AND (b.failure_reason IS NULL OR b.failure_reason NOT ILIKE '%dry_run%')
+          AND b.created_by LIKE '%' || $1
+        GROUP BY b.channel, u.status, u.kind`,
+      [date],
+    )).rows;
+    const brainByChannel = { nmbnew: { N: 0, count: 0 }, bank: { B: 0, count: 0 }, iphone_bank: { P: 0, count: 0 } };
+    for (const r of brainRows) {
+      if (r.status !== 'created') continue; // count only QB-pushed
+      const ch = r.channel;
+      if (!brainByChannel[ch]) continue;
+      const suf = { nmbnew: 'N', bank: 'B', iphone_bank: 'P' }[ch];
+      brainByChannel[ch][suf] += Number(r.total);
+      brainByChannel[ch].count += Number(r.n);
+    }
+
+    // ── 2. QB side: query QB for Payments WHERE TxnDate=?, group by suffix
+    //       in PrivateNote (the last letter). Pages through.
+    const qbPayments = [];
+    let start = 1;
+    const pageSize = 200;
+    while (true) {
+      const sql = `SELECT Id, TotalAmt, TxnDate, PrivateNote FROM Payment WHERE TxnDate = '${date}' STARTPOSITION ${start} MAXRESULTS ${pageSize}`;
+      const j = await qbQuery(sql);
+      const rows = (j?.QueryResponse?.Payment) || [];
+      qbPayments.push(...rows);
+      if (rows.length < pageSize) break;
+      start += pageSize;
+      if (start > 5000) break;
+    }
+    const qbBySuffix = { N: { total: 0, count: 0 }, B: { total: 0, count: 0 }, P: { total: 0, count: 0 }, other: { total: 0, count: 0 } };
+    for (const p of qbPayments) {
+      const note = String(p?.PrivateNote || '').trim();
+      // Split on whitespace, take the FIRST token, then read its last char
+      // (the channel suffix). This catches "MC213FLMN | ts" → "MC213FLMN" → "N".
+      const firstToken = note.split(/\s/)[0] || '';
+      const lastChar = firstToken.slice(-1).toUpperCase();
+      const bucket = lastChar === 'N' || lastChar === 'B' || lastChar === 'P' ? lastChar : 'other';
+      qbBySuffix[bucket].total += Number(p?.TotalAmt || 0);
+      qbBySuffix[bucket].count += 1;
+    }
+
+    // ── 3. Compare side-by-side. For each channel suffix, show BRAIN
+    //       claimed total vs QB actual total. Delta should be 0 if
+    //       everything BRAIN pushed actually landed in QB with the
+    //       matching TxnDate.
+    const summary = [];
+    for (const ch of ['nmbnew', 'bank', 'iphone_bank']) {
+      const suf = { nmbnew: 'N', bank: 'B', iphone_bank: 'P' }[ch];
+      const brainTotal = brainByChannel[ch][suf];
+      const brainCount = brainByChannel[ch].count;
+      const qbTotal = qbBySuffix[suf].total;
+      const qbCount = qbBySuffix[suf].count;
+      summary.push({
+        channel: ch,
+        suffix: suf,
+        brain_count: brainCount,
+        brain_total: brainTotal,
+        qb_count: qbCount,
+        qb_total: qbTotal,
+        delta: qbTotal - brainTotal,
+      });
+    }
+    const qbOther = qbBySuffix.other;
+    res.json({
+      txn_date: date,
+      by_channel: summary,
+      qb_total_all: qbPayments.reduce((acc, p) => acc + Number(p?.TotalAmt || 0), 0),
+      qb_count_all: qbPayments.length,
+      qb_other_suffix: { count: qbOther.count, total: qbOther.total, note: 'Payments whose PrivateNote did not end with N/B/P — possibly manual or non-BRAIN entries' },
+    });
+  } catch (err) {
+    console.error('[GET /api/admin/three-way-recon]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Tightly-scoped admin tool: delete a dry-run batch + its uploads. Triple
 // safety: refuses if the batch isn't marked as dry_run in failure_reason,
 // or if ANY of its payment_uploads has a status that isn't 'dry_run'. So a
