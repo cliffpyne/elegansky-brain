@@ -392,12 +392,29 @@ async function qbBatchCreateUnappliedPayments(items) {
  */
 async function qbPreflightDedup({ tuples, sinceTxnDate }) {
   // tuples: [{ customerId: '8334', ref: '101AGD…N' }, …]
-  // Group refs by customerId so we can ask QB per-customer
+  // Group refs by customerId so we can ask QB per-customer.
+  //
+  // byCust: cid → Map<lookupForm, canonicalSuffixedRef>
+  // For each ref we add TWO lookup forms so PrivateNote matches catch
+  // both BRAIN writes (PN = ref+suffix) and manual QB writes (PN = bare
+  // ref, no suffix). Frank's operators often write iPhone payments by
+  // hand using just the TIPS Vodacom ref — without this dual-form match,
+  // dedup misses them and the next auto-fire pushes a duplicate.
   const byCust = new Map();
+  const SUFFIX_LETTERS = new Set(['N', 'B', 'P']);
   for (const t of tuples) {
     if (!t.customerId || !t.ref) continue;
-    if (!byCust.has(t.customerId)) byCust.set(t.customerId, new Set());
-    byCust.get(t.customerId).add(t.ref);
+    if (!byCust.has(t.customerId)) byCust.set(t.customerId, new Map());
+    const m = byCust.get(t.customerId);
+    // canonical = the suffixed form (what BRAIN writes + what we use as the dedup key)
+    if (!m.has(t.ref)) m.set(t.ref, t.ref);
+    // also map the bare form (suffix stripped) → canonical, so a manual
+    // QB write with PN = bare ref still matches
+    const last = t.ref.slice(-1);
+    if (SUFFIX_LETTERS.has(last) && t.ref.length > 1) {
+      const bare = t.ref.slice(0, -1);
+      if (bare && !m.has(bare)) m.set(bare, t.ref);
+    }
   }
   if (byCust.size === 0) return { duplicateKeys: new Set(), detail: [] };
 
@@ -430,16 +447,22 @@ async function qbPreflightDedup({ tuples, sinceTxnDate }) {
           const cid = x.CustomerRef?.value;
           if (!cid) continue;
           const refsForThisCust = byCust.get(cid);
-          if (!refsForThisCust || !refsForThisCust.has(pn)) continue;
-          const key = `${cid}|${pn}`;
+          if (!refsForThisCust) continue;
+          // matches EITHER the suffixed form (BRAIN-written) OR the bare
+          // form (manual QB-written). Canonical = the suffixed ref so the
+          // key + external_consumed_refs row stays consistent.
+          const canonical = refsForThisCust.get(pn);
+          if (!canonical) continue;
+          const key = `${cid}|${canonical}`;
           if (duplicateKeys.has(key)) continue;
           duplicateKeys.add(key);
           detail.push({
             customerId: cid,
-            ref: pn,
+            ref: canonical,
             qb_id: x.Id,
             qb_kind: entity === 'Payment' ? 'payment' : 'credit_memo',
             qb_txn_date: x.TxnDate,
+            matched_via: pn === canonical ? 'suffixed' : 'bare',
           });
         }
         if (items.length < 1000) break;
