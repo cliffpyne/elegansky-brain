@@ -1287,6 +1287,119 @@ app.get('/api/admin/auto-upload-lock-status', async (req, res) => {
   }
 });
 
+// Officer-coverage analyzer: breaks down QB Payments for a TxnDate into
+// 3 buckets so we can SEE where money goes after "officer-reports collection":
+//   in_listed: payment hit a customer mapped to one of the officers
+//               currently displayed by /officer-reports (the 11-ish visible)
+//   in_other:  payment hit a customer mapped to an officer NOT in the list
+//               (excluded per project_officer_report_exclusions, or just not
+//                rendered yet)
+//   unmapped:  payment hit a customer with no customer_officer_map entry
+//
+// Pass ?date=YYYY-MM-DD (defaults to today EAT). Defaults the "displayed
+// officers" list to the 10 customer-IDs from project memory; pass
+// ?display=id1,id2,... to override.
+app.get('/api/admin/officer-coverage', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    let date = String(req.query.date || '').trim();
+    if (!date) {
+      const d = new Date(Date.now() + 3 * 60 * 60 * 1000);
+      date = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+    // Page through QB Payments for the date and group by customer.
+    const payments = [];
+    let start = 1;
+    const pageSize = 200;
+    while (true) {
+      const sql = `SELECT Id, TotalAmt, TxnDate, CustomerRef, PrivateNote FROM Payment WHERE TxnDate = '${date}' STARTPOSITION ${start} MAXRESULTS ${pageSize}`;
+      const j = await qbQuery(sql);
+      const rows = (j?.QueryResponse?.Payment) || [];
+      payments.push(...rows);
+      if (rows.length < pageSize) break;
+      start += pageSize;
+      if (start > 5000) break;
+    }
+    const byCustomer = {};
+    for (const p of payments) {
+      const cid = p?.CustomerRef?.value || 'unknown';
+      const amt = Number(p?.TotalAmt || 0);
+      if (!byCustomer[cid]) byCustomer[cid] = { customer_id: cid, n: 0, total: 0 };
+      byCustomer[cid].n += 1;
+      byCustomer[cid].total += amt;
+    }
+    const customerIds = Object.keys(byCustomer);
+
+    // Look up officer mapping for those customers.
+    const pool = (await import('./db/pool.js')).db();
+    const mapRows = (await pool.query(
+      `SELECT customer_id, officer_id, officer_name FROM customer_officer_map WHERE customer_id = ANY($1::text[])`,
+      [customerIds],
+    )).rows;
+    const officerByCustomer = {};
+    for (const r of mapRows) officerByCustomer[r.customer_id] = r;
+
+    // Pull what /officer-reports actually shows so we can flag "in_listed".
+    const todayRows = (await pool.query(
+      `SELECT DISTINCT officer_id FROM customer_officer_map`,
+    )).rows;
+    // The actual "displayed" set is whatever /officer-reports/today's per_officer returns.
+    // Fetch it for the same date so the 3-way split matches what the dashboard shows.
+    let displayedOfficerIds = new Set();
+    try {
+      const orRes = await fetch(`http://127.0.0.1:${process.env.PORT || 3000}/api/officer-reports/today`, {
+        headers: { 'X-Report-Secret': secret },
+      });
+      if (orRes.ok) {
+        const oj = await orRes.json();
+        for (const po of (oj?.per_officer || [])) {
+          if (po?.officer_id) displayedOfficerIds.add(String(po.officer_id));
+        }
+      }
+    } catch (e) {
+      // fallthrough: empty set → everything mapped lands in 'in_other'
+    }
+
+    // Aggregate
+    const buckets = {
+      in_listed: { n_payments: 0, n_customers: 0, total: 0, sample: [] },
+      in_other:  { n_payments: 0, n_customers: 0, total: 0, sample: [] },
+      unmapped:  { n_payments: 0, n_customers: 0, total: 0, sample: [] },
+    };
+    for (const cid of customerIds) {
+      const cust = byCustomer[cid];
+      const off = officerByCustomer[cid];
+      let bucket;
+      if (!off) bucket = 'unmapped';
+      else if (displayedOfficerIds.has(String(off.officer_id))) bucket = 'in_listed';
+      else bucket = 'in_other';
+      buckets[bucket].n_payments += cust.n;
+      buckets[bucket].n_customers += 1;
+      buckets[bucket].total += cust.total;
+      if (buckets[bucket].sample.length < 5) {
+        buckets[bucket].sample.push({
+          customer_id: cid,
+          officer_id: off?.officer_id || null,
+          officer_name: off?.officer_name || null,
+          n: cust.n,
+          total: cust.total,
+        });
+      }
+    }
+    res.json({
+      txn_date: date,
+      qb_payments_total: payments.length,
+      qb_amount_total: payments.reduce((a, p) => a + Number(p?.TotalAmt || 0), 0),
+      displayed_officers_count: displayedOfficerIds.size,
+      buckets,
+    });
+  } catch (err) {
+    console.error('[GET /api/admin/officer-coverage]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // QB health check: query QB directly for today's Payments, group by
 // DepositToAccountRef, sum totals. Lets us reconcile what we INTENDED
 // to push (BRAIN's payment_uploads with status='created') vs what QB
