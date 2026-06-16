@@ -1256,6 +1256,19 @@ export async function computeOfficerReport(date) {
   await ensureSchema();
 
   // Today's collections per officer, joined live from payment_uploads.
+  // Frank 2026-06-16: filter by the QB Payment's intended TxnDate, NOT
+  // the batch's created_at. The 16:16 EAT boundary means post-16:16 fires
+  // (kibo1900, kibo2100) create batches whose Payments have tomorrow's
+  // TxnDate — those Payments are "today's money" in QB and on the bank's
+  // chart of accounts, so they MUST count in today's officer collection
+  // too. Previously they were silently dropped because pu.created_at was
+  // yesterday, causing a ~7M/day gap vs the QB-side total.
+  //
+  // We parse the TxnDate from the batch's created_by tick_label suffix
+  // (format: `..._YYYY-MM-DD`, used by every catchup window). If the
+  // suffix isn't parseable (heisenberg fires, rogue test batches, etc.)
+  // we fall back to pu.created_at::date — preserves old behavior for
+  // legacy / manual entries.
   const collectionsRes = await db().query(
     `SELECT m.officer_id, m.officer_name,
             COALESCE(SUM(pu.amount), 0) AS collection,
@@ -1263,7 +1276,10 @@ export async function computeOfficerReport(date) {
        FROM payment_uploads pu
        JOIN customer_officer_map m ON m.customer_id = pu.customer_id
        JOIN payment_batches pb ON pb.id = pu.batch_id
-      WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1
+      WHERE COALESCE(
+              substring(pb.created_by from '_(\\d{4}-\\d{2}-\\d{2})$')::date,
+              (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date
+            ) = $1
         AND pu.status = 'created'
       GROUP BY m.officer_id, m.officer_name`,
     [date],
