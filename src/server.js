@@ -1355,6 +1355,100 @@ app.get('/api/admin/qb-health-check', async (req, res) => {
   }
 });
 
+// NMB-pull coordination — worker on Render (statement-pull) signals the
+// hosted NMB POC service (nmb-live-pull) to fire an immediate pull cycle
+// at scheduled tick time. The POC normally pulls every 5 min on its own;
+// these endpoints let scheduled ticks bypass the 5-min cadence and get
+// a fresh pull right before payments fire.
+//
+// State stored in app_settings:
+//   nmb_pull_requested_at   ISO timestamp — worker sets this on /request
+//   nmb_pull_completed_at   ISO timestamp — POC sets this on /complete
+//   nmb_pull_result_json    JSON          — POC's pull result (passed/skipped/failed counts)
+//
+// A request is "pending" when requested_at > completed_at (lexicographic
+// ISO 8601 string compare is fine here since both come from the same
+// clock and never go backwards).
+app.post('/api/nmb-pull/request', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const now = new Date().toISOString();
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_requested_at', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [now],
+    );
+    // Clear completed flag so polling sees the new request as pending.
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_completed_at', '')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_result_json', '')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    );
+    res.json({ ok: true, requested_at: now });
+  } catch (err) {
+    console.error('[POST /api/nmb-pull/request]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/nmb-pull/state', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const rows = (await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('nmb_pull_requested_at','nmb_pull_completed_at','nmb_pull_result_json')`,
+    )).rows;
+    const m = {};
+    for (const r of rows) m[r.key] = r.value;
+    const requested = m.nmb_pull_requested_at || '';
+    const completed = m.nmb_pull_completed_at || '';
+    const pending = !!requested && requested > completed;
+    let result = null;
+    if (m.nmb_pull_result_json) {
+      try { result = JSON.parse(m.nmb_pull_result_json); } catch { result = null; }
+    }
+    res.json({
+      requested_at: requested || null,
+      completed_at: completed || null,
+      pending,
+      result,
+    });
+  } catch (err) {
+    console.error('[GET /api/nmb-pull/state]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/nmb-pull/complete', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const now = new Date().toISOString();
+    const result = req.body || {};
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_completed_at', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_result_json', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [JSON.stringify(result)],
+    );
+    res.json({ ok: true, completed_at: now });
+  } catch (err) {
+    console.error('[POST /api/nmb-pull/complete]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 3-way reconciliation: compare BRAIN's payment_uploads vs QB's Payments
 // vs the sheet's processed rows for a given TxnDate. Groups by channel
 // suffix (N=nmbnew, B=bank, P=iphone_bank — detected from the trailing
