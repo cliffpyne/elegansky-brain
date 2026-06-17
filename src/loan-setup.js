@@ -189,14 +189,17 @@ export function mountLoanSetupApi(app, deps) {
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
               `FROM Customer WHERE ${conds.join(' AND ')} ORDER BY DisplayName MAXRESULTS 200`;
       } else {
-        // Default: top-level (Level=0) branches
-        const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
+        // Default: top-level branches. QBO doesn't accept Level in WHERE, so
+        // we pull a wide window and filter in code.
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE Active = true AND Level = ${lvl} ` +
-              `ORDER BY DisplayName MAXRESULTS 1000`;
+              `FROM Customer WHERE Active = true ORDER BY DisplayName MAXRESULTS 1000`;
       }
       const j = await qbQuery(sql);
-      const customers = j.QueryResponse?.Customer || [];
+      let customers = j.QueryResponse?.Customer || [];
+      if (!parentId && !search) {
+        const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
+        customers = customers.filter((c) => Number(c.Level ?? 0) === lvl);
+      }
       res.json({
         parent_id: parentId || null,
         search: search || null,
