@@ -12,7 +12,7 @@ import {
 import { Search, RefreshCw, ChevronRight, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import {
   getQbCustomerChildren, getQbItems, getQbNextInvoiceNo,
-  getQbCustomerLastInvoice, previewAddInvoices, executeAddInvoices,
+  getQbCustomerLastInvoice, previewAddInvoices, executeAddInvoices, recallByLog,
   type QbCustomer, type QbItem,
   type AddInvoicesPreview, type AddInvoicesResult,
 } from '@/lib/brain-api';
@@ -349,7 +349,31 @@ export function AddInvoicesPage() {
                   </ul>
                 </div>
               )}
-              <Button onClick={resetAll} variant="outline">+ Add to another customer</Button>
+              <div className="flex gap-2">
+                <Button onClick={resetAll} variant="outline">+ Add to another customer</Button>
+                {result.log_id && (
+                  <Button
+                    variant="destructive"
+                    onClick={async () => {
+                      if (!confirm(`Recall these ${result.invoices.count} invoices? This deletes them from QB. Customer stays.`)) return;
+                      setLoading('recall');
+                      try {
+                        const rec = await recallByLog(result.log_id!);
+                        if (rec.ok) {
+                          alert(`Recalled ${rec.invoices.deleted} invoices.`);
+                          resetAll();
+                        } else {
+                          alert(`Recall partial: ${rec.invoices.deleted}/${rec.invoices.planned} deleted, ${rec.invoices.failure_count} failed`);
+                        }
+                      } catch (e) { setError(String((e as Error).message)); }
+                      finally { setLoading(null); }
+                    }}
+                    disabled={loading === 'recall'}
+                  >
+                    {loading === 'recall' ? 'Recalling…' : 'Recall these invoices'}
+                  </Button>
+                )}
+              </div>
             </CardContent>
           </Card>
         )}

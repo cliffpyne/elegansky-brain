@@ -907,3 +907,26 @@ export async function executeAddInvoices(body: {
   if (!r.ok) throw new Error(`add-invoices/execute ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+export interface RecallByLogResult {
+  ok: boolean;
+  plan: {
+    log_id: string;
+    customer: { id: string; display_name: string };
+    invoices_to_delete: number;
+    estimate_to_delete: string | null;
+    deactivate_customer: boolean;
+  };
+  invoices: { planned: number; deleted: number; failure_count: number; failures: Array<{ id: string; error: string }> };
+  estimate: { id: string; deleted: boolean; error: string | null } | null;
+  customer: { id: string; deactivated: boolean; error: string | null };
+}
+export async function recallByLog(log_id: string): Promise<RecallByLogResult> {
+  const r = await authed(`/api/admin/loan/recall-by-log`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ log_id }),
+  });
+  if (!r.ok) throw new Error(`recall-by-log ${r.status}: ${await r.text()}`);
+  return r.json();
+}

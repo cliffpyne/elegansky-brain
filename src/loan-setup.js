@@ -935,7 +935,158 @@ export function mountLoanSetupApi(app, deps) {
     }
   });
 
-  // ── RECALL ────────────────────────────────────────────────────────────
+  // ── PRECISE RECALL BY LOG ID ──────────────────────────────────────────
+  // POST /api/admin/loan/recall-by-log
+  // Body: { log_id, dry_run? }
+  //
+  // Targets ONLY the entities that a specific wizard fire created (from
+  // loan_creation_log). Use this for add-invoices recall — it deletes
+  // ONLY the invoices added by that batch, not the customer's other
+  // invoices that were already in QB.
+  //   - Invoices: DELETE each id in log.invoice_qb_ids
+  //   - Estimate: DELETE if log has estimate_qb_id (new-loan logs only)
+  //   - Customer: deactivate if log estimate_qb_id present AND
+  //               customer_was_reused = false (i.e. wizard actually
+  //               created the customer this round)
+  app.post('/api/admin/loan/recall-by-log', requireSecretOrJwt, async (req, res) => {
+    try {
+      const logId = String(req.body?.log_id || '').trim();
+      if (!logId) return res.status(400).json({ error: 'log_id required' });
+      const dryRun = req.body?.dry_run === true;
+
+      const row = (await db().query(
+        `SELECT id, customer_qb_id, customer_display_name, customer_was_reused,
+                estimate_qb_id, invoice_qb_ids, invoice_count, status
+           FROM loan_creation_log WHERE id = $1`,
+        [logId],
+      )).rows[0];
+      if (!row) return res.status(404).json({ error: 'log row not found' });
+
+      const invoiceIds = row.invoice_qb_ids || [];
+      const shouldDeleteEstimate = !!row.estimate_qb_id;
+      const shouldDeactivateCustomer = !!row.estimate_qb_id && !row.customer_was_reused;
+
+      // Fetch SyncTokens for each invoice we plan to delete (and the estimate)
+      const tokens = new Map(); // qb_id → SyncToken
+      if (invoiceIds.length > 0) {
+        // Paginate via STARTPOSITION using SELECT WHERE Id IN (...)
+        // QBO allows up to ~1000 ids per IN; but to be safe, chunk by 200.
+        for (let i = 0; i < invoiceIds.length; i += 200) {
+          const chunk = invoiceIds.slice(i, i + 200);
+          const inList = chunk.map((id) => `'${escSql(id)}'`).join(',');
+          const j = await qbQuery(
+            `SELECT Id, SyncToken FROM Invoice WHERE Id IN (${inList}) MAXRESULTS 1000`,
+          );
+          for (const inv of (j.QueryResponse?.Invoice || [])) {
+            tokens.set(String(inv.Id), inv.SyncToken);
+          }
+        }
+      }
+      let estimateToken = null;
+      if (row.estimate_qb_id) {
+        const j = await qbQuery(`SELECT Id, SyncToken FROM Estimate WHERE Id = '${escSql(row.estimate_qb_id)}'`);
+        const est = j.QueryResponse?.Estimate?.[0];
+        if (est) estimateToken = est.SyncToken;
+      }
+      let customerToken = null;
+      if (shouldDeactivateCustomer) {
+        const j = await qbQuery(`SELECT Id, SyncToken, Active FROM Customer WHERE Id = '${escSql(row.customer_qb_id)}'`);
+        const cust = j.QueryResponse?.Customer?.[0];
+        if (cust) customerToken = cust.SyncToken;
+      }
+
+      const plan = {
+        log_id: row.id,
+        customer: { id: row.customer_qb_id, display_name: row.customer_display_name },
+        invoices_to_delete: invoiceIds.length,
+        invoices_with_token: tokens.size,
+        invoices_missing: invoiceIds.length - tokens.size,
+        estimate_to_delete: shouldDeleteEstimate ? row.estimate_qb_id : null,
+        deactivate_customer: shouldDeactivateCustomer,
+      };
+
+      if (dryRun) return res.json({ ok: true, dry_run: true, plan });
+
+      // Delete invoices in batches of 30, concurrency 4
+      const invoiceItems = invoiceIds
+        .map((id) => ({ entity: 'Invoice', id, syncToken: tokens.get(String(id)) }))
+        .filter((it) => it.syncToken != null);
+      const chunks = [];
+      for (let i = 0; i < invoiceItems.length; i += 30) chunks.push({ start: i, items: invoiceItems.slice(i, i + 30) });
+      const deletedInvoices = new Set();
+      const failures = [];
+      let cursor = 0;
+      const runOne = async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= chunks.length) return;
+          const { items } = chunks[idx];
+          try {
+            const results = await qbBatchDelete(items);
+            for (let k = 0; k < items.length; k++) {
+              if (results[k].ok) deletedInvoices.add(items[k].id);
+              else failures.push({ id: items[k].id, error: results[k].error });
+            }
+          } catch (err) {
+            const msg = String(err.message || err).slice(0, 300);
+            for (const it of items) failures.push({ id: it.id, error: 'batch failed: ' + msg });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: 4 }, () => runOne()));
+
+      // Estimate
+      let estimateDeleted = false;
+      let estimateError = null;
+      if (shouldDeleteEstimate && estimateToken != null) {
+        try {
+          const r = await qbBatchDelete([{ entity: 'Estimate', id: row.estimate_qb_id, syncToken: estimateToken }]);
+          if (r[0]?.ok) estimateDeleted = true;
+          else estimateError = r[0]?.error;
+        } catch (err) { estimateError = String(err.message || err).slice(0, 200); }
+      }
+
+      // Customer
+      let customerDeactivated = false;
+      let customerError = null;
+      if (shouldDeactivateCustomer && customerToken != null && failures.length === 0) {
+        try {
+          await qbPost('customer', {
+            Id: row.customer_qb_id, SyncToken: customerToken, sparse: true, Active: false,
+          });
+          customerDeactivated = true;
+        } catch (err) { customerError = String(err.message || err).slice(0, 300); }
+      }
+
+      // Mark the log row as recalled (cheap audit trail)
+      try {
+        await db().query(
+          `UPDATE loan_creation_log SET status = $2, error = $3 WHERE id = $1`,
+          [logId, 'recalled', failures.length ? JSON.stringify(failures).slice(0, 2000) : null],
+        );
+      } catch { /* nbd */ }
+
+      res.json({
+        ok: failures.length === 0,
+        plan,
+        invoices: {
+          planned: invoiceIds.length,
+          deleted: deletedInvoices.size,
+          failure_count: failures.length,
+          failures: failures.slice(0, 20),
+        },
+        estimate: shouldDeleteEstimate
+          ? { id: row.estimate_qb_id, deleted: estimateDeleted, error: estimateError }
+          : null,
+        customer: { id: row.customer_qb_id, deactivated: customerDeactivated, error: customerError },
+      });
+    } catch (err) {
+      console.error('[recall-by-log]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── BLAST RECALL BY CUSTOMER ──────────────────────────────────────────
   // POST /api/admin/new-loan/recall
   // Body: { customer_qb_id, dry_run?: true, deactivate_customer?: true }
   //
