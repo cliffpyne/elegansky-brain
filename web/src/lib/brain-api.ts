@@ -831,3 +831,79 @@ export async function executeNewLoan(body: {
   if (!r.ok) throw new Error(`new-loan/execute ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ── add-invoices to existing customer ────────────────────────────────────
+export interface AddInvoicesPreview {
+  ok: boolean;
+  mode: 'remaining_amount' | 'end_date';
+  customer: { id: string; display_name: string; full_name: string };
+  invoices: {
+    count: number;
+    daily_count: number;
+    remainder_amount: number;
+    first_doc_number: string;
+    last_doc_number: string;
+    first_date: string;
+    last_date: string;
+    per_invoice_amount: number;
+    total_amount: number;
+    sample: Array<{ doc_number: string; txn_date: string; amount: number }>;
+  };
+}
+export interface AddInvoicesResult {
+  ok: boolean;
+  status: 'success' | 'partial' | 'failed';
+  customer: { id: string; display_name: string };
+  invoices: {
+    count: number;
+    planned: number;
+    first_doc: string | null;
+    last_doc: string | null;
+    total_amount: number;
+    failures: Array<{ doc_number: string; txn_date: string; error: string }>;
+  };
+  log_id?: string;
+}
+export interface QbCustomerLastInvoice {
+  customer_id: string;
+  last: { invoice_qb_id: string; doc_number: string; txn_date: string } | null;
+  suggested_start_date?: string;
+}
+export async function getQbCustomerLastInvoice(customer_id: string): Promise<QbCustomerLastInvoice> {
+  const r = await authed(`/api/admin/qb-customer-last-invoice?customer_id=${encodeURIComponent(customer_id)}`);
+  if (!r.ok) throw new Error(`qb-customer-last-invoice ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function previewAddInvoices(body: {
+  customer_id: string;
+  start_date: string;
+  daily_amount: number;
+  product_service_id: string;
+  remaining_amount?: number;
+  end_date?: string;
+}): Promise<AddInvoicesPreview> {
+  const r = await authed(`/api/admin/add-invoices/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`add-invoices/preview ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function executeAddInvoices(body: {
+  customer_id: string;
+  start_date: string;
+  daily_amount: number;
+  product_service_id: string;
+  remaining_amount?: number;
+  end_date?: string;
+  idempotency_key: string;
+}): Promise<AddInvoicesResult> {
+  const r = await authed(`/api/admin/add-invoices/execute`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`add-invoices/execute ${r.status}: ${await r.text()}`);
+  return r.json();
+}
