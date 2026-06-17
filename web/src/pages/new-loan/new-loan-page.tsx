@@ -25,19 +25,19 @@ function uuid() {
 }
 
 interface Step {
-  parent: QbCustomer | null;     // Step 1: top-level branch
-  subBranch: QbCustomer | null;  // Step 2: sub-branch (e.g. AGRICOLA BODA)
-  officer: QbCustomer | null;    // Step 3: officer (e.g. Furaha)
+  parent: QbCustomer | null;        // Step 1: BRANCH (Level 0, e.g. KIJICHI BRANCH)
+  loanOfficer: QbCustomer | null;   // Step 2: LOAN OFFICER (Level 1, e.g. AGRICOLA BODA)
+  subOfficer: QbCustomer | null;    // Step 3: SUB LOAN OFFICER (Level 2, e.g. Furaha Rashidy Boda)
 }
 
 export function NewLoanPage() {
-  // Customer hierarchy state (3 levels)
-  const [step, setStep] = useState<Step>({ parent: null, subBranch: null, officer: null });
+  // Customer hierarchy state — 3 picker steps before the leaf borrower
+  const [step, setStep] = useState<Step>({ parent: null, loanOfficer: null, subOfficer: null });
 
   // Dropdown data
   const [branches, setBranches] = useState<QbCustomer[]>([]);
-  const [subBranches, setSubBranches] = useState<QbCustomer[]>([]);
-  const [officers, setOfficers] = useState<QbCustomer[]>([]);
+  const [loanOfficers, setLoanOfficers] = useState<QbCustomer[]>([]);
+  const [subOfficers, setSubOfficers] = useState<QbCustomer[]>([]);
   const [items, setItems] = useState<QbItem[]>([]);
 
   // Branch search (since top-level can be many)
@@ -78,25 +78,25 @@ export function NewLoanPage() {
     getQbNextInvoiceNo().then((r) => setNextInvoiceNo(r.next)).catch(() => {});
   }, [loadBranches]);
 
-  // Branch picked → load sub-branches
+  // Branch picked → load loan officers
   useEffect(() => {
-    if (!step.parent) { setSubBranches([]); return; }
-    setLoading('sub-branches');
+    if (!step.parent) { setLoanOfficers([]); return; }
+    setLoading('loan-officers');
     getQbCustomerChildren({ parent_id: step.parent.id })
-      .then((r) => setSubBranches(r.customers))
+      .then((r) => setLoanOfficers(r.customers))
       .catch((e) => setError(String((e as Error).message)))
       .finally(() => setLoading(null));
   }, [step.parent]);
 
-  // Sub-branch picked → load officers
+  // Loan officer picked → load sub loan officers
   useEffect(() => {
-    if (!step.subBranch) { setOfficers([]); return; }
-    setLoading('officers');
-    getQbCustomerChildren({ parent_id: step.subBranch.id })
-      .then((r) => setOfficers(r.customers))
+    if (!step.loanOfficer) { setSubOfficers([]); return; }
+    setLoading('sub-officers');
+    getQbCustomerChildren({ parent_id: step.loanOfficer.id })
+      .then((r) => setSubOfficers(r.customers))
       .catch((e) => setError(String((e as Error).message)))
       .finally(() => setLoading(null));
-  }, [step.subBranch]);
+  }, [step.loanOfficer]);
 
   // Days between
   const days = useMemo(() => {
@@ -113,17 +113,17 @@ export function NewLoanPage() {
   }, [days, dailyAmount]);
 
   const canPreview = !!(
-    step.officer && displayName.trim() &&
+    step.subOfficer && displayName.trim() &&
     Number(estimateAmount) > 0 && startDate && endDate &&
     Number(dailyAmount) > 0 && productId
   );
 
   const doPreview = async () => {
-    if (!step.officer) return;
+    if (!step.subOfficer) return;
     setLoading('preview'); setError(null); setPreview(null); setResult(null);
     try {
       const p = await previewNewLoan({
-        parent_id: step.officer.id,
+        parent_id: step.subOfficer.id,
         display_name: displayName.trim(),
         mobile: mobile.trim() || undefined,
         estimate_amount: Number(estimateAmount),
@@ -138,11 +138,11 @@ export function NewLoanPage() {
   };
 
   const doExecute = async () => {
-    if (!step.officer) return;
+    if (!step.subOfficer) return;
     setLoading('execute'); setError(null);
     try {
       const r = await executeNewLoan({
-        parent_id: step.officer.id,
+        parent_id: step.subOfficer.id,
         display_name: displayName.trim(),
         mobile: mobile.trim() || undefined,
         estimate_amount: Number(estimateAmount),
@@ -160,7 +160,7 @@ export function NewLoanPage() {
   };
 
   const resetAll = () => {
-    setStep({ parent: null, subBranch: null, officer: null });
+    setStep({ parent: null, loanOfficer: null, subOfficer: null });
     setDisplayName(''); setMobile(''); setEstimateAmount('');
     setStartDate(todayISO()); setEndDate(''); setDailyAmount('12500');
     setProductId(''); setMemo('');
@@ -196,11 +196,11 @@ export function NewLoanPage() {
           {/* ─── LEFT: Form ─────────────────────────────────── */}
           <Card>
             <CardHeader>
-              <CardTitle>1. Branch hierarchy</CardTitle>
+              <CardTitle>1. Branch + officer hierarchy</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <div>
-                <Label>Branch (Level 0)</Label>
+                <Label>Branch (Level 0) — e.g. KIJICHI BRANCH</Label>
                 <div className="flex gap-2 mt-1">
                   <Input
                     placeholder="search e.g. KIJICHI"
@@ -216,7 +216,7 @@ export function NewLoanPage() {
                   value={step.parent?.id || ''}
                   onValueChange={(v) => {
                     const c = branches.find((b) => b.id === v) || null;
-                    setStep({ parent: c, subBranch: null, officer: null });
+                    setStep({ parent: c, loanOfficer: null, subOfficer: null });
                   }}
                 >
                   <SelectTrigger className="mt-2"><SelectValue placeholder={`${branches.length} branches loaded`} /></SelectTrigger>
@@ -229,18 +229,18 @@ export function NewLoanPage() {
               </div>
 
               <div>
-                <Label>Sub-branch</Label>
+                <Label>Loan officer (Level 1) — e.g. AGRICOLA BODA</Label>
                 <Select
-                  value={step.subBranch?.id || ''}
+                  value={step.loanOfficer?.id || ''}
                   onValueChange={(v) => {
-                    const c = subBranches.find((b) => b.id === v) || null;
-                    setStep((s) => ({ ...s, subBranch: c, officer: null }));
+                    const c = loanOfficers.find((b) => b.id === v) || null;
+                    setStep((s) => ({ ...s, loanOfficer: c, subOfficer: null }));
                   }}
                   disabled={!step.parent}
                 >
-                  <SelectTrigger><SelectValue placeholder={step.parent ? `${subBranches.length} sub-branches` : 'pick branch first'} /></SelectTrigger>
+                  <SelectTrigger><SelectValue placeholder={step.parent ? `${loanOfficers.length} loan officers` : 'pick branch first'} /></SelectTrigger>
                   <SelectContent>
-                    {subBranches.map((b) => (
+                    {loanOfficers.map((b) => (
                       <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
                     ))}
                   </SelectContent>
@@ -248,27 +248,27 @@ export function NewLoanPage() {
               </div>
 
               <div>
-                <Label>Officer (parent of new customer)</Label>
+                <Label>Sub loan officer (Level 2) — e.g. Furaha Rashidy Boda</Label>
                 <Select
-                  value={step.officer?.id || ''}
+                  value={step.subOfficer?.id || ''}
                   onValueChange={(v) => {
-                    const c = officers.find((b) => b.id === v) || null;
-                    setStep((s) => ({ ...s, officer: c }));
+                    const c = subOfficers.find((b) => b.id === v) || null;
+                    setStep((s) => ({ ...s, subOfficer: c }));
                   }}
-                  disabled={!step.subBranch}
+                  disabled={!step.loanOfficer}
                 >
-                  <SelectTrigger><SelectValue placeholder={step.subBranch ? `${officers.length} officers` : 'pick sub-branch first'} /></SelectTrigger>
+                  <SelectTrigger><SelectValue placeholder={step.loanOfficer ? `${subOfficers.length} sub loan officers` : 'pick loan officer first'} /></SelectTrigger>
                   <SelectContent>
-                    {officers.map((b) => (
+                    {subOfficers.map((b) => (
                       <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
 
-              {step.officer && (
+              {step.subOfficer && (
                 <div className="text-sm text-muted-foreground">
-                  Path: {step.officer.full_name}
+                  New borrower will be created under: <b>{step.subOfficer.full_name}</b>
                 </div>
               )}
             </CardContent>
@@ -276,11 +276,11 @@ export function NewLoanPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle>2. Customer + loan</CardTitle>
+              <CardTitle>2. Borrower (Level 3) + loan</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <div>
-                <Label>DisplayName (free text — phone in name is fine)</Label>
+                <Label>Borrower DisplayName (free text — phone embedded is fine)</Label>
                 <Input
                   placeholder="e.g. 0713227668Cliford Denis MAsui"
                   value={displayName}
