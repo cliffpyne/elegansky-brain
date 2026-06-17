@@ -713,3 +713,121 @@ export async function getMegaReportSeries(params: { from: string; to: string; of
   if (!r.ok) throw new Error(`mega-report/series ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ── Loan-setup (new-loan wizard) ──────────────────────────────────────────
+export interface QbCustomer {
+  id: string;
+  name: string;
+  full_name: string;
+  level: number;
+  is_job: boolean;
+}
+export interface QbItem {
+  id: string;
+  name: string;
+  default_price: number;
+  type: string;
+}
+export interface NewLoanPreview {
+  ok: boolean;
+  customer: {
+    display_name: string;
+    parent_id: string;
+    existing_qb_id: string | null;
+    will_be_reused: boolean;
+  };
+  estimate: {
+    amount: number;
+    start_date: string;
+    end_date: string;
+    product_service_id: string;
+  };
+  invoices: {
+    count: number;
+    first_doc_number: string;
+    last_doc_number: string;
+    first_date: string;
+    last_date: string;
+    per_invoice_amount: number;
+    total_amount: number;
+    sample: Array<{ doc_number: string; txn_date: string; amount: number }>;
+  };
+  warning: string | null;
+}
+export interface NewLoanExecuteResult {
+  ok: boolean;
+  status: 'success' | 'partial' | 'failed';
+  customer: { id: string; display_name: string; was_reused: boolean };
+  estimate: { id: string; amount: number };
+  invoices: {
+    count: number;
+    planned: number;
+    first_doc: string | null;
+    last_doc: string | null;
+    total_amount: number;
+    failures: Array<{ doc_number: string; txn_date: string; error: string }>;
+  };
+  log_id: string;
+}
+
+export async function getQbCustomerChildren(params: {
+  parent_id?: string;
+  search?: string;
+  level?: number;
+}): Promise<{ customers: QbCustomer[] }> {
+  const q = new URLSearchParams();
+  if (params.parent_id) q.set('parent_id', params.parent_id);
+  if (params.search) q.set('search', params.search);
+  if (params.level !== undefined) q.set('level', String(params.level));
+  const r = await authed(`/api/admin/qb-customer-children?${q.toString()}`);
+  if (!r.ok) throw new Error(`qb-customer-children ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function getQbItems(): Promise<{ items: QbItem[] }> {
+  const r = await authed(`/api/admin/qb-items`);
+  if (!r.ok) throw new Error(`qb-items ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function getQbNextInvoiceNo(): Promise<{ next: number; max_existing: number }> {
+  const r = await authed(`/api/admin/qb-next-invoice-no`);
+  if (!r.ok) throw new Error(`qb-next-invoice-no ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function previewNewLoan(body: {
+  parent_id: string;
+  display_name: string;
+  mobile?: string;
+  estimate_amount: number;
+  start_date: string;
+  end_date: string;
+  daily_amount: number;
+  product_service_id: string;
+}): Promise<NewLoanPreview> {
+  const r = await authed(`/api/admin/new-loan/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`new-loan/preview ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+export async function executeNewLoan(body: {
+  parent_id: string;
+  display_name: string;
+  mobile?: string;
+  estimate_amount: number;
+  start_date: string;
+  end_date: string;
+  daily_amount: number;
+  product_service_id: string;
+  memo?: string;
+  idempotency_key: string;
+}): Promise<NewLoanExecuteResult> {
+  const r = await authed(`/api/admin/new-loan/execute`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`new-loan/execute ${r.status}: ${await r.text()}`);
+  return r.json();
+}

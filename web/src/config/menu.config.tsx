@@ -43,6 +43,7 @@ export const MENU_SIDEBAR: MenuConfig = [
     children: [
       { title: 'Arrears', path: '/arrears' },
       { title: 'Payment batches', path: '/payment-batches' },
+      { title: 'New loan', path: '/new-loan' },
       { title: 'Invoices', path: '/coming-soon', disabled: true },
       { title: 'Credit memos', path: '/coming-soon', disabled: true },
     ],
