@@ -17,6 +17,7 @@ import { initQbClient } from './qb-client.js';
 import { mountAgentApi } from './agent/api.js';
 import { mountOfficerReportsApi } from './officer-reports.js';
 import { mountMegaReportApi } from './mega-report.js';
+import { mountLoanSetupApi } from './loan-setup.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 import { mountQbMirrorApi } from './qb-mirror-api.js';
@@ -604,6 +605,7 @@ mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey })
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
 mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
+mountLoanSetupApi(app, { qbPost, requireSecretOrJwt });
 mountQbMirrorApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
