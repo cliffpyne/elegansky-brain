@@ -14,6 +14,7 @@ import { AgentSessionDetailPage } from '@/pages/agent/agent-session-detail-page'
 import { OfficerReportsPage } from '@/pages/officer-reports/officer-reports-page';
 import { NewLoanPage } from '@/pages/new-loan/new-loan-page';
 import { AddInvoicesPage } from '@/pages/add-invoices/add-invoices-page';
+import { LoanHistoryPage } from '@/pages/loan-history/loan-history-page';
 import { AccountBalancePage } from '@/pages/everything-report/account-balance-page';
 import { SheetTotalsPage } from '@/pages/everything-report/sheet-totals-page';
 import { OpenInvoicesPage } from '@/pages/everything-report/open-invoices-page';
@@ -47,6 +48,7 @@ export function AppRoutingSetup() {
           <Route path="/officer-reports" element={<OfficerReportsPage />} />
           <Route path="/new-loan" element={<NewLoanPage />} />
           <Route path="/add-invoices" element={<AddInvoicesPage />} />
+          <Route path="/loan-history" element={<LoanHistoryPage />} />
           <Route path="/everything-report" element={<Navigate to="/everything-report/account-balance" replace />} />
           <Route path="/everything-report/account-balance" element={<AccountBalancePage />} />
           <Route path="/everything-report/sheet-totals" element={<SheetTotalsPage />} />

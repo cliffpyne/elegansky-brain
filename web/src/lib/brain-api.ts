@@ -930,3 +930,28 @@ export async function recallByLog(log_id: string): Promise<RecallByLogResult> {
   if (!r.ok) throw new Error(`recall-by-log ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ── Loan creation log (history of new-loan + add-invoices fires) ─────────
+export interface LoanLogRow {
+  id: string;
+  idempotency_key: string | null;
+  created_at: string;
+  parent_qb_id: string | null;
+  customer_qb_id: string | null;
+  customer_display_name: string | null;
+  customer_was_reused: boolean;
+  estimate_qb_id: string | null;
+  estimate_amount: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  daily_amount: string | null;
+  invoice_count: number | null;
+  total_amount: string | null;
+  status: string | null;
+  error: string | null;
+}
+export async function getLoanLog(limit = 100): Promise<{ rows: LoanLogRow[] }> {
+  const r = await authed(`/api/admin/new-loan/log?limit=${limit}`);
+  if (!r.ok) throw new Error(`new-loan/log ${r.status}: ${await r.text()}`);
+  return r.json();
+}

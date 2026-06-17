@@ -45,6 +45,7 @@ export const MENU_SIDEBAR: MenuConfig = [
       { title: 'Payment batches', path: '/payment-batches' },
       { title: 'New loan', path: '/new-loan' },
       { title: 'Add invoices', path: '/add-invoices' },
+      { title: 'Loan history', path: '/loan-history' },
       { title: 'Invoices', path: '/coming-soon', disabled: true },
       { title: 'Credit memos', path: '/coming-soon', disabled: true },
     ],
