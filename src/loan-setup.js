@@ -198,10 +198,16 @@ export function mountLoanSetupApi(app, deps) {
           return res.json({ parent_id: parentId, customers: [], error: 'parent not found' });
         }
         parentFqn = parent.FullyQualifiedName;
-        // Step 2: all descendants under that FQN — we'll filter to direct children in code
+        // Step 2: direct children only.
+        //   FQN LIKE 'parent:%'      → all descendants
+        //   AND FQN NOT LIKE 'parent:%:%' → exclude depths beyond direct
+        // Without the NOT-LIKE narrowing the 1000-row window fills up
+        // with deep leaves (each branch has thousands of borrowers) and
+        // the direct loan officers don't make it into the window.
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
               `FROM Customer WHERE Active = true ` +
               `AND FullyQualifiedName LIKE '${escSql(parentFqn)}:%' ` +
+              `AND FullyQualifiedName NOT LIKE '${escSql(parentFqn)}:%:%' ` +
               `ORDER BY DisplayName MAXRESULTS 1000`;
       } else if (search) {
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
