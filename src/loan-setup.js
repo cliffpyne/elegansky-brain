@@ -187,7 +187,8 @@ export function mountLoanSetupApi(app, deps) {
       const levelFilter = req.query.level !== undefined ? Number(req.query.level) : null;
 
       let parentFqn = null;
-      let sql;
+      let customers = [];
+
       if (parentId) {
         // Step 1: look up the parent FQN
         const parentRes = await qbQuery(
@@ -198,42 +199,50 @@ export function mountLoanSetupApi(app, deps) {
           return res.json({ parent_id: parentId, customers: [], error: 'parent not found' });
         }
         parentFqn = parent.FullyQualifiedName;
-        // Step 2: direct children only.
-        //   FQN LIKE 'parent:%'      → all descendants
-        //   AND FQN NOT LIKE 'parent:%:%' → exclude depths beyond direct
-        // Without the NOT-LIKE narrowing the 1000-row window fills up
-        // with deep leaves (each branch has thousands of borrowers) and
-        // the direct loan officers don't make it into the window.
-        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE Active = true ` +
-              `AND FullyQualifiedName LIKE '${escSql(parentFqn)}:%' ` +
-              `AND FullyQualifiedName NOT LIKE '${escSql(parentFqn)}:%:%' ` +
-              `ORDER BY DisplayName MAXRESULTS 1000`;
-      } else if (search) {
-        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE Active = true ` +
-              `AND DisplayName LIKE '%${escSql(search)}%' ` +
-              `ORDER BY DisplayName MAXRESULTS 200`;
-      } else {
-        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE Active = true ORDER BY DisplayName MAXRESULTS 1000`;
-      }
-      const j = await qbQuery(sql);
-      let customers = j.QueryResponse?.Customer || [];
-
-      // Filter to DIRECT children only (one colon-level deeper than parent)
-      if (parentId && parentFqn) {
+        // Step 2: paginate through all descendants under that FQN, filter to
+        // direct children in code. QBO doesn't accept NOT LIKE reliably here,
+        // so we fetch pages of 1000 and stop when we've seen all matches.
         const targetDepth = parentFqn.split(':').length + 1;
-        customers = customers.filter((c) =>
-          (c.FullyQualifiedName || '').split(':').length === targetDepth,
+        const PAGE = 1000;
+        const MAX_PAGES = 50; // 50k descendants ceiling; covers a full branch
+        const seen = new Map(); // dedupe direct children by id
+        for (let p = 0; p < MAX_PAGES; p++) {
+          const start = p * PAGE + 1;
+          const sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+                      `FROM Customer WHERE Active = true ` +
+                      `AND FullyQualifiedName LIKE '${escSql(parentFqn)}:%' ` +
+                      `ORDER BY FullyQualifiedName STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
+          const pageRes = await qbQuery(sql);
+          const items = pageRes.QueryResponse?.Customer || [];
+          for (const c of items) {
+            if ((c.FullyQualifiedName || '').split(':').length === targetDepth) {
+              if (!seen.has(c.Id)) seen.set(c.Id, c);
+            }
+          }
+          if (items.length < PAGE) break;
+        }
+        customers = Array.from(seen.values()).sort((a, b) =>
+          (a.DisplayName || '').localeCompare(b.DisplayName || ''),
         );
-      }
-      // Default top-level: Level=0 in code (Level not WHERE-able)
-      if (!parentId && !search) {
-        const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
-        customers = customers.filter((c) => Number(c.Level ?? 0) === lvl);
-      } else if (search && levelFilter !== null && !isNaN(levelFilter)) {
-        customers = customers.filter((c) => Number(c.Level ?? 0) === levelFilter);
+      } else {
+        let sql;
+        if (search) {
+          sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+                `FROM Customer WHERE Active = true ` +
+                `AND DisplayName LIKE '%${escSql(search)}%' ` +
+                `ORDER BY DisplayName MAXRESULTS 200`;
+        } else {
+          sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+                `FROM Customer WHERE Active = true ORDER BY DisplayName MAXRESULTS 1000`;
+        }
+        const j = await qbQuery(sql);
+        customers = j.QueryResponse?.Customer || [];
+        if (!search) {
+          const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
+          customers = customers.filter((c) => Number(c.Level ?? 0) === lvl);
+        } else if (levelFilter !== null && !isNaN(levelFilter)) {
+          customers = customers.filter((c) => Number(c.Level ?? 0) === levelFilter);
+        }
       }
 
       res.json({
