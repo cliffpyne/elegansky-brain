@@ -35,8 +35,8 @@ export function AddInvoicesPage() {
   const [items, setItems] = useState<QbItem[]>([]);
   const [productId, setProductId] = useState<string>('');
 
-  // Inputs
-  const [remainingAmount, setRemainingAmount] = useState<string>('');
+  // Inputs (per Frank 2026-06-17: human types days + amount, system fills the rest)
+  const [numDays, setNumDays] = useState<string>('');
   const [dailyAmount, setDailyAmount] = useState<string>('12500');
   const [startDate, setStartDate] = useState<string>(todayISO());
 
@@ -78,18 +78,12 @@ export function AddInvoicesPage() {
       .catch(() => { setLastInvoice(null); });
   }, [selectedCustomer]);
 
-  // Math preview (matches backend)
-  const dailyCount = useMemo(() => {
-    const rem = Number(remainingAmount) || 0;
-    const dai = Number(dailyAmount) || 0;
-    return rem > 0 && dai > 0 ? Math.floor(rem / dai) : 0;
-  }, [remainingAmount, dailyAmount]);
-  const remainder = useMemo(() => {
-    const rem = Number(remainingAmount) || 0;
-    const dai = Number(dailyAmount) || 0;
-    return rem > 0 && dai > 0 ? rem - dailyCount * dai : 0;
-  }, [remainingAmount, dailyAmount, dailyCount]);
-  const totalInvoiceCount = dailyCount + (remainder > 0 ? 1 : 0);
+  // Math (days × daily = total — direct, no remainder needed)
+  const totalInvoiceCount = useMemo(() => Math.max(0, Math.floor(Number(numDays) || 0)), [numDays]);
+  const totalAmount = useMemo(
+    () => totalInvoiceCount * (Number(dailyAmount) || 0),
+    [totalInvoiceCount, dailyAmount],
+  );
   const computedEndDate = useMemo(() => {
     if (!startDate || totalInvoiceCount <= 0) return '';
     const d = new Date(startDate + 'T00:00:00Z');
@@ -98,7 +92,7 @@ export function AddInvoicesPage() {
   }, [startDate, totalInvoiceCount]);
 
   const canPreview = !!(
-    selectedCustomer && productId && Number(remainingAmount) > 0 &&
+    selectedCustomer && productId && totalInvoiceCount > 0 &&
     Number(dailyAmount) > 0 && startDate
   );
 
@@ -111,7 +105,7 @@ export function AddInvoicesPage() {
         start_date: startDate,
         daily_amount: Number(dailyAmount),
         product_service_id: productId,
-        remaining_amount: Number(remainingAmount),
+        end_date: computedEndDate,
       });
       setPreview(p);
     } catch (e) { setError(String((e as Error).message)); }
@@ -127,7 +121,7 @@ export function AddInvoicesPage() {
         start_date: startDate,
         daily_amount: Number(dailyAmount),
         product_service_id: productId,
-        remaining_amount: Number(remainingAmount),
+        end_date: computedEndDate,
         idempotency_key: idemKey,
       });
       setResult(r);
@@ -139,7 +133,7 @@ export function AddInvoicesPage() {
   const resetAll = () => {
     setSearchTerm(''); setSearchResults([]); setSelectedCustomer(null);
     setLastInvoice(null); setSuggestedStart('');
-    setRemainingAmount(''); setDailyAmount('12500'); setStartDate(todayISO()); setProductId('');
+    setNumDays(''); setDailyAmount('12500'); setStartDate(todayISO()); setProductId('');
     setPreview(null); setResult(null); setError(null);
     setIdemKey(uuid());
     getQbNextInvoiceNo().then((r) => setNextInvoiceNo(r.next)).catch(() => {});
@@ -244,11 +238,11 @@ export function AddInvoicesPage() {
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <Label>Remaining amount (TZS)</Label>
-                  <Input type="number" value={remainingAmount} onChange={(e) => setRemainingAmount(e.target.value)} placeholder="e.g. 103500" />
+                  <Label>Number of days</Label>
+                  <Input type="number" value={numDays} onChange={(e) => setNumDays(e.target.value)} placeholder="e.g. 180" />
                 </div>
                 <div>
-                  <Label>Daily invoice (TZS)</Label>
+                  <Label>Amount per invoice (TZS)</Label>
                   <Input type="number" value={dailyAmount} onChange={(e) => setDailyAmount(e.target.value)} placeholder="12500" />
                 </div>
               </div>
@@ -265,16 +259,7 @@ export function AddInvoicesPage() {
 
               {totalInvoiceCount > 0 && (
                 <div className="text-sm text-muted-foreground">
-                  {remainder > 0 ? (
-                    <>
-                      <b>{fmt(totalInvoiceCount)}</b> invoices = {fmt(dailyCount)} × {fmt(Number(dailyAmount))} + 1 × <b>{fmt(remainder)}</b> remainder
-                      = <b>{fmt(Number(remainingAmount))} TZS</b>
-                    </>
-                  ) : (
-                    <>
-                      <b>{fmt(totalInvoiceCount)}</b> invoices × {fmt(Number(dailyAmount))} TZS = <b>{fmt(Number(remainingAmount))} TZS</b>
-                    </>
-                  )}
+                  <b>{fmt(totalInvoiceCount)}</b> invoices × {fmt(Number(dailyAmount))} TZS = <b>{fmt(totalAmount)} TZS</b>
                 </div>
               )}
 
