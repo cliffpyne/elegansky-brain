@@ -170,38 +170,69 @@ export function mountLoanSetupApi(app, deps) {
   // ── routes ─────────────────────────────────────────────────────────────
 
   // GET /api/admin/qb-customer-children?parent_id=<id>&search=<text>&level=<n>
-  //   - parent_id given → children of that parent
+  //   - parent_id given → direct children of that parent
   //   - search given     → fuzzy match (LIKE) on DisplayName, optional level filter
   //   - neither          → defaults to Level=0 (top-level branches)
+  //
+  // QBO query limitations (verified the hard way 2026-06-17):
+  //   - WHERE ParentRef = 'X'  → "property 'ParentRef' is not queryable"
+  //   - WHERE Level = N        → "property 'Level' is not queryable"
+  //   - WHERE FullyQualifiedName LIKE 'X:%' → works
+  //   - So children lookup goes: parent_id → parent FQN → LIKE 'FQN:%' →
+  //     filter in code for direct children (one colon-level deeper).
   app.get('/api/admin/qb-customer-children', requireSecretOrJwt, async (req, res) => {
     try {
       const parentId = String(req.query.parent_id || '').trim();
       const search = String(req.query.search || '').trim();
       const levelFilter = req.query.level !== undefined ? Number(req.query.level) : null;
+
+      let parentFqn = null;
       let sql;
       if (parentId) {
+        // Step 1: look up the parent FQN
+        const parentRes = await qbQuery(
+          `SELECT FullyQualifiedName, Level FROM Customer WHERE Id = '${escSql(parentId)}'`,
+        );
+        const parent = parentRes.QueryResponse?.Customer?.[0];
+        if (!parent) {
+          return res.json({ parent_id: parentId, customers: [], error: 'parent not found' });
+        }
+        parentFqn = parent.FullyQualifiedName;
+        // Step 2: all descendants under that FQN — we'll filter to direct children in code
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE Active = true AND ParentRef = '${escSql(parentId)}' ` +
+              `FROM Customer WHERE Active = true ` +
+              `AND FullyQualifiedName LIKE '${escSql(parentFqn)}:%' ` +
               `ORDER BY DisplayName MAXRESULTS 1000`;
       } else if (search) {
-        const conds = [`Active = true`, `DisplayName LIKE '%${escSql(search)}%'`];
-        if (levelFilter !== null && !isNaN(levelFilter)) conds.push(`Level = ${levelFilter}`);
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
-              `FROM Customer WHERE ${conds.join(' AND ')} ORDER BY DisplayName MAXRESULTS 200`;
+              `FROM Customer WHERE Active = true ` +
+              `AND DisplayName LIKE '%${escSql(search)}%' ` +
+              `ORDER BY DisplayName MAXRESULTS 200`;
       } else {
-        // Default: top-level branches. QBO doesn't accept Level in WHERE, so
-        // we pull a wide window and filter in code.
         sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
               `FROM Customer WHERE Active = true ORDER BY DisplayName MAXRESULTS 1000`;
       }
       const j = await qbQuery(sql);
       let customers = j.QueryResponse?.Customer || [];
+
+      // Filter to DIRECT children only (one colon-level deeper than parent)
+      if (parentId && parentFqn) {
+        const targetDepth = parentFqn.split(':').length + 1;
+        customers = customers.filter((c) =>
+          (c.FullyQualifiedName || '').split(':').length === targetDepth,
+        );
+      }
+      // Default top-level: Level=0 in code (Level not WHERE-able)
       if (!parentId && !search) {
         const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
         customers = customers.filter((c) => Number(c.Level ?? 0) === lvl);
+      } else if (search && levelFilter !== null && !isNaN(levelFilter)) {
+        customers = customers.filter((c) => Number(c.Level ?? 0) === levelFilter);
       }
+
       res.json({
         parent_id: parentId || null,
+        parent_fqn: parentFqn,
         search: search || null,
         level: levelFilter,
         customers: customers.map((c) => ({
