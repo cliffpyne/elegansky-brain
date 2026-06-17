@@ -169,30 +169,43 @@ export function mountLoanSetupApi(app, deps) {
 
   // ── routes ─────────────────────────────────────────────────────────────
 
-  // GET /api/admin/qb-customer-children?parent_id=<id>
-  //   parent_id omitted/empty → top-level customers (no ParentRef)
-  //   else → children of that parent
+  // GET /api/admin/qb-customer-children?parent_id=<id>&search=<text>&level=<n>
+  //   - parent_id given → children of that parent
+  //   - search given     → fuzzy match (LIKE) on DisplayName, optional level filter
+  //   - neither          → defaults to Level=0 (top-level branches)
   app.get('/api/admin/qb-customer-children', requireSecretOrJwt, async (req, res) => {
     try {
       const parentId = String(req.query.parent_id || '').trim();
+      const search = String(req.query.search || '').trim();
+      const levelFilter = req.query.level !== undefined ? Number(req.query.level) : null;
       let sql;
       if (parentId) {
-        sql = `SELECT Id, DisplayName, Active, Job FROM Customer ` +
-              `WHERE Active = true AND ParentRef = '${escSql(parentId)}' ` +
+        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+              `FROM Customer WHERE Active = true AND ParentRef = '${escSql(parentId)}' ` +
               `ORDER BY DisplayName MAXRESULTS 1000`;
+      } else if (search) {
+        const conds = [`Active = true`, `DisplayName LIKE '%${escSql(search)}%'`];
+        if (levelFilter !== null && !isNaN(levelFilter)) conds.push(`Level = ${levelFilter}`);
+        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+              `FROM Customer WHERE ${conds.join(' AND ')} ORDER BY DisplayName MAXRESULTS 200`;
       } else {
-        // QB doesn't expose ParentRef IS NULL filter cleanly; query and filter.
-        sql = `SELECT Id, DisplayName, Active, Job, ParentRef FROM Customer ` +
-              `WHERE Active = true ORDER BY DisplayName MAXRESULTS 1000`;
+        // Default: top-level (Level=0) branches
+        const lvl = levelFilter !== null && !isNaN(levelFilter) ? levelFilter : 0;
+        sql = `SELECT Id, DisplayName, FullyQualifiedName, Active, Job, Level ` +
+              `FROM Customer WHERE Active = true AND Level = ${lvl} ` +
+              `ORDER BY DisplayName MAXRESULTS 1000`;
       }
       const j = await qbQuery(sql);
-      let customers = j.QueryResponse?.Customer || [];
-      if (!parentId) customers = customers.filter((c) => !c.ParentRef);
+      const customers = j.QueryResponse?.Customer || [];
       res.json({
         parent_id: parentId || null,
+        search: search || null,
+        level: levelFilter,
         customers: customers.map((c) => ({
           id: c.Id,
           name: c.DisplayName,
+          full_name: c.FullyQualifiedName || c.DisplayName,
+          level: Number(c.Level ?? 0),
           is_job: !!c.Job,
         })),
       });
