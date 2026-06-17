@@ -98,14 +98,29 @@ export function NewLoanPage() {
       .finally(() => setLoading(null));
   }, [step.loanOfficer]);
 
-  // Days between
+  // Days driven by estimate ÷ daily (Frank's spec: all invoices stay at the
+  // daily amount; end date is whatever it takes to hit the estimate, even
+  // if > 366 days). End date input becomes derived, not user-typed.
   const days = useMemo(() => {
-    if (!startDate || !endDate) return 0;
-    const s = new Date(startDate + 'T00:00:00Z').getTime();
-    const e = new Date(endDate + 'T00:00:00Z').getTime();
-    if (isNaN(s) || isNaN(e) || e < s) return 0;
-    return Math.round((e - s) / 86400000) + 1;
-  }, [startDate, endDate]);
+    const est = Number(estimateAmount) || 0;
+    const dai = Number(dailyAmount) || 0;
+    if (est <= 0 || dai <= 0) return 0;
+    return Math.ceil(est / dai);
+  }, [estimateAmount, dailyAmount]);
+
+  // Derived end_date from start + days.
+  const computedEndDate = useMemo(() => {
+    if (!startDate || days <= 0) return '';
+    const d = new Date(startDate + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + days - 1);
+    return d.toISOString().slice(0, 10);
+  }, [startDate, days]);
+
+  // Keep endDate state in sync with computed value so the preview/execute
+  // requests use it without an extra prop.
+  useEffect(() => {
+    if (computedEndDate && computedEndDate !== endDate) setEndDate(computedEndDate);
+  }, [computedEndDate]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const totalInvoices = useMemo(() => {
     const d = Number(dailyAmount) || 0;
@@ -323,15 +338,15 @@ export function NewLoanPage() {
                   <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
                 </div>
                 <div>
-                  <Label>End date</Label>
-                  <Input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+                  <Label>End date (auto)</Label>
+                  <Input type="date" value={endDate} readOnly disabled />
                 </div>
               </div>
               {days > 0 && (
                 <div className="text-sm text-muted-foreground">
-                  {days} calendar days → {fmt(days)} invoices × {fmt(Number(dailyAmount) || 0)} = <b>{fmt(totalInvoices)} TZS</b>
-                  {Number(estimateAmount) !== totalInvoices && Number(estimateAmount) > 0 && (
-                    <span className="text-amber-600"> (≠ estimate {fmt(Number(estimateAmount))})</span>
+                  {fmt(days)} invoices × {fmt(Number(dailyAmount) || 0)} TZS = <b>{fmt(totalInvoices)} TZS</b>
+                  {Number(estimateAmount) > 0 && totalInvoices !== Number(estimateAmount) && (
+                    <span className="text-amber-600"> (estimate {fmt(Number(estimateAmount))} differs by {fmt(totalInvoices - Number(estimateAmount))})</span>
                   )}
                 </div>
               )}
