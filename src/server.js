@@ -282,6 +282,78 @@ async function qbCreatePayment({ customerId, invoiceQbId, amount, memo, txnDate 
  * items: [{ customerId, invoiceQbId, amount, memo }]
  * returns: aligned array of [{ ok, id, response, error }]
  */
+/**
+ * Create many Invoices in a single QB Batch API call (up to 30 per batch).
+ * items: [{ customerId, productServiceId, amount, txnDate, dueDate?, docNumber? }]
+ * returns: aligned array of [{ ok, id, response, error }]
+ *
+ * Use case: new-loan wizard pushing 397 daily invoices for a single
+ * borrower. Serial qbCreateInvoice was ~3 sec/row → 20 min for one loan;
+ * batch-30 with 4 concurrent batches finishes the same set in <30 sec.
+ */
+async function qbBatchCreateInvoices(items) {
+  if (items.length === 0) return [];
+  if (items.length > 30) throw new Error(`qbBatchCreateInvoices: ${items.length} > 30 (QB max)`);
+  const body = {
+    BatchItemRequest: items.map((it, ix) => ({
+      bId: `i${ix}`,
+      operation: 'create',
+      Invoice: {
+        CustomerRef: { value: String(it.customerId) },
+        DocNumber: it.docNumber != null ? String(it.docNumber) : undefined,
+        TxnDate: it.txnDate,
+        DueDate: it.dueDate || it.txnDate,
+        Line: [{
+          Amount: Number(it.amount),
+          DetailType: 'SalesItemLineDetail',
+          SalesItemLineDetail: {
+            ItemRef: { value: String(it.productServiceId) },
+            UnitPrice: Number(it.amount),
+            Qty: 1,
+          },
+        }],
+      },
+    })),
+  };
+  const json = await qbPost('batch', body);
+  const byBId = {};
+  for (const x of json.BatchItemResponse || []) byBId[x.bId] = x;
+  return items.map((_, ix) => {
+    const resp = byBId[`i${ix}`];
+    if (resp?.Invoice?.Id) return { ok: true, id: resp.Invoice.Id, response: resp.Invoice, error: null };
+    const fault = resp?.Fault;
+    const errMsg = fault?.Error?.[0]?.Detail || fault?.Error?.[0]?.Message || (resp ? JSON.stringify(resp).slice(0, 200) : 'no response');
+    return { ok: false, id: null, response: null, error: errMsg };
+  });
+}
+
+/**
+ * Batch-delete entities (Invoice/Estimate/Customer) up to 30 per call.
+ * items: [{ entity: 'Invoice'|'Estimate'|'Customer', id, syncToken }]
+ * returns: aligned array of [{ ok, error }]
+ */
+async function qbBatchDelete(items) {
+  if (items.length === 0) return [];
+  if (items.length > 30) throw new Error(`qbBatchDelete: ${items.length} > 30 (QB max)`);
+  const body = {
+    BatchItemRequest: items.map((it, ix) => ({
+      bId: `d${ix}`,
+      operation: 'delete',
+      [it.entity]: { Id: String(it.id), SyncToken: String(it.syncToken ?? '0') },
+    })),
+  };
+  const json = await qbPost('batch', body);
+  const byBId = {};
+  for (const x of json.BatchItemResponse || []) byBId[x.bId] = x;
+  return items.map((_, ix) => {
+    const resp = byBId[`d${ix}`];
+    if (resp && !resp.Fault) return { ok: true, error: null };
+    const fault = resp?.Fault;
+    const errMsg = fault?.Error?.[0]?.Detail || fault?.Error?.[0]?.Message || (resp ? JSON.stringify(resp).slice(0, 200) : 'no response');
+    return { ok: false, error: errMsg };
+  });
+}
+
 async function qbBatchCreatePayments(items) {
   if (items.length === 0) return [];
   if (items.length > 30) throw new Error(`qbBatchCreatePayments: ${items.length} > 30 (QB max)`);
@@ -605,7 +677,7 @@ mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey })
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
 mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
-mountLoanSetupApi(app, { qbPost, requireSecretOrJwt });
+mountLoanSetupApi(app, { qbPost, qbBatchCreateInvoices, qbBatchDelete, requireSecretOrJwt });
 mountQbMirrorApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React

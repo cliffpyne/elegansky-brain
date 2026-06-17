@@ -67,7 +67,7 @@ function escSql(s) {
 }
 
 export function mountLoanSetupApi(app, deps) {
-  const { qbPost, requireSecretOrJwt } = deps;
+  const { qbPost, qbBatchCreateInvoices, qbBatchDelete, requireSecretOrJwt } = deps;
 
   // Best-effort table create on mount.
   ensureLoanCreationLogTable().catch((e) =>
@@ -421,43 +421,104 @@ export function mountLoanSetupApi(app, deps) {
       });
       const estimateId = String(estimate.Id);
 
-      // 3. Reserve invoice numbers + create one-by-one (sequential).
-      //    Collision-proof: on DocNumber conflict, advance + retry.
+      // 3. Build the full plan, push in batches of 30 with concurrency.
+      //    Was: serial qbCreateInvoice → ~3s/row → 20 min for 397 invoices.
+      //    Now: batch-30 × 4 concurrent → finishes 397 in ~20 sec.
+      //    Collision handling: a single item failing with "duplicate
+      //    DocNumber" gets retried serially with bump-and-try at the end.
       let nextDoc = (await getMaxInvoiceDocNumber()) + 1;
-      const invoiceIds = [];
-      const docNumbers = [];
-      const failures = [];
+      const plan = [];
       for (let i = 0; i < days; i++) {
-        const txnDate = addDaysISO(b.start_date, i);
+        plan.push({
+          customerId,
+          productServiceId: String(b.product_service_id),
+          amount: dailyAmount,
+          txnDate: addDaysISO(b.start_date, i),
+          docNumber: String(nextDoc + i),
+        });
+      }
+      nextDoc += days; // reserve the contiguous range
+
+      const invoiceIds = new Array(plan.length);
+      const docNumbers = new Array(plan.length);
+      const collisions = [];
+      const failures = [];
+
+      // Chunk into batches of 30
+      const chunks = [];
+      for (let i = 0; i < plan.length; i += 30) {
+        chunks.push({ start: i, items: plan.slice(i, i + 30) });
+      }
+      const CONCURRENCY = 4;
+      let cursor = 0;
+      const runOne = async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= chunks.length) return;
+          const { start, items } = chunks[idx];
+          try {
+            const results = await qbBatchCreateInvoices(items);
+            for (let k = 0; k < items.length; k++) {
+              const r = results[k];
+              if (r.ok) {
+                invoiceIds[start + k] = r.id;
+                docNumbers[start + k] = items[k].docNumber;
+              } else if (/duplicate|6240|already exists/i.test(r.error || '')) {
+                collisions.push({ planIdx: start + k, item: items[k] });
+              } else {
+                failures.push({ doc_number: items[k].docNumber, txn_date: items[k].txnDate, error: String(r.error || '').slice(0, 300) });
+              }
+            }
+          } catch (err) {
+            // Whole-batch failure (e.g., network) — record per-item
+            const msg = String(err.message || err).slice(0, 300);
+            for (let k = 0; k < items.length; k++) {
+              failures.push({ doc_number: items[k].docNumber, txn_date: items[k].txnDate, error: 'batch failed: ' + msg });
+            }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => runOne()));
+
+      // Retry any collisions serially with bump-and-try
+      for (const c of collisions) {
         let pushed = false;
         let attempts = 0;
-        while (!pushed && attempts < 25) {
+        while (!pushed && attempts < 50) {
           attempts++;
           try {
-            const inv = await qbCreateInvoice({
-              customerId,
-              productServiceId: String(b.product_service_id),
-              amount: dailyAmount,
-              txnDate,
-              docNumber: String(nextDoc),
-            });
-            invoiceIds.push(String(inv.Id));
-            docNumbers.push(String(nextDoc));
-            nextDoc++;
-            pushed = true;
-          } catch (err) {
-            const msg = String(err.message || err);
-            // Duplicate DocNumber → bump and retry
-            if (/duplicate|6240|already exists/i.test(msg)) {
+            const res = await qbBatchCreateInvoices([{ ...c.item, docNumber: String(nextDoc) }]);
+            const r = res[0];
+            if (r.ok) {
+              invoiceIds[c.planIdx] = r.id;
+              docNumbers[c.planIdx] = String(nextDoc);
+              nextDoc++;
+              pushed = true;
+              break;
+            }
+            if (/duplicate|6240|already exists/i.test(r.error || '')) {
               nextDoc++;
               continue;
             }
-            failures.push({ doc_number: String(nextDoc), txn_date: txnDate, error: msg.slice(0, 300) });
+            failures.push({ doc_number: String(nextDoc), txn_date: c.item.txnDate, error: String(r.error || '').slice(0, 300) });
+            nextDoc++;
+            break;
+          } catch (err) {
+            failures.push({ doc_number: String(nextDoc), txn_date: c.item.txnDate, error: String(err.message || err).slice(0, 300) });
             nextDoc++;
             break;
           }
         }
       }
+
+      // Strip undefined slots from invoiceIds/docNumbers (planIdx for failed items)
+      const finalInvoiceIds = invoiceIds.filter((x) => x);
+      const finalDocNumbers = docNumbers.filter((x) => x);
+      // Re-bind so the downstream code can use the same names
+      invoiceIds.length = 0;
+      invoiceIds.push(...finalInvoiceIds);
+      docNumbers.length = 0;
+      docNumbers.push(...finalDocNumbers);
 
       const status = failures.length === 0 ? 'success' : (invoiceIds.length === 0 ? 'failed' : 'partial');
 
@@ -526,6 +587,395 @@ export function mountLoanSetupApi(app, deps) {
       res.json({ rows: r.rows });
     } catch (err) {
       console.error('[new-loan/log]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── ADD-INVOICES MODE ──────────────────────────────────────────────────
+  // Use when a customer + estimate already exist in QB and you just want to
+  // generate the daily invoices from `start_date` to `end_date` (driven by
+  // estimate amount when only daily + total are given). Lets the operator
+  // stop the SaasAnt-driven recurring invoice cron and continue creating
+  // them through BRAIN from where the previous cron left off.
+
+  // GET /api/admin/qb-customer-last-invoice?customer_id=<id>
+  //   Returns the latest existing Invoice's DocNumber + TxnDate for this
+  //   customer so the wizard can default start_date to the day after.
+  app.get('/api/admin/qb-customer-last-invoice', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customerId = String(req.query.customer_id || '').trim();
+      if (!customerId) return res.status(400).json({ error: 'customer_id required' });
+      const j = await qbQuery(
+        `SELECT Id, DocNumber, TxnDate FROM Invoice ` +
+        `WHERE CustomerRef = '${escSql(customerId)}' ` +
+        `ORDER BY TxnDate DESC MAXRESULTS 50`,
+      );
+      const items = j.QueryResponse?.Invoice || [];
+      if (!items.length) {
+        return res.json({ customer_id: customerId, last: null });
+      }
+      const newest = items[0];
+      // Next-day default for start_date so we don't collide with the
+      // existing schedule.
+      const nextDay = new Date(newest.TxnDate + 'T00:00:00Z');
+      nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+      res.json({
+        customer_id: customerId,
+        last: {
+          invoice_qb_id: newest.Id,
+          doc_number: newest.DocNumber,
+          txn_date: newest.TxnDate,
+        },
+        suggested_start_date: nextDay.toISOString().slice(0, 10),
+      });
+    } catch (err) {
+      console.error('[qb-customer-last-invoice]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/add-invoices/preview
+  // Body: { customer_id, start_date, end_date, daily_amount, product_service_id }
+  app.post('/api/admin/add-invoices/preview', requireSecretOrJwt, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const errs = [];
+      if (!b.customer_id) errs.push('customer_id required');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.start_date || '')) errs.push('start_date (YYYY-MM-DD) required');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '')) errs.push('end_date (YYYY-MM-DD) required');
+      if (!b.daily_amount || Number(b.daily_amount) <= 0) errs.push('daily_amount must be > 0');
+      if (!b.product_service_id) errs.push('product_service_id required');
+      if (errs.length) return res.status(400).json({ errors: errs });
+
+      const days = daysBetween(b.start_date, b.end_date);
+      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+
+      // Look up the customer so the operator can see what they picked
+      const cj = await qbQuery(
+        `SELECT Id, DisplayName, FullyQualifiedName FROM Customer ` +
+        `WHERE Id = '${escSql(b.customer_id)}'`,
+      );
+      const customer = cj.QueryResponse?.Customer?.[0];
+      if (!customer) return res.status(404).json({ errors: ['customer not found in QB'] });
+
+      const nextDoc = (await getMaxInvoiceDocNumber()) + 1;
+      const samples = [];
+      for (let i = 0; i < Math.min(3, days); i++) {
+        samples.push({
+          doc_number: String(nextDoc + i),
+          txn_date: addDaysISO(b.start_date, i),
+          amount: Number(b.daily_amount),
+        });
+      }
+      const totalAmount = days * Number(b.daily_amount);
+
+      res.json({
+        ok: true,
+        customer: {
+          id: customer.Id,
+          display_name: customer.DisplayName,
+          full_name: customer.FullyQualifiedName,
+        },
+        invoices: {
+          count: days,
+          first_doc_number: String(nextDoc),
+          last_doc_number: String(nextDoc + days - 1),
+          first_date: b.start_date,
+          last_date: b.end_date,
+          per_invoice_amount: Number(b.daily_amount),
+          total_amount: totalAmount,
+          sample: samples,
+        },
+      });
+    } catch (err) {
+      console.error('[add-invoices/preview]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/add-invoices/execute
+  // Body: same as preview + idempotency_key (recommended).
+  app.post('/api/admin/add-invoices/execute', requireSecretOrJwt, async (req, res) => {
+    const b = req.body || {};
+    const idemKey = String(b.idempotency_key || '').trim();
+    try {
+      const errs = [];
+      if (!b.customer_id) errs.push('customer_id required');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.start_date || '')) errs.push('start_date required');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '')) errs.push('end_date required');
+      if (!b.daily_amount || Number(b.daily_amount) <= 0) errs.push('daily_amount must be > 0');
+      if (!b.product_service_id) errs.push('product_service_id required');
+      if (errs.length) return res.status(400).json({ errors: errs });
+
+      if (idemKey) {
+        const prior = await db().query(
+          `SELECT * FROM loan_creation_log WHERE idempotency_key = $1`,
+          [idemKey],
+        );
+        if (prior.rows.length) {
+          return res.json({ ok: true, idempotent_hit: true, log: prior.rows[0] });
+        }
+      }
+
+      const days = daysBetween(b.start_date, b.end_date);
+      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+
+      const customerId = String(b.customer_id);
+      const dailyAmount = Number(b.daily_amount);
+
+      // Verify customer exists; capture name for the log
+      const cj = await qbQuery(
+        `SELECT Id, DisplayName FROM Customer WHERE Id = '${escSql(customerId)}'`,
+      );
+      const customer = cj.QueryResponse?.Customer?.[0];
+      if (!customer) return res.status(404).json({ errors: ['customer not found in QB'] });
+
+      // Create invoices sequentially with collision-bump retry (same as new-loan)
+      let nextDoc = (await getMaxInvoiceDocNumber()) + 1;
+      const invoiceIds = [];
+      const docNumbers = [];
+      const failures = [];
+      for (let i = 0; i < days; i++) {
+        const txnDate = addDaysISO(b.start_date, i);
+        let pushed = false;
+        let attempts = 0;
+        while (!pushed && attempts < 25) {
+          attempts++;
+          try {
+            const inv = await qbCreateInvoice({
+              customerId,
+              productServiceId: String(b.product_service_id),
+              amount: dailyAmount,
+              txnDate,
+              docNumber: String(nextDoc),
+            });
+            invoiceIds.push(String(inv.Id));
+            docNumbers.push(String(nextDoc));
+            nextDoc++;
+            pushed = true;
+          } catch (err) {
+            const msg = String(err.message || err);
+            if (/duplicate|6240|already exists/i.test(msg)) {
+              nextDoc++;
+              continue;
+            }
+            failures.push({ doc_number: String(nextDoc), txn_date: txnDate, error: msg.slice(0, 300) });
+            nextDoc++;
+            break;
+          }
+        }
+      }
+
+      const status = failures.length === 0 ? 'success' : (invoiceIds.length === 0 ? 'failed' : 'partial');
+      const totalAmount = invoiceIds.length * dailyAmount;
+
+      // Reuse the loan_creation_log so all wizard activity lives in one place.
+      // estimate columns stay null since this mode doesn't create an estimate.
+      const log = await db().query(
+        `INSERT INTO loan_creation_log (
+           idempotency_key, parent_qb_id, customer_qb_id, customer_display_name,
+           customer_was_reused, estimate_qb_id, estimate_was_reused, estimate_amount,
+           product_service_id, start_date, end_date, daily_amount,
+           invoice_qb_ids, invoice_doc_numbers, invoice_count, total_amount,
+           status, error
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         RETURNING *`,
+        [
+          idemKey || null, null, customerId, customer.DisplayName,
+          true, null, false, null,
+          String(b.product_service_id), b.start_date, b.end_date, dailyAmount,
+          invoiceIds, docNumbers, invoiceIds.length, totalAmount,
+          status, failures.length ? JSON.stringify(failures).slice(0, 2000) : null,
+        ],
+      );
+
+      res.json({
+        ok: status !== 'failed',
+        status,
+        customer: { id: customerId, display_name: customer.DisplayName },
+        invoices: {
+          count: invoiceIds.length,
+          planned: days,
+          first_doc: docNumbers[0] || null,
+          last_doc: docNumbers[docNumbers.length - 1] || null,
+          total_amount: totalAmount,
+          failures,
+        },
+        log_id: log.rows[0].id,
+      });
+    } catch (err) {
+      console.error('[add-invoices/execute]', err);
+      if (idemKey) {
+        try {
+          await db().query(
+            `INSERT INTO loan_creation_log (idempotency_key, status, error)
+             VALUES ($1, 'failed', $2) ON CONFLICT (idempotency_key) DO NOTHING`,
+            [idemKey, String(err.message || err).slice(0, 2000)],
+          );
+        } catch { /* nbd */ }
+      }
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── RECALL ────────────────────────────────────────────────────────────
+  // POST /api/admin/new-loan/recall
+  // Body: { customer_qb_id, dry_run?: true, deactivate_customer?: true }
+  //
+  // Walks the customer's complete QB footprint (all Invoices + Estimates)
+  // and DELETEs them in batches of 30 with concurrency 4 — typical full
+  // 397-invoice loan recalls in <30 seconds. Customer can't be DELETEd
+  // once it has any history, so it's marked inactive instead (default
+  // on; pass deactivate_customer=false to keep it active).
+  //
+  // QB DELETE on an Invoice fails if a Payment links to it. Brand-new
+  // wizard loans have no payments → all DELETEs succeed. If recalling a
+  // loan that has received payments, the deletes will partially fail and
+  // the response surfaces which invoices got stuck.
+  app.post('/api/admin/new-loan/recall', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customerId = String(req.body?.customer_qb_id || '').trim();
+      if (!customerId) return res.status(400).json({ error: 'customer_qb_id required' });
+      const dryRun = req.body?.dry_run === true;
+      const deactivateCustomer = req.body?.deactivate_customer !== false;
+
+      // 1. Verify customer exists
+      const cj = await qbQuery(
+        `SELECT Id, DisplayName, SyncToken, Active FROM Customer WHERE Id = '${escSql(customerId)}'`,
+      );
+      const customer = cj.QueryResponse?.Customer?.[0];
+      if (!customer) return res.status(404).json({ error: 'customer not found in QB' });
+
+      // 2. Collect all invoices (paginated — a full loan = 366-400 rows)
+      const invoices = [];
+      let start = 1;
+      while (true) {
+        const j = await qbQuery(
+          `SELECT Id, DocNumber, TxnDate, TotalAmt, SyncToken FROM Invoice ` +
+          `WHERE CustomerRef = '${escSql(customerId)}' ` +
+          `STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const items = j.QueryResponse?.Invoice || [];
+        invoices.push(...items);
+        if (items.length < 1000) break;
+        start += 1000;
+      }
+
+      // 3. Collect all estimates
+      const estimates = [];
+      start = 1;
+      while (true) {
+        const j = await qbQuery(
+          `SELECT Id, TotalAmt, SyncToken FROM Estimate ` +
+          `WHERE CustomerRef = '${escSql(customerId)}' ` +
+          `STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const items = j.QueryResponse?.Estimate || [];
+        estimates.push(...items);
+        if (items.length < 1000) break;
+        start += 1000;
+      }
+
+      const planSummary = {
+        customer: { id: customer.Id, display_name: customer.DisplayName, active: customer.Active },
+        invoices_to_delete: invoices.length,
+        invoices_total_amount: invoices.reduce((s, i) => s + Number(i.TotalAmt || 0), 0),
+        estimates_to_delete: estimates.length,
+        estimates_total_amount: estimates.reduce((s, e) => s + Number(e.TotalAmt || 0), 0),
+        will_deactivate_customer: deactivateCustomer,
+      };
+
+      if (dryRun) {
+        return res.json({ ok: true, dry_run: true, plan: planSummary });
+      }
+
+      // 4. Delete invoices in batches of 30 with concurrency 4
+      const invoiceItems = invoices.map((i) => ({ entity: 'Invoice', id: i.Id, syncToken: i.SyncToken }));
+      const invoiceChunks = [];
+      for (let i = 0; i < invoiceItems.length; i += 30) invoiceChunks.push({ start: i, items: invoiceItems.slice(i, i + 30) });
+      const deletedInvoiceIds = new Set();
+      const invoiceFailures = [];
+      const CONCURRENCY = 4;
+      let cursor = 0;
+      const runOne = async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= invoiceChunks.length) return;
+          const { start, items } = invoiceChunks[idx];
+          try {
+            const results = await qbBatchDelete(items);
+            for (let k = 0; k < items.length; k++) {
+              if (results[k].ok) deletedInvoiceIds.add(items[k].id);
+              else invoiceFailures.push({ id: items[k].id, error: results[k].error });
+            }
+          } catch (err) {
+            const msg = String(err.message || err).slice(0, 300);
+            for (const it of items) invoiceFailures.push({ id: it.id, error: 'batch failed: ' + msg });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => runOne()));
+
+      // 5. Delete estimates (usually small count, can be a single batch)
+      const estimateItems = estimates.map((e) => ({ entity: 'Estimate', id: e.Id, syncToken: e.SyncToken }));
+      const deletedEstimateIds = new Set();
+      const estimateFailures = [];
+      for (let i = 0; i < estimateItems.length; i += 30) {
+        const chunk = estimateItems.slice(i, i + 30);
+        try {
+          const results = await qbBatchDelete(chunk);
+          for (let k = 0; k < chunk.length; k++) {
+            if (results[k].ok) deletedEstimateIds.add(chunk[k].id);
+            else estimateFailures.push({ id: chunk[k].id, error: results[k].error });
+          }
+        } catch (err) {
+          for (const it of chunk) estimateFailures.push({ id: it.id, error: 'batch failed: ' + String(err.message || err).slice(0, 200) });
+        }
+      }
+
+      // 6. Mark customer inactive (only if no item-delete failures, so a
+      //    partial recall doesn't leave a hidden customer that still has
+      //    invoices on it)
+      let customerDeactivated = false;
+      let customerError = null;
+      if (deactivateCustomer && invoiceFailures.length === 0 && estimateFailures.length === 0) {
+        try {
+          await qbPost('customer', {
+            Id: customer.Id,
+            SyncToken: customer.SyncToken,
+            sparse: true,
+            Active: false,
+          });
+          customerDeactivated = true;
+        } catch (err) {
+          customerError = String(err.message || err).slice(0, 300);
+        }
+      }
+
+      res.json({
+        ok: invoiceFailures.length === 0 && estimateFailures.length === 0,
+        customer: {
+          id: customer.Id,
+          display_name: customer.DisplayName,
+          deactivated: customerDeactivated,
+          deactivate_error: customerError,
+        },
+        invoices: {
+          planned: invoices.length,
+          deleted: deletedInvoiceIds.size,
+          failures: invoiceFailures.slice(0, 20),
+          failure_count: invoiceFailures.length,
+        },
+        estimates: {
+          planned: estimates.length,
+          deleted: deletedEstimateIds.size,
+          failures: estimateFailures.slice(0, 10),
+          failure_count: estimateFailures.length,
+        },
+        plan: planSummary,
+      });
+    } catch (err) {
+      console.error('[new-loan/recall]', err);
       res.status(500).json({ error: err.message });
     }
   });
