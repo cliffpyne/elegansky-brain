@@ -310,8 +310,17 @@ export function mountLoanSetupApi(app, deps) {
       if (!b.product_service_id) errs.push('product_service_id required');
       if (errs.length) return res.status(400).json({ errors: errs });
 
-      const days = daysBetween(b.start_date, b.end_date);
-      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+      // Per Frank 2026-06-17: drive invoice count from estimate ÷ daily.
+      //   dailyCount = floor(estimate / daily)
+      //   remainder  = estimate mod daily  (e.g. 3,500 if not divisible)
+      //   invoices   = dailyCount × daily + (remainder > 0 ? 1 × remainder : 0)
+      //   Σ invoice amounts == estimate_amount EXACTLY.
+      const estimate = Number(b.estimate_amount);
+      const daily = Number(b.daily_amount);
+      const dailyCount = Math.floor(estimate / daily);
+      const remainder = estimate - dailyCount * daily;
+      const totalInvoices = dailyCount + (remainder > 0 ? 1 : 0);
+      const computedEndDate = addDaysISO(b.start_date, totalInvoices - 1);
 
       const existing = await findCustomerByDisplayName({
         displayName: String(b.display_name).trim(),
@@ -320,14 +329,15 @@ export function mountLoanSetupApi(app, deps) {
       const nextDoc = (await getMaxInvoiceDocNumber()) + 1;
 
       const samples = [];
-      for (let i = 0; i < Math.min(3, days); i++) {
+      for (let i = 0; i < Math.min(3, totalInvoices); i++) {
+        const isRemainder = remainder > 0 && i === totalInvoices - 1;
         samples.push({
           doc_number: String(nextDoc + i),
           txn_date: addDaysISO(b.start_date, i),
-          amount: Number(b.daily_amount),
+          amount: isRemainder ? remainder : daily,
         });
       }
-      const totalInvoices = days * Number(b.daily_amount);
+      const totalAmount = dailyCount * daily + remainder;
 
       res.json({
         ok: true,
@@ -338,24 +348,24 @@ export function mountLoanSetupApi(app, deps) {
           will_be_reused: !!existing,
         },
         estimate: {
-          amount: Number(b.estimate_amount),
+          amount: estimate,
           start_date: b.start_date,
-          end_date: b.end_date,
+          end_date: computedEndDate,
           product_service_id: b.product_service_id,
         },
         invoices: {
-          count: days,
+          count: totalInvoices,
+          daily_count: dailyCount,
+          remainder_amount: remainder,
           first_doc_number: String(nextDoc),
-          last_doc_number: String(nextDoc + days - 1),
+          last_doc_number: String(nextDoc + totalInvoices - 1),
           first_date: b.start_date,
-          last_date: b.end_date,
-          per_invoice_amount: Number(b.daily_amount),
-          total_amount: totalInvoices,
+          last_date: computedEndDate,
+          per_invoice_amount: daily,
+          total_amount: totalAmount,
           sample: samples,
         },
-        warning: totalInvoices !== Number(b.estimate_amount)
-          ? `estimate (${b.estimate_amount}) does not equal daily × days (${totalInvoices})`
-          : null,
+        warning: null,
       });
     } catch (err) {
       console.error('[new-loan/preview]', err);
@@ -374,7 +384,6 @@ export function mountLoanSetupApi(app, deps) {
       if (!b.display_name) errs.push('display_name required');
       if (!b.estimate_amount || Number(b.estimate_amount) <= 0) errs.push('estimate_amount must be > 0');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(b.start_date || '')) errs.push('start_date required');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '')) errs.push('end_date required');
       if (!b.daily_amount || Number(b.daily_amount) <= 0) errs.push('daily_amount must be > 0');
       if (!b.product_service_id) errs.push('product_service_id required');
       if (errs.length) return res.status(400).json({ errors: errs });
@@ -390,13 +399,15 @@ export function mountLoanSetupApi(app, deps) {
         }
       }
 
-      const days = daysBetween(b.start_date, b.end_date);
-      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
-
       const displayName = String(b.display_name).trim();
       const parentId = String(b.parent_id);
       const dailyAmount = Number(b.daily_amount);
-      const totalAmount = days * dailyAmount;
+      const estimateAmt = Number(b.estimate_amount);
+      const dailyCount = Math.floor(estimateAmt / dailyAmount);
+      const remainder = estimateAmt - dailyCount * dailyAmount;
+      const totalInvoices = dailyCount + (remainder > 0 ? 1 : 0);
+      const computedEndDate = addDaysISO(b.start_date, totalInvoices - 1);
+      const totalAmount = dailyCount * dailyAmount + remainder; // == estimateAmt
 
       // 1. Find or create customer
       let customer = await findCustomerByDisplayName({ displayName, parentId });
@@ -413,22 +424,20 @@ export function mountLoanSetupApi(app, deps) {
       // 2. Create estimate (no dedup check — operator decides; one-per-loan is the design)
       const estimate = await qbCreateEstimate({
         customerId,
-        amount: Number(b.estimate_amount),
+        amount: estimateAmt,
         productServiceId: String(b.product_service_id),
         startDate: b.start_date,
-        endDate: b.end_date,
+        endDate: computedEndDate,
         memo: b.memo || null,
       });
       const estimateId = String(estimate.Id);
 
-      // 3. Build the full plan, push in batches of 30 with concurrency.
-      //    Was: serial qbCreateInvoice → ~3s/row → 20 min for 397 invoices.
-      //    Now: batch-30 × 4 concurrent → finishes 397 in ~20 sec.
-      //    Collision handling: a single item failing with "duplicate
-      //    DocNumber" gets retried serially with bump-and-try at the end.
+      // 3. Build the full plan: dailyCount × dailyAmount, + 1 × remainder
+      //    if estimate isn't perfectly divisible by daily. Push in batches
+      //    of 30 with concurrency 4 (~30 sec for 397-row loan).
       let nextDoc = (await getMaxInvoiceDocNumber()) + 1;
       const plan = [];
-      for (let i = 0; i < days; i++) {
+      for (let i = 0; i < dailyCount; i++) {
         plan.push({
           customerId,
           productServiceId: String(b.product_service_id),
@@ -437,7 +446,16 @@ export function mountLoanSetupApi(app, deps) {
           docNumber: String(nextDoc + i),
         });
       }
-      nextDoc += days; // reserve the contiguous range
+      if (remainder > 0) {
+        plan.push({
+          customerId,
+          productServiceId: String(b.product_service_id),
+          amount: remainder,
+          txnDate: addDaysISO(b.start_date, dailyCount),
+          docNumber: String(nextDoc + dailyCount),
+        });
+      }
+      nextDoc += totalInvoices; // reserve the contiguous range
 
       const invoiceIds = new Array(plan.length);
       const docNumbers = new Array(plan.length);
@@ -534,8 +552,8 @@ export function mountLoanSetupApi(app, deps) {
          RETURNING *`,
         [
           idemKey || null, parentId, customerId, displayName,
-          customerReused, estimateId, false, Number(b.estimate_amount),
-          String(b.product_service_id), b.start_date, b.end_date, dailyAmount,
+          customerReused, estimateId, false, estimateAmt,
+          String(b.product_service_id), b.start_date, computedEndDate, dailyAmount,
           invoiceIds, docNumbers, invoiceIds.length, totalAmount,
           status, failures.length ? JSON.stringify(failures).slice(0, 2000) : null,
         ],
@@ -545,13 +563,15 @@ export function mountLoanSetupApi(app, deps) {
         ok: status !== 'failed',
         status,
         customer: { id: customerId, display_name: displayName, was_reused: customerReused },
-        estimate: { id: estimateId, amount: Number(b.estimate_amount) },
+        estimate: { id: estimateId, amount: estimateAmt },
         invoices: {
           count: invoiceIds.length,
-          planned: days,
+          planned: totalInvoices,
           first_doc: docNumbers[0] || null,
           last_doc: docNumbers[docNumbers.length - 1] || null,
-          total_amount: invoiceIds.length * dailyAmount,
+          total_amount: totalAmount,
+          daily_count: dailyCount,
+          remainder_amount: remainder,
           failures,
         },
         log_id: log.rows[0].id,
@@ -635,22 +655,43 @@ export function mountLoanSetupApi(app, deps) {
   });
 
   // POST /api/admin/add-invoices/preview
-  // Body: { customer_id, start_date, end_date, daily_amount, product_service_id }
+  // Body: { customer_id, start_date, daily_amount, product_service_id,
+  //         remaining_amount?, end_date? }
+  // Two modes (one of remaining_amount OR end_date required):
+  //   1. remaining_amount mode (preferred per Frank 2026-06-17):
+  //        N_full   = floor(remaining / daily)
+  //        remainder = remaining mod daily  (e.g. 3,500 if not divisible)
+  //        invoices = N_full × daily + (remainder ? 1 × remainder : 0)
+  //        Total of invoice amounts = remaining_amount EXACTLY.
+  //   2. end_date mode (legacy): N_full = days_between, all × daily.
   app.post('/api/admin/add-invoices/preview', requireSecretOrJwt, async (req, res) => {
     try {
       const b = req.body || {};
       const errs = [];
       if (!b.customer_id) errs.push('customer_id required');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(b.start_date || '')) errs.push('start_date (YYYY-MM-DD) required');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '')) errs.push('end_date (YYYY-MM-DD) required');
       if (!b.daily_amount || Number(b.daily_amount) <= 0) errs.push('daily_amount must be > 0');
       if (!b.product_service_id) errs.push('product_service_id required');
+      const hasRemaining = b.remaining_amount != null && Number(b.remaining_amount) > 0;
+      const hasEndDate = /^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '');
+      if (!hasRemaining && !hasEndDate) errs.push('either remaining_amount or end_date required');
       if (errs.length) return res.status(400).json({ errors: errs });
 
-      const days = daysBetween(b.start_date, b.end_date);
-      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+      const daily = Number(b.daily_amount);
+      let dailyCount = 0;
+      let remainder = 0;
+      if (hasRemaining) {
+        const remaining = Number(b.remaining_amount);
+        dailyCount = Math.floor(remaining / daily);
+        remainder = remaining - dailyCount * daily; // exact subtraction; no fp drift for integer amounts
+      } else {
+        dailyCount = daysBetween(b.start_date, b.end_date);
+        if (dailyCount <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+      }
+      const totalInvoices = dailyCount + (remainder > 0 ? 1 : 0);
+      const totalAmount = dailyCount * daily + remainder;
 
-      // Look up the customer so the operator can see what they picked
+      // Look up the customer so the operator sees what they picked
       const cj = await qbQuery(
         `SELECT Id, DisplayName, FullyQualifiedName FROM Customer ` +
         `WHERE Id = '${escSql(b.customer_id)}'`,
@@ -660,29 +701,33 @@ export function mountLoanSetupApi(app, deps) {
 
       const nextDoc = (await getMaxInvoiceDocNumber()) + 1;
       const samples = [];
-      for (let i = 0; i < Math.min(3, days); i++) {
+      for (let i = 0; i < Math.min(3, totalInvoices); i++) {
+        const isRemainder = remainder > 0 && i === totalInvoices - 1;
         samples.push({
           doc_number: String(nextDoc + i),
           txn_date: addDaysISO(b.start_date, i),
-          amount: Number(b.daily_amount),
+          amount: isRemainder ? remainder : daily,
         });
       }
-      const totalAmount = days * Number(b.daily_amount);
+      const endDate = addDaysISO(b.start_date, totalInvoices - 1);
 
       res.json({
         ok: true,
+        mode: hasRemaining ? 'remaining_amount' : 'end_date',
         customer: {
           id: customer.Id,
           display_name: customer.DisplayName,
           full_name: customer.FullyQualifiedName,
         },
         invoices: {
-          count: days,
+          count: totalInvoices,
+          daily_count: dailyCount,
+          remainder_amount: remainder,
           first_doc_number: String(nextDoc),
-          last_doc_number: String(nextDoc + days - 1),
+          last_doc_number: String(nextDoc + totalInvoices - 1),
           first_date: b.start_date,
-          last_date: b.end_date,
-          per_invoice_amount: Number(b.daily_amount),
+          last_date: endDate,
+          per_invoice_amount: daily,
           total_amount: totalAmount,
           sample: samples,
         },
@@ -695,6 +740,7 @@ export function mountLoanSetupApi(app, deps) {
 
   // POST /api/admin/add-invoices/execute
   // Body: same as preview + idempotency_key (recommended).
+  // Modes: remaining_amount OR end_date — see preview docs for math.
   app.post('/api/admin/add-invoices/execute', requireSecretOrJwt, async (req, res) => {
     const b = req.body || {};
     const idemKey = String(b.idempotency_key || '').trim();
@@ -702,9 +748,11 @@ export function mountLoanSetupApi(app, deps) {
       const errs = [];
       if (!b.customer_id) errs.push('customer_id required');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(b.start_date || '')) errs.push('start_date required');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '')) errs.push('end_date required');
       if (!b.daily_amount || Number(b.daily_amount) <= 0) errs.push('daily_amount must be > 0');
       if (!b.product_service_id) errs.push('product_service_id required');
+      const hasRemaining = b.remaining_amount != null && Number(b.remaining_amount) > 0;
+      const hasEndDate = /^\d{4}-\d{2}-\d{2}$/.test(b.end_date || '');
+      if (!hasRemaining && !hasEndDate) errs.push('either remaining_amount or end_date required');
       if (errs.length) return res.status(400).json({ errors: errs });
 
       if (idemKey) {
@@ -717,57 +765,126 @@ export function mountLoanSetupApi(app, deps) {
         }
       }
 
-      const days = daysBetween(b.start_date, b.end_date);
-      if (days <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
-
       const customerId = String(b.customer_id);
       const dailyAmount = Number(b.daily_amount);
+      let dailyCount = 0;
+      let remainder = 0;
+      if (hasRemaining) {
+        const remaining = Number(b.remaining_amount);
+        dailyCount = Math.floor(remaining / dailyAmount);
+        remainder = remaining - dailyCount * dailyAmount;
+      } else {
+        dailyCount = daysBetween(b.start_date, b.end_date);
+        if (dailyCount <= 0) return res.status(400).json({ errors: ['end_date must be on or after start_date'] });
+      }
+      const totalInvoices = dailyCount + (remainder > 0 ? 1 : 0);
 
-      // Verify customer exists; capture name for the log
+      // Verify customer exists
       const cj = await qbQuery(
         `SELECT Id, DisplayName FROM Customer WHERE Id = '${escSql(customerId)}'`,
       );
       const customer = cj.QueryResponse?.Customer?.[0];
       if (!customer) return res.status(404).json({ errors: ['customer not found in QB'] });
 
-      // Create invoices sequentially with collision-bump retry (same as new-loan)
+      // Build plan: dailyCount × dailyAmount, then 1 × remainder if any
       let nextDoc = (await getMaxInvoiceDocNumber()) + 1;
-      const invoiceIds = [];
-      const docNumbers = [];
+      const plan = [];
+      for (let i = 0; i < dailyCount; i++) {
+        plan.push({
+          customerId,
+          productServiceId: String(b.product_service_id),
+          amount: dailyAmount,
+          txnDate: addDaysISO(b.start_date, i),
+          docNumber: String(nextDoc + i),
+        });
+      }
+      if (remainder > 0) {
+        plan.push({
+          customerId,
+          productServiceId: String(b.product_service_id),
+          amount: remainder,
+          txnDate: addDaysISO(b.start_date, dailyCount),
+          docNumber: String(nextDoc + dailyCount),
+        });
+      }
+      nextDoc += totalInvoices;
+
+      // Push in batches of 30 with concurrency (same fast path as new-loan)
+      const invoiceIds = new Array(plan.length);
+      const docNumbers = new Array(plan.length);
+      const collisions = [];
       const failures = [];
-      for (let i = 0; i < days; i++) {
-        const txnDate = addDaysISO(b.start_date, i);
+      const chunks = [];
+      for (let i = 0; i < plan.length; i += 30) {
+        chunks.push({ start: i, items: plan.slice(i, i + 30) });
+      }
+      const CONCURRENCY = 4;
+      let cursor = 0;
+      const runOne = async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= chunks.length) return;
+          const { start, items } = chunks[idx];
+          try {
+            const results = await qbBatchCreateInvoices(items);
+            for (let k = 0; k < items.length; k++) {
+              const r = results[k];
+              if (r.ok) {
+                invoiceIds[start + k] = r.id;
+                docNumbers[start + k] = items[k].docNumber;
+              } else if (/duplicate|6240|already exists/i.test(r.error || '')) {
+                collisions.push({ planIdx: start + k, item: items[k] });
+              } else {
+                failures.push({ doc_number: items[k].docNumber, txn_date: items[k].txnDate, error: String(r.error || '').slice(0, 300) });
+              }
+            }
+          } catch (err) {
+            const msg = String(err.message || err).slice(0, 300);
+            for (const it of items) failures.push({ doc_number: it.docNumber, txn_date: it.txnDate, error: 'batch failed: ' + msg });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => runOne()));
+
+      // Bump-and-retry collisions serially
+      for (const c of collisions) {
         let pushed = false;
         let attempts = 0;
-        while (!pushed && attempts < 25) {
+        while (!pushed && attempts < 50) {
           attempts++;
           try {
-            const inv = await qbCreateInvoice({
-              customerId,
-              productServiceId: String(b.product_service_id),
-              amount: dailyAmount,
-              txnDate,
-              docNumber: String(nextDoc),
-            });
-            invoiceIds.push(String(inv.Id));
-            docNumbers.push(String(nextDoc));
-            nextDoc++;
-            pushed = true;
-          } catch (err) {
-            const msg = String(err.message || err);
-            if (/duplicate|6240|already exists/i.test(msg)) {
+            const r = (await qbBatchCreateInvoices([{ ...c.item, docNumber: String(nextDoc) }]))[0];
+            if (r.ok) {
+              invoiceIds[c.planIdx] = r.id;
+              docNumbers[c.planIdx] = String(nextDoc);
+              nextDoc++;
+              pushed = true;
+              break;
+            }
+            if (/duplicate|6240|already exists/i.test(r.error || '')) {
               nextDoc++;
               continue;
             }
-            failures.push({ doc_number: String(nextDoc), txn_date: txnDate, error: msg.slice(0, 300) });
+            failures.push({ doc_number: String(nextDoc), txn_date: c.item.txnDate, error: String(r.error || '').slice(0, 300) });
+            nextDoc++;
+            break;
+          } catch (err) {
+            failures.push({ doc_number: String(nextDoc), txn_date: c.item.txnDate, error: String(err.message || err).slice(0, 300) });
             nextDoc++;
             break;
           }
         }
       }
 
+      const finalIds = invoiceIds.filter((x) => x);
+      const finalDocs = docNumbers.filter((x) => x);
+      invoiceIds.length = 0; invoiceIds.push(...finalIds);
+      docNumbers.length = 0; docNumbers.push(...finalDocs);
+
       const status = failures.length === 0 ? 'success' : (invoiceIds.length === 0 ? 'failed' : 'partial');
-      const totalAmount = invoiceIds.length * dailyAmount;
+      const totalAmount = (Math.min(invoiceIds.length, dailyCount) * dailyAmount) +
+                          (invoiceIds.length > dailyCount ? remainder : 0);
+      const endDate = addDaysISO(b.start_date, totalInvoices - 1);
 
       // Reuse the loan_creation_log so all wizard activity lives in one place.
       // estimate columns stay null since this mode doesn't create an estimate.

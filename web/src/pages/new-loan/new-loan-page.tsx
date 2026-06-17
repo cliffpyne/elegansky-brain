@@ -98,34 +98,48 @@ export function NewLoanPage() {
       .finally(() => setLoading(null));
   }, [step.loanOfficer]);
 
-  // Days driven by estimate ÷ daily (Frank's spec: all invoices stay at the
-  // daily amount; end date is whatever it takes to hit the estimate, even
-  // if > 366 days). End date input becomes derived, not user-typed.
-  const days = useMemo(() => {
+  // Estimate-driven invoice math (Frank's spec 2026-06-17):
+  //   dailyCount = floor(estimate / daily)
+  //   remainder  = estimate mod daily   (e.g. 3,500 when not divisible)
+  //   total invoices = dailyCount + (remainder > 0 ? 1 : 0)
+  //   Σ invoice amounts == estimate EXACTLY.
+  const dailyCount = useMemo(() => {
     const est = Number(estimateAmount) || 0;
     const dai = Number(dailyAmount) || 0;
     if (est <= 0 || dai <= 0) return 0;
-    return Math.ceil(est / dai);
+    return Math.floor(est / dai);
   }, [estimateAmount, dailyAmount]);
 
-  // Derived end_date from start + days.
-  const computedEndDate = useMemo(() => {
-    if (!startDate || days <= 0) return '';
-    const d = new Date(startDate + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() + days - 1);
-    return d.toISOString().slice(0, 10);
-  }, [startDate, days]);
+  const remainderAmount = useMemo(() => {
+    const est = Number(estimateAmount) || 0;
+    const dai = Number(dailyAmount) || 0;
+    if (est <= 0 || dai <= 0) return 0;
+    return est - dailyCount * dai;
+  }, [estimateAmount, dailyAmount, dailyCount]);
 
-  // Keep endDate state in sync with computed value so the preview/execute
-  // requests use it without an extra prop.
+  const totalInvoiceCount = useMemo(
+    () => dailyCount + (remainderAmount > 0 ? 1 : 0),
+    [dailyCount, remainderAmount],
+  );
+
+  // Derived end_date = start + (totalInvoiceCount - 1) days
+  const computedEndDate = useMemo(() => {
+    if (!startDate || totalInvoiceCount <= 0) return '';
+    const d = new Date(startDate + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + totalInvoiceCount - 1);
+    return d.toISOString().slice(0, 10);
+  }, [startDate, totalInvoiceCount]);
+
   useEffect(() => {
     if (computedEndDate && computedEndDate !== endDate) setEndDate(computedEndDate);
   }, [computedEndDate]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const totalInvoices = useMemo(() => {
-    const d = Number(dailyAmount) || 0;
-    return days * d;
-  }, [days, dailyAmount]);
+  // For backward compat with older code paths that referenced `days`
+  const days = totalInvoiceCount;
+  const totalInvoices = useMemo(
+    () => dailyCount * (Number(dailyAmount) || 0) + remainderAmount,
+    [dailyCount, dailyAmount, remainderAmount],
+  );
 
   const canPreview = !!(
     step.subOfficer && displayName.trim() &&
@@ -342,11 +356,18 @@ export function NewLoanPage() {
                   <Input type="date" value={endDate} readOnly disabled />
                 </div>
               </div>
-              {days > 0 && (
+              {totalInvoiceCount > 0 && (
                 <div className="text-sm text-muted-foreground">
-                  {fmt(days)} invoices × {fmt(Number(dailyAmount) || 0)} TZS = <b>{fmt(totalInvoices)} TZS</b>
-                  {Number(estimateAmount) > 0 && totalInvoices !== Number(estimateAmount) && (
-                    <span className="text-amber-600"> (estimate {fmt(Number(estimateAmount))} differs by {fmt(totalInvoices - Number(estimateAmount))})</span>
+                  {remainderAmount > 0 ? (
+                    <>
+                      <b>{fmt(totalInvoiceCount)}</b> invoices = {fmt(dailyCount)} × {fmt(Number(dailyAmount))} + 1 × <b>{fmt(remainderAmount)}</b> remainder
+                      = <b>{fmt(totalInvoices)} TZS</b>
+                    </>
+                  ) : (
+                    <>
+                      <b>{fmt(totalInvoiceCount)}</b> invoices × {fmt(Number(dailyAmount))} TZS
+                      = <b>{fmt(totalInvoices)} TZS</b>
+                    </>
                   )}
                 </div>
               )}
