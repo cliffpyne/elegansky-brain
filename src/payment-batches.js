@@ -3199,6 +3199,167 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/retry-batch-failures
+  // For a pending batch with status='failed' payment_uploads (most commonly
+  // QB timeout casualties), preflight QB to catch latent-success writes
+  // (timeout returned but the Payment did land), then retry the rest. If
+  // every failed row ends up created → finalize the batch.
+  // Body: { batch_id, dry_run?: true, concurrency?: 3 }
+  app.post('/api/admin/retry-batch-failures', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.body?.batch_id || '');
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      const dryRun = req.body?.dry_run === true;
+      const PAR = Math.max(1, Math.min(8, Number(req.body?.concurrency) || 3));
+
+      let fullId = batchId;
+      if (batchId.length < 36) {
+        const r = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [batchId + '%']);
+        if (!r.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = r.rows[0].id;
+      }
+
+      const batch = (await db().query(
+        `SELECT id, channel, status, txn_date FROM payment_batches WHERE id=$1`,
+        [fullId],
+      )).rows[0];
+      if (!batch) return res.status(404).json({ error: 'batch not found' });
+      if (!batch.txn_date) return res.status(400).json({ error: 'batch has no txn_date — cannot push' });
+      const txnDate = batch.txn_date instanceof Date
+        ? batch.txn_date.toISOString().slice(0, 10)
+        : String(batch.txn_date).slice(0, 10);
+
+      const failedRows = (await db().query(
+        `SELECT id, bank_ref, customer_id, customer_name, invoice_qb_id, amount, kind, failure_reason
+           FROM payment_uploads
+          WHERE batch_id = $1 AND status = 'failed'
+          ORDER BY id`,
+        [fullId],
+      )).rows;
+
+      if (failedRows.length === 0) {
+        return res.json({ batch_id: fullId, attempted: 0, message: 'no failed rows to retry' });
+      }
+
+      if (dryRun) {
+        return res.json({
+          batch_id: fullId,
+          channel: batch.channel,
+          txn_date: txnDate,
+          attempted: failedRows.length,
+          dry_run: true,
+          sample: failedRows.slice(0, 5).map((r) => ({
+            ref: r.bank_ref, amount: Number(r.amount), customer: r.customer_name,
+            kind: r.kind, has_invoice: !!r.invoice_qb_id, failure_reason: r.failure_reason,
+          })),
+        });
+      }
+
+      const sinceISO = (() => {
+        const d = new Date(txnDate); d.setUTCDate(d.getUTCDate() - 7);
+        return d.toISOString().slice(0, 10);
+      })();
+
+      let recovered = 0;
+      let latentSuccess = 0;
+      let stillFailed = 0;
+      const stillFailures = [];
+      let cursor = 0;
+
+      const worker = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= failedRows.length) return;
+          const u = failedRows[i];
+          try {
+            // 1. Preflight: maybe the timeout-failed push actually succeeded server-side
+            const q = await qbQuery(
+              `SELECT Id, PrivateNote, TotalAmt FROM Payment ` +
+              `WHERE CustomerRef = '${String(u.customer_id).replace(/'/g, "''")}' ` +
+              `AND TxnDate >= '${sinceISO}' MAXRESULTS 1000`,
+            );
+            const pmts = q.QueryResponse?.Payment || [];
+            const hit = pmts.find((p) => String(p.PrivateNote || '') === u.bank_ref && Number(p.TotalAmt) === Number(u.amount));
+            if (hit) {
+              await db().query(
+                `UPDATE payment_uploads SET status='created', qb_id=$2, failure_reason=NULL WHERE id=$1`,
+                [u.id, String(hit.Id)],
+              );
+              latentSuccess++;
+              recovered++;
+              continue;
+            }
+
+            // 2. Re-push: kind + invoice presence picks the right QB call
+            let qb;
+            if (u.kind === 'payment' && u.invoice_qb_id) {
+              qb = await qbCreatePayment({
+                customerId: u.customer_id, invoiceQbId: u.invoice_qb_id,
+                amount: Number(u.amount), memo: u.bank_ref, txnDate,
+              });
+            } else if (u.kind === 'payment' && !u.invoice_qb_id) {
+              qb = await qbCreateUnappliedPayment({
+                customerId: u.customer_id, amount: Number(u.amount),
+                memo: u.bank_ref, txnDate,
+              });
+            } else {
+              qb = await qbCreateCreditMemo({
+                customerId: u.customer_id, amount: Number(u.amount),
+                memo: u.bank_ref, txnDate,
+              });
+            }
+            if (!qb || !qb.id) throw new Error('no qb id returned');
+            await db().query(
+              `UPDATE payment_uploads SET status='created', qb_id=$2, qb_response=$3, failure_reason=NULL WHERE id=$1`,
+              [u.id, String(qb.id), JSON.stringify(qb.response || {})],
+            );
+            recovered++;
+          } catch (err) {
+            stillFailed++;
+            const reason = String(err.message || err).slice(0, 500);
+            stillFailures.push({ ref: u.bank_ref, amount: Number(u.amount), customer: u.customer_name, reason });
+            await db().query(
+              `UPDATE payment_uploads SET failure_reason=$2 WHERE id=$1`,
+              [u.id, reason],
+            );
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: PAR }, () => worker()));
+
+      // If no failures remain in the batch → finalize
+      let batchStatus = batch.status;
+      if (stillFailed === 0) {
+        const remaining = (await db().query(
+          `SELECT COUNT(*)::int AS n FROM payment_uploads WHERE batch_id=$1 AND status='failed'`,
+          [fullId],
+        )).rows[0].n;
+        if (remaining === 0) {
+          await db().query(
+            `UPDATE payment_batches SET status='finalized', finalized_at=now(), failure_reason=NULL WHERE id=$1`,
+            [fullId],
+          );
+          batchStatus = 'finalized';
+        }
+      }
+
+      res.json({
+        batch_id: fullId,
+        channel: batch.channel,
+        txn_date: txnDate,
+        attempted: failedRows.length,
+        recovered,
+        latent_success: latentSuccess,
+        still_failed: stillFailed,
+        still_failures: stillFailures.slice(0, 20),
+        batch_status: batchStatus,
+      });
+    } catch (err) {
+      console.error('[retry-batch-failures] failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/release-recalled-batch-cts
   // DELETE every consumed_transactions row whose batch was recalled on/after
   // since_iso. Covers refs with status='needs_saasant', 'failed', or 'voided'
