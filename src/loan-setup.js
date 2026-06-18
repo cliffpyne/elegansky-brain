@@ -67,7 +67,7 @@ function escSql(s) {
 }
 
 export function mountLoanSetupApi(app, deps) {
-  const { qbPost, qbBatchCreateInvoices, qbBatchDelete, requireSecretOrJwt } = deps;
+  const { qbPost, qbBatchCreateInvoices, qbBatchCreatePayments, qbBatchDelete, requireSecretOrJwt } = deps;
 
   // Best-effort table create on mount.
   ensureLoanCreationLogTable().catch((e) =>
@@ -1244,6 +1244,202 @@ export function mountLoanSetupApi(app, deps) {
       });
     } catch (err) {
       console.error('[new-loan/recall]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── BULK PAYMENT PUSH FROM SAASANT-FORMAT CSV ────────────────────────
+  // POST /api/admin/saasant-payments/push
+  // Body: {
+  //   csv: "<full CSV text>",
+  //   dry_run?: true
+  // }
+  //
+  // SaasAnt payment CSV columns (header row required):
+  //   Payment Date, Customer, Payment Method, Deposit To Account Name,
+  //   Invoice No, Journal No, Amount, Reference No, Memo, ...
+  //
+  // For each row the endpoint:
+  //   1. Resolves the Customer column to a QB Customer Id (DisplayName match)
+  //   2. Resolves Invoice No to a QB Invoice Id (DocNumber for that customer)
+  //   3. Builds a payment item: { customerId, invoiceQbId, amount, memo, txnDate }
+  //   4. Pushes via qbBatchCreatePayments — batches of 30, concurrency 4
+  //   5. Returns per-row results + the QB Payment Ids
+  //
+  // Memo from the CSV becomes the QB PrivateNote (= the bank ref).
+  app.post('/api/admin/saasant-payments/push', requireSecretOrJwt, async (req, res) => {
+    try {
+      const csv = String(req.body?.csv || '');
+      const dryRun = req.body?.dry_run === true;
+      if (!csv) return res.status(400).json({ error: 'csv body field required' });
+
+      // Naive CSV split — SaasAnt files don't quote embedded commas in any
+      // column we use, so split-on-comma is safe enough here.
+      const lines = csv.split(/\r?\n/).filter((l) => l.trim());
+      if (lines.length < 2) return res.status(400).json({ error: 'csv has no data rows' });
+      const header = lines[0].split(',').map((s) => s.trim());
+      const iCust = header.indexOf('Customer');
+      const iInv  = header.indexOf('Invoice No');
+      const iAmt  = header.indexOf('Amount');
+      const iMemo = header.indexOf('Memo');
+      const iDate = header.indexOf('Payment Date');
+      if (iCust < 0 || iInv < 0 || iAmt < 0 || iDate < 0) {
+        return res.status(400).json({
+          error: 'csv missing required columns',
+          required: ['Payment Date', 'Customer', 'Invoice No', 'Amount'],
+          got: header,
+        });
+      }
+
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',');
+        const amount = Number((cols[iAmt] || '').trim());
+        if (!isFinite(amount) || amount <= 0) continue;
+        rows.push({
+          rowNum: i + 1,
+          customerName: (cols[iCust] || '').trim(),
+          invoiceNo: (cols[iInv] || '').trim(),
+          amount,
+          memo: iMemo >= 0 ? (cols[iMemo] || '').trim() : '',
+          paymentDate: (cols[iDate] || '').trim(),
+        });
+      }
+      if (rows.length === 0) return res.status(400).json({ error: 'no valid data rows after parse' });
+
+      // 1. Resolve each unique customer name to a QB Id (one query per name)
+      const uniqueNames = [...new Set(rows.map((r) => r.customerName))];
+      const customerMap = {}; // name → qb id
+      const lookupErrors = [];
+      for (const name of uniqueNames) {
+        if (!name) continue;
+        const j = await qbQuery(
+          `SELECT Id, DisplayName FROM Customer WHERE DisplayName = '${escSql(name)}' MAXRESULTS 5`,
+        );
+        const c = j.QueryResponse?.Customer?.[0];
+        if (c) customerMap[name] = String(c.Id);
+        else lookupErrors.push({ kind: 'customer_not_found', name });
+      }
+
+      // 2. For each customer, batch-look up all their invoices by DocNumber
+      const byCust = {};
+      for (const r of rows) {
+        if (!customerMap[r.customerName]) continue;
+        (byCust[r.customerName] ||= new Set()).add(r.invoiceNo);
+      }
+      const invoiceMap = {}; // `${custId}|${docNo}` → invoice qb id
+      for (const [name, docSet] of Object.entries(byCust)) {
+        const custId = customerMap[name];
+        const docs = [...docSet];
+        // QBO IN list supports a generous number; we chunk just in case.
+        for (let i = 0; i < docs.length; i += 200) {
+          const chunk = docs.slice(i, i + 200);
+          const inList = chunk.map((d) => `'${escSql(d)}'`).join(',');
+          const j = await qbQuery(
+            `SELECT Id, DocNumber FROM Invoice WHERE CustomerRef = '${custId}' ` +
+            `AND DocNumber IN (${inList}) MAXRESULTS 1000`,
+          );
+          for (const inv of (j.QueryResponse?.Invoice || [])) {
+            invoiceMap[`${custId}|${inv.DocNumber}`] = String(inv.Id);
+          }
+        }
+      }
+
+      // 3. Build qbBatchCreatePayments items, attach row index for traceability
+      const items = [];
+      for (const r of rows) {
+        const custId = customerMap[r.customerName];
+        if (!custId) {
+          lookupErrors.push({ kind: 'customer_missing', row: r.rowNum, name: r.customerName });
+          continue;
+        }
+        const invId = invoiceMap[`${custId}|${r.invoiceNo}`];
+        if (!invId) {
+          lookupErrors.push({ kind: 'invoice_not_found', row: r.rowNum, customer: r.customerName, invoice_no: r.invoiceNo });
+          continue;
+        }
+        // SaasAnt date is M/D/YYYY or MM/DD/YYYY → convert to YYYY-MM-DD
+        const m = r.paymentDate.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        if (!m) {
+          lookupErrors.push({ kind: 'bad_date', row: r.rowNum, date: r.paymentDate });
+          continue;
+        }
+        const txnDate = `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+        items.push({
+          customerId: custId,
+          invoiceQbId: invId,
+          amount: r.amount,
+          memo: r.memo,
+          txnDate,
+          _rowNum: r.rowNum,
+        });
+      }
+
+      if (dryRun) {
+        return res.json({
+          ok: true,
+          dry_run: true,
+          total_rows: rows.length,
+          items_to_push: items.length,
+          lookup_errors: lookupErrors.length,
+          errors: lookupErrors.slice(0, 30),
+          sample_items: items.slice(0, 5).map((x) => ({
+            row: x._rowNum, customer_id: x.customerId, invoice_qb_id: x.invoiceQbId,
+            amount: x.amount, memo: x.memo, txn_date: x.txnDate,
+          })),
+        });
+      }
+
+      if (items.length === 0) {
+        return res.json({
+          ok: false,
+          total_rows: rows.length,
+          pushed: 0,
+          lookup_errors: lookupErrors.length,
+          errors: lookupErrors.slice(0, 30),
+          message: 'no items could be resolved; nothing pushed',
+        });
+      }
+
+      // 4. Batch push (30 per call, concurrency 4 → 131 rows finish in ~10 sec)
+      const chunks = [];
+      for (let i = 0; i < items.length; i += 30) chunks.push({ start: i, items: items.slice(i, i + 30) });
+      const qbIds = new Array(items.length);
+      const failures = [];
+      let cursor = 0;
+      const runOne = async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= chunks.length) return;
+          const { start, items: chunk } = chunks[idx];
+          try {
+            const results = await qbBatchCreatePayments(chunk);
+            for (let k = 0; k < chunk.length; k++) {
+              const r = results[k];
+              if (r.ok) qbIds[start + k] = r.id;
+              else failures.push({ row: chunk[k]._rowNum, memo: chunk[k].memo, error: String(r.error || '').slice(0, 250) });
+            }
+          } catch (err) {
+            const msg = String(err.message || err).slice(0, 250);
+            for (const it of chunk) failures.push({ row: it._rowNum, memo: it.memo, error: 'batch failed: ' + msg });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: 4 }, () => runOne()));
+
+      const pushed = qbIds.filter(Boolean);
+      res.json({
+        ok: failures.length === 0 && lookupErrors.length === 0,
+        total_rows: rows.length,
+        pushed: pushed.length,
+        failures: failures.length,
+        lookup_errors: lookupErrors.length,
+        qb_payment_ids: pushed,
+        failure_details: failures.slice(0, 30),
+        lookup_error_details: lookupErrors.slice(0, 30),
+      });
+    } catch (err) {
+      console.error('[saasant-payments/push]', err);
       res.status(500).json({ error: err.message });
     }
   });

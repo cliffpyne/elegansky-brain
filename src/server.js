@@ -677,7 +677,7 @@ mountAgentApi(app, { requireSharedSecret, requireSupabaseJwt, requirePhoneKey })
 mountLimboRecoveryApi(app, { requireSupabaseJwt });
 mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
-mountLoanSetupApi(app, { qbPost, qbBatchCreateInvoices, qbBatchDelete, requireSecretOrJwt });
+mountLoanSetupApi(app, { qbPost, qbBatchCreateInvoices, qbBatchCreatePayments, qbBatchDelete, requireSecretOrJwt });
 mountQbMirrorApi(app, { requireSecretOrJwt });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
