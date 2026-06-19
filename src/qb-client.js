@@ -49,16 +49,34 @@ async function refreshOnce() {
   if (!process.env.QB_CLIENT_ID || !process.env.QB_CLIENT_SECRET) {
     throw new Error('QB_CLIENT_ID/QB_CLIENT_SECRET env vars required');
   }
+  // Always reload from DB first. The intuit-oauth client in server.js shares this
+  // token row and rotates refresh_token on every refresh. Our in-memory copy may
+  // be stale and would 400 with invalid_grant if used directly.
+  _tokens = await loadTokens();
+  if (!isExpiringSoon(_tokens)) return;
   const auth = Buffer.from(`${process.env.QB_CLIENT_ID}:${process.env.QB_CLIENT_SECRET}`).toString('base64');
-  const r = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: 'Basic ' + auth,
-      Accept: 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(_tokens.refresh_token),
-  });
+  const doRefresh = async () => {
+    const r = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + auth,
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(_tokens.refresh_token),
+    });
+    return r;
+  };
+  let r = await doRefresh();
+  if (!r.ok && r.status === 400) {
+    // Re-read DB once more — another process may have rotated mid-call.
+    const fresh = await loadTokens();
+    if (fresh.refresh_token !== _tokens.refresh_token) {
+      _tokens = fresh;
+      if (!isExpiringSoon(_tokens)) return;
+      r = await doRefresh();
+    }
+  }
   if (!r.ok) throw new Error(`qb refresh ${r.status}: ${(await r.text()).slice(0, 300)}`);
   const j = await r.json();
   _tokens = { ...j, realmId: _tokens.realmId, acquiredAt: Date.now() };
