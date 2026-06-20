@@ -525,7 +525,7 @@ export function mountPaymentBatchesApi(app, deps) {
     try {
       // Read sheet + compute plan synchronously (cheap — single sheet read).
       const cfg = CHANNEL_SHEETS[channel];
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const planResult = computeCatchupPlan({ channel, sheet, nowUtcMs: Date.now() });
 
@@ -1020,7 +1020,7 @@ export function mountPaymentBatchesApi(app, deps) {
       for (const ch of channels) {
         const cfg = CHANNEL_SHEETS[ch];
         if (!cfg) { summary[ch] = { error: 'unknown channel' }; continue; }
-        const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H80000`);
+        const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:H200000`);
         const rows = sheetData.values || sheetData.data || [];
         // ref-without-suffix → sheet ISO string
         const refToSheetTs = new Map();
@@ -1755,7 +1755,7 @@ export function mountPaymentBatchesApi(app, deps) {
       if (!anchorIsoRaw) return res.status(400).json({ error: 'anchor_iso required' });
       const anchorTs = new Date(anchorIsoRaw);
       if (isNaN(+anchorTs)) return res.status(400).json({ error: 'invalid anchor_iso' });
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K200000`);
       const sheet = sheetData.values || sheetData.data || [];
       // First pass: find rows whose dates parse, mark their row numbers
       // and timestamps. Find the index range around the anchor (rows
@@ -1952,7 +1952,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const winStart = new Date(String(req.body?.since_iso || ''));
       const winEnd = new Date(String(req.body?.until_iso || ''));
       if (isNaN(+winStart) || isNaN(+winEnd)) return res.status(400).json({ error: 'since_iso/until_iso required' });
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const rows = [];
       let total = 0;
@@ -1998,7 +1998,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const winStart = new Date(String(req.body?.since_iso || ''));
       const winEnd = new Date(String(req.body?.until_iso || ''));
       if (isNaN(+winStart) || isNaN(+winEnd)) return res.status(400).json({ error: 'since_iso/until_iso required' });
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K200000`);
       const sheet = sheetData.values || sheetData.data || [];
       let maxKRow = 0;
       let kSamples = [];
@@ -2069,7 +2069,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const sinceIso = new Date(String(req.body?.since_iso || ''));
       const untilIso = new Date(String(req.body?.until_iso || ''));
       if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso and until_iso required' });
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const rowsInWindow = [];
       for (let i = 1; i < sheet.length; i++) {
@@ -2135,7 +2135,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const sinceIso = new Date(String(req.body?.since_iso || ''));
       const untilIso = new Date(String(req.body?.until_iso || ''));
       if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso and until_iso required' });
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:K200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const refMap = new Map(); // ref → [{row, date, amount, customer}]
       let inWindow = 0;
@@ -2431,7 +2431,7 @@ export function mountPaymentBatchesApi(app, deps) {
         }
       }
       // 1. Scan the sheet
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const sheetHits = new Map(); // bareRef → row info
       for (let i = 1; i < sheet.length; i++) {
@@ -2516,7 +2516,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const cfg = CHANNEL_SHEETS[channel];
       const sinceIso = req.query.since_iso ? new Date(String(req.query.since_iso)) : null;
       const untilIso = req.query.until_iso ? new Date(String(req.query.until_iso)) : null;
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J200000`);
       const rows = sheetData.values || sheetData.data || [];
       const now = Date.now();
       const STALE_MS = 10 * 60 * 1000;
@@ -2597,7 +2597,7 @@ export function mountPaymentBatchesApi(app, deps) {
       const reason = String(req.body?.reason || 'operator window recall via void-by-sheet-window');
 
       // 1. Read sheet and collect (sheet_row, bank_ref_with_suffix) for rows in window
-      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J80000`);
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:J200000`);
       const sheet = sheetData.values || sheetData.data || [];
       const refToRow = new Map();           // bank_ref_with_suffix → sheet_row_number
       const rowAmounts = new Map();         // sheet_row_number → amount (for display)
@@ -5247,7 +5247,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // Column L holds "QB_DUPLICATE <qb_id>" markers when the dup-check
   // discovered a ref already in QB (SaasAnt / manual processor / prior
   // BRAIN run). Read A:L so the skip logic can honor those too.
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L80000`);
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
   const sheet = sheetData.values || sheetData.data || [];
   // Find the highest row index whose Column K holds a BRAIN end-of-tick
   // marker. Only values that start with "end of " are treated as

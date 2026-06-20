@@ -200,7 +200,7 @@ export async function eraseDryRunMarkers(spreadsheetId, tabName) {
   const sheetId = tab.properties.sheetId;
 
   // Find rows with any (DRY_RUN) marker in I/J/K
-  const data = await readSheet(spreadsheetId, `${tabName}!A1:K80000`);
+  const data = await readSheet(spreadsheetId, `${tabName}!A1:K200000`);
   const rows = data.values || data.data || [];
   const dryRunRows = []; // 1-based row numbers
   for (let i = 0; i < rows.length; i++) {

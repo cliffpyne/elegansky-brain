@@ -74,7 +74,7 @@ export const TOOLS = [
       type: 'object',
       properties: {
         spreadsheetId: { type: 'string' },
-        range: { type: 'string', description: 'A1 notation, e.g. "PASSED!A1:H80000"' },
+        range: { type: 'string', description: 'A1 notation, e.g. "PASSED!A1:H200000"' },
       },
       required: ['spreadsheetId', 'range'],
     },

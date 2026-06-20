@@ -1233,7 +1233,7 @@ app.get('/api/admin/sheet-ref-lookup', async (req, res) => {
   try {
     const refs = String(req.query.refs || '').split(',').map((s) => s.trim()).filter(Boolean);
     if (refs.length === 0) return res.status(400).json({ error: 'refs query param required' });
-    const { values } = await readSheet(NMB_PASSED_SHEET_ID, `${NMB_PASSED_TAB}!A1:L80000`);
+    const { values } = await readSheet(NMB_PASSED_SHEET_ID, `${NMB_PASSED_TAB}!A1:L200000`);
     const sheet = values || [];
     const out = [];
     // Strip N suffix from refs to match raw bank refs in sheet (which don't have channel suffix)
@@ -1350,7 +1350,7 @@ app.get('/api/admin/catchup-plan', async (req, res) => {
     const nowUtcMs = Date.now();
     const out = { now_utc_iso: new Date(nowUtcMs).toISOString(), channels: {} };
     for (const { channel, sheetId, tab } of ALL_CHANNEL_SHEETS) {
-      const { values } = await readSheet(sheetId, `${tab}!A1:L80000`);
+      const { values } = await readSheet(sheetId, `${tab}!A1:L200000`);
       out.channels[channel] = computeCatchupPlan({ channel, sheet: values || [], nowUtcMs });
     }
     res.json(out);
