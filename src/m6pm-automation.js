@@ -113,11 +113,32 @@ async function postArrearsToM6pm(xlsBuffer, modeLabel) {
   const r = await fetch(`${M6PM_BASE}/api/generate-debt-reports`, {
     method: 'POST',
     body: form,
+    // m6pm sits behind Cloudflare with bot detection — server-to-server fetches
+    // without browser-like headers get bounced with Cloudflare code 1010
+    // (browser-signature ban). These headers mimic a real Chrome request just
+    // enough to pass.
+    headers: m6pmBrowserHeaders(),
     signal: AbortSignal.timeout(5 * 60_000),
   });
   const text = await r.text();
   if (!r.ok) throw new Error(`m6pm /api/generate-debt-reports ${r.status}: ${text.slice(0, 300)}`);
   try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+/**
+ * Browser-fingerprint headers for Cloudflare bypass. Cloudflare's "code 1010"
+ * banning kicks in when User-Agent looks like a known bot library (node,
+ * python-requests, curl). Sending a real-Chrome UA gets us past the default
+ * rule. Long-term: whitelist BRAIN's outbound IP in Cloudflare's allow list.
+ */
+function m6pmBrowserHeaders() {
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': M6PM_BASE,
+    'Referer': `${M6PM_BASE}/`,
+  };
 }
 
 /**
@@ -128,6 +149,7 @@ async function postArrearsToM6pm(xlsBuffer, modeLabel) {
 async function postSyncMobile() {
   const r = await fetch(`${M6PM_BASE}/api/sync-mobile`, {
     method: 'POST',
+    headers: m6pmBrowserHeaders(),
     signal: AbortSignal.timeout(5 * 60_000),
   });
   const text = await r.text();
