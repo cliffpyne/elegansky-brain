@@ -21,6 +21,7 @@ import { mountLoanSetupApi } from './loan-setup.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 import { mountQbMirrorApi } from './qb-mirror-api.js';
+import { mountM6pmApi } from './m6pm-automation.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
 import { getPrewarmHooks, computeAccountBalanceForSnapshot, computeSheetTotalsForSnapshot } from './mega-report.js';
@@ -679,6 +680,11 @@ mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
 mountLoanSetupApi(app, { qbPost, qbBatchCreateInvoices, qbBatchCreatePayments, qbBatchDelete, requireSecretOrJwt });
 mountQbMirrorApi(app, { requireSecretOrJwt });
+mountM6pmApi(app, {
+  requireSecretOrJwt,
+  sharedSecret: process.env.STATEMENT_REPORT_SECRET,
+  pool: db(),
+});
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
 // router handles all client-side paths. QB OAuth status moves to /api/qb/status
