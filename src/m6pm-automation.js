@@ -449,12 +449,18 @@ async function pocFailureAlertWatcher({ pool }) {
     const minutesPastTick = (eatHr - hour) * 60 + (eatMin - min);
     if (minutesPastTick < FAILURE_GRACE_MIN) continue;
 
-    // Did this tick produce ANY finalized batches today?
+    // Did this tick produce ANY finalized batches today (EAT midnight,
+    // not UTC midnight — earlier code used the wrong cast and missed
+    // meru0100 batches that finalize between 01:00 and 03:00 EAT which
+    // is "yesterday" in UTC).
     const ok = await pool.query(
       `SELECT id FROM payment_batches
         WHERE created_by LIKE $1
           AND status = 'finalized'
-          AND created_at >= (date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam'))::timestamptz
+          AND created_at >= (
+            date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
+            AT TIME ZONE 'Africa/Dar_es_Salaam'
+          )
         LIMIT 1`,
       [`auto-upload:${tick}%`],
     );
@@ -512,14 +518,22 @@ async function pocFailureAlertWatcher({ pool }) {
  * — exceptions are caught and logged so a watcher hiccup never crashes BRAIN.
  */
 export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
+  let running = false;
   const tick = async () => {
-    try { await autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase: brainBase }); }
-    catch (err) { console.error('[m6pm/autofire watcher]', err.message); }
-    try { await pocFailureAlertWatcher({ pool }); }
-    catch (err) { console.error('[m6pm/poc-alert watcher]', err.message); }
+    if (running) return; // prevent overlap if a prior cycle is still in flight
+    running = true;
+    try {
+      try { await autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase: brainBase }); }
+      catch (err) { console.error('[m6pm/autofire watcher]', err.message); }
+      try { await pocFailureAlertWatcher({ pool }); }
+      catch (err) { console.error('[m6pm/poc-alert watcher]', err.message); }
+    } finally {
+      running = false;
+    }
   };
-  // First tick after 60s — give BRAIN time to finish boot before hammering DB.
-  setTimeout(tick, 60_000);
+  // setInterval only — earlier code also called setTimeout(tick, 60_000) which
+  // raced with the interval's first tick, causing double-counts in the
+  // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert watchers armed');
+  console.log('[m6pm/watchers] auto-fire + POC-alert watchers armed (60s interval, no overlap)');
 }
