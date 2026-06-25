@@ -263,3 +263,263 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     res.json({ ok: true, message: 'morning gate cleared — next morning trigger will sync + notify' });
   });
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// AUTO-FIRE WATCHERS
+//
+// Two crons running in the BRAIN process — both poll every 60s:
+//
+//   1. autoFireReportsWatcher — when a tick (meru0100 / lengai1230 / kili1615)
+//      finalizes its batches, automatically fire m6pm /api/generate-debt-reports
+//      with the right mode (morning / afternoon / evening). For MORNING only,
+//      the once-a-day gate also triggers /api/sync-mobile so officers' phones
+//      get the day's fresh invoice state ONCE per day.
+//
+//   2. pocFailureAlertWatcher — detects ticks that are >=20 min late with no
+//      batches created. Tracks consecutive failures in app_settings. At 3 in
+//      a row, sends an SMS to 255752900450 (the boss phone) so the operator
+//      can check the POC/relay before the day's collection report goes out
+//      with stale numbers.
+// ────────────────────────────────────────────────────────────────────────────
+
+const REPORT_TICKS = {
+  meru0100: 'morning',
+  lengai1230: 'afternoon',
+  kili1615: 'evening',
+};
+
+// All 9 scheduled ticks with EAT fire time (24h). Used by the failure
+// watcher to know which ticks should have produced batches by now.
+const TICK_SCHEDULE_EAT = [
+  { tick: 'meru0100', hour: 1, min: 0 },
+  { tick: 'meru0300', hour: 3, min: 0 },
+  { tick: 'hanang0700', hour: 7, min: 0 },
+  { tick: 'loolmalas1000', hour: 10, min: 0 },
+  { tick: 'lengai1230', hour: 12, min: 30 },
+  { tick: 'mawenzi1400', hour: 14, min: 0 },
+  { tick: 'kili1615', hour: 16, min: 15 },
+  { tick: 'kibo1900', hour: 19, min: 0 },
+  { tick: 'kibo2100', hour: 21, min: 0 },
+];
+
+const POC_FAILURE_THRESHOLD = 3;
+const POC_FAILURE_ALERT_PHONE = '255752900450';
+const FAILURE_GRACE_MIN = 20; // wait 20 min after scheduled tick before declaring failure
+const NEXTSMS_API = 'https://messaging-service.co.tz/api/sms/v1/text/single';
+
+/**
+ * Send a one-shot SMS via NextSMS. Requires NEXTSMS_USERNAME +
+ * NEXTSMS_PASSWORD + NEXTSMS_SENDER_ID env vars (same credentials m6pm
+ * uses — set them on BRAIN's Render service). Logs and swallows errors
+ * so a watcher cron doesn't crash on transient SMS-gateway hiccups.
+ */
+async function sendNextSms(phone, text) {
+  const user = process.env.NEXTSMS_USERNAME;
+  const pass = process.env.NEXTSMS_PASSWORD;
+  const sender = process.env.NEXTSMS_SENDER_ID || 'NEXTSMS';
+  if (!user || !pass) {
+    console.warn('[m6pm/sms] NEXTSMS_USERNAME/PASSWORD not set — skipping SMS');
+    return { skipped: true, reason: 'no_credentials' };
+  }
+  try {
+    const auth = Buffer.from(`${user}:${pass}`).toString('base64');
+    const r = await fetch(NEXTSMS_API, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: sender, to: phone, text }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = await r.text();
+    if (!r.ok) {
+      console.error(`[m6pm/sms] NextSMS ${r.status}: ${body.slice(0, 200)}`);
+      return { ok: false, status: r.status, body: body.slice(0, 200) };
+    }
+    console.log(`[m6pm/sms] sent to ${phone}: "${text.slice(0, 60)}..."`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[m6pm/sms] threw:`, err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Watcher #1: scan finalized batches for the report-fire ticks and
+ * trigger the m6pm flow if not already fired today.
+ *
+ * Sequence per trigger:
+ *   1. fetchAllArrears (paginate /arrears for live invoice list)
+ *   2. buildArrearsXls (QB-format .xls)
+ *   3. postArrearsToM6pm (m6pm generates per-agent debt reports)
+ *   4. (morning only, once-a-day) postSyncMobile → officers' phones refresh
+ *
+ * Idempotency: per-day-per-tick gate in app_settings prevents duplicate
+ * fires even if multiple BRAIN processes are running.
+ */
+async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
+  if (process.env.M6PM_AUTO_FIRE !== 'true') return;
+  const today = todayYmdEat();
+  for (const [tick, mode] of Object.entries(REPORT_TICKS)) {
+    const gateKey = `m6pm_auto_fired:${today}:${tick}`;
+    const gate = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [gateKey]);
+    if (gate.rows.length) continue; // already fired today
+
+    // Need at least one finalized batch for this tick within the last 30 min.
+    const recent = await pool.query(
+      `SELECT id FROM payment_batches
+        WHERE created_by LIKE $1
+          AND status = 'finalized'
+          AND finalized_at > now() - interval '30 minutes'
+        LIMIT 1`,
+      [`auto-upload:${tick}%`],
+    );
+    if (!recent.rows.length) continue;
+
+    // Atomic gate acquire — only one BRAIN process wins.
+    const acquired = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, 'firing')
+         ON CONFLICT (key) DO NOTHING
+         RETURNING value`,
+      [gateKey],
+    );
+    if (!acquired.rows.length) continue;
+
+    console.log(`[m6pm/autofire] ${tick} → mode=${mode} — starting report fire`);
+    try {
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret });
+      const buf = buildArrearsXls(arrears, null);
+      await postArrearsToM6pm(buf, mode);
+      let syncResult = null;
+      if (mode === 'morning') {
+        const got = await morningGateAcquired(pool, today);
+        if (got) {
+          try {
+            syncResult = await postSyncMobile();
+            console.log(`[m6pm/autofire] ${tick} sync-mobile fired (morning gate acquired)`);
+          } catch (e) {
+            console.error(`[m6pm/autofire] sync-mobile failed:`, e.message);
+            syncResult = { error: e.message };
+          }
+        } else {
+          syncResult = '(skipped — morning gate already claimed today)';
+        }
+      }
+      // Mark fired
+      await pool.query(
+        `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
+        [gateKey],
+      );
+      console.log(`[m6pm/autofire] ${tick} DONE arrears=${arrears.length} sync=${syncResult ? 'fired' : 'n/a'}`);
+    } catch (err) {
+      console.error(`[m6pm/autofire] ${tick} failed:`, err.message);
+      // Roll back the gate so a later retry can pick it up.
+      await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
+    }
+  }
+}
+
+/**
+ * Watcher #2: detect ticks that haven't produced batches by the
+ * grace deadline and SMS the boss after 3 consecutive failures. Reset
+ * the counter on any success.
+ *
+ * Stored in app_settings:
+ *   m6pm_poc_consec_failures = "N" (count)
+ *   m6pm_poc_last_alerted_ymd = "YYYY-MM-DD" (per-day SMS dedup)
+ *   m6pm_poc_seen_ticks:${ymd} = comma-separated list of ticks we already
+ *                                evaluated today (so we don't double-count)
+ */
+async function pocFailureAlertWatcher({ pool }) {
+  if (process.env.M6PM_POC_ALERTS !== 'true') return;
+  const today = todayYmdEat();
+  const now = new Date();
+  const eatNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const eatHr = eatNow.getUTCHours();
+  const eatMin = eatNow.getUTCMinutes();
+
+  const seenKey = `m6pm_poc_seen_ticks:${today}`;
+  const seenRow = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [seenKey]);
+  const seen = new Set((seenRow.rows[0]?.value || '').split(',').filter(Boolean));
+
+  for (const { tick, hour, min } of TICK_SCHEDULE_EAT) {
+    if (seen.has(tick)) continue;
+    // Skip ticks not yet past the grace window.
+    const minutesPastTick = (eatHr - hour) * 60 + (eatMin - min);
+    if (minutesPastTick < FAILURE_GRACE_MIN) continue;
+
+    // Did this tick produce ANY finalized batches today?
+    const ok = await pool.query(
+      `SELECT id FROM payment_batches
+        WHERE created_by LIKE $1
+          AND status = 'finalized'
+          AND created_at >= (date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam'))::timestamptz
+        LIMIT 1`,
+      [`auto-upload:${tick}%`],
+    );
+
+    const seenList = [...seen, tick].join(',');
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [seenKey, seenList],
+    );
+    seen.add(tick);
+
+    if (ok.rows.length) {
+      // Success → reset consecutive-failure counter.
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('m6pm_poc_consec_failures', '0')
+           ON CONFLICT (key) DO UPDATE SET value='0', updated_at=now()`,
+      );
+      console.log(`[m6pm/poc-alert] ${tick} ✓ — reset failure counter`);
+      continue;
+    }
+
+    // Failure — increment counter atomically.
+    const inc = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('m6pm_poc_consec_failures', '1')
+         ON CONFLICT (key) DO UPDATE
+           SET value = (COALESCE(app_settings.value, '0')::int + 1)::text,
+               updated_at = now()
+         RETURNING value`,
+    );
+    const failures = parseInt(inc.rows[0].value, 10);
+    console.warn(`[m6pm/poc-alert] ${tick} ❌ — consecutive failures: ${failures}`);
+
+    if (failures >= POC_FAILURE_THRESHOLD) {
+      // Per-day dedup so we don't spam the boss with one SMS per tick.
+      const alertedKey = 'm6pm_poc_last_alerted_ymd';
+      const alerted = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [alertedKey]);
+      if (alerted.rows[0]?.value === today) {
+        console.log(`[m6pm/poc-alert] already alerted today — skipping`);
+        continue;
+      }
+      const text = `BRAIN: ${failures} consecutive scheduled-tick failures today (${today}). Latest fail: ${tick}. Check POC/relay/phone.`;
+      await sendNextSms(POC_FAILURE_ALERT_PHONE, text);
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [alertedKey, today],
+      );
+    }
+  }
+}
+
+/**
+ * Start both watchers on BRAIN boot. Each runs every 60s. They're best-effort
+ * — exceptions are caught and logged so a watcher hiccup never crashes BRAIN.
+ */
+export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
+  const tick = async () => {
+    try { await autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase: brainBase }); }
+    catch (err) { console.error('[m6pm/autofire watcher]', err.message); }
+    try { await pocFailureAlertWatcher({ pool }); }
+    catch (err) { console.error('[m6pm/poc-alert watcher]', err.message); }
+  };
+  // First tick after 60s — give BRAIN time to finish boot before hammering DB.
+  setTimeout(tick, 60_000);
+  setInterval(tick, 60_000);
+  console.log('[m6pm/watchers] auto-fire + POC-alert watchers armed');
+}

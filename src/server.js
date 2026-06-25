@@ -21,7 +21,7 @@ import { mountLoanSetupApi } from './loan-setup.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 import { mountQbMirrorApi } from './qb-mirror-api.js';
-import { mountM6pmApi } from './m6pm-automation.js';
+import { mountM6pmApi, startM6pmWatchers } from './m6pm-automation.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
 import { getPrewarmHooks, computeAccountBalanceForSnapshot, computeSheetTotalsForSnapshot } from './mega-report.js';
@@ -684,6 +684,11 @@ mountM6pmApi(app, {
   requireSecretOrJwt,
   sharedSecret: process.env.STATEMENT_REPORT_SECRET,
   pool: db(),
+});
+startM6pmWatchers({
+  pool: db(),
+  sharedSecret: process.env.STATEMENT_REPORT_SECRET,
+  brainBase: process.env.BRAIN_BASE_URL || 'https://elegansky-brain.onrender.com',
 });
 
 // (legacy / homepage removed — the Vite dashboard now owns "/" and the React
