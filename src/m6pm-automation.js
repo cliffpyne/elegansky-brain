@@ -229,22 +229,14 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         m6pm_reports: m6pmReports,
         sync_mobile: null,
       };
+      // SAFETY: the manual /trigger endpoint NEVER fires sync-mobile, even
+      // for mode=morning. Frank 2026-06-25: each sync-mobile re-fire WIPES
+      // officers' in-progress work. Sync-mobile only fires from the auto
+      // path (post-meru0100 hook in production), gated by morningGateAcquired().
+      // Manual /trigger is for testing report generation in isolation.
       if (mode === 'morning') {
-        const today = todayYmdEat();
-        const acquired = await morningGateAcquired(pool, today);
-        if (acquired) {
-          try {
-            result.sync_mobile = await postSyncMobile();
-            result.morning_gate = 'acquired';
-          } catch (syncErr) {
-            console.error('[m6pm/trigger] sync-mobile failed:', syncErr.message);
-            result.sync_mobile_error = syncErr.message;
-            result.morning_gate = 'acquired_but_sync_failed';
-          }
-        } else {
-          result.morning_gate = 'already_done_today';
-          result.sync_mobile = '(skipped — already done today)';
-        }
+        result.sync_mobile = '(SKIPPED — manual /trigger never syncs mobile; auto path only)';
+        result.morning_gate = '(not touched by manual /trigger)';
       }
       res.json(result);
     } catch (err) {
