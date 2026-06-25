@@ -884,7 +884,7 @@ app.get('/arrears', async (req, res) => {
       while (start < 200_000) {
         const sql =
           `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-          `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
+          `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
           `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
         const r = await qbQuery(sql);
         const invs = r.QueryResponse?.Invoice ?? [];
@@ -914,7 +914,7 @@ app.get('/arrears', async (req, res) => {
     const fetchSize = branchFilter || qFilter ? Math.min(1000, pageSize * 4) : pageSize;
     const sql =
       `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-      `FROM Invoice WHERE Balance > '0' AND DueDate < '${asOf}' ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
       `STARTPOSITION ${start} MAXRESULTS ${fetchSize}`;
     const r = await qbQuery(sql);
     const raw = r.QueryResponse?.Invoice ?? [];
