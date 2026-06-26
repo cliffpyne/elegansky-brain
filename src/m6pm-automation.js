@@ -514,8 +514,102 @@ async function pocFailureAlertWatcher({ pool }) {
 }
 
 /**
- * Start both watchers on BRAIN boot. Each runs every 60s. They're best-effort
- * — exceptions are caught and logged so a watcher hiccup never crashes BRAIN.
+ * Watcher #3: per-tick result SMS to 255752900450. After each scheduled
+ * tick's first batches finalize, send ONE SMS summarising paid count +
+ * TZS per channel. If no batches by grace deadline (+20 min from tick),
+ * send an error SMS instead. Per-tick-per-day dedup so Frank gets exactly
+ * one SMS per tick. Env-gated TICK_RESULT_SMS=true.
+ *
+ * Stored in app_settings:
+ *   m6pm_tick_notif:${ymd}:${tick} = "ok" | "err" (mark so we don't re-SMS)
+ */
+async function tickResultNotifierWatcher({ pool }) {
+  if (process.env.TICK_RESULT_SMS !== 'true') return;
+  const today = todayYmdEat();
+  const now = new Date();
+  const eatNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const eatHr = eatNow.getUTCHours();
+  const eatMin = eatNow.getUTCMinutes();
+
+  for (const { tick, hour, min } of TICK_SCHEDULE_EAT) {
+    const notifKey = `m6pm_tick_notif:${today}:${tick}`;
+    const already = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [notifKey]);
+    if (already.rows.length) continue;
+
+    const minutesPastTick = (eatHr - hour) * 60 + (eatMin - min);
+    // Hold off until the tick has had time to start (5 min after fire).
+    // Reasoning: 4-5 min for scrapers + arrears + push to QB.
+    if (minutesPastTick < 5) continue;
+
+    // Roll up paid + unused per channel for this tick today (EAT day).
+    const stats = await pool.query(
+      `SELECT channel,
+              COALESCE(SUM(paid_count), 0)::int   AS paid_count,
+              COALESCE(SUM(paid_total), 0)::numeric AS paid_total,
+              COALESCE(SUM(unused_count), 0)::int AS unused_count,
+              MAX(finalized_at)                   AS last_finalized
+         FROM payment_batches
+        WHERE created_by LIKE $1
+          AND status = 'finalized'
+          AND created_at >= (
+            date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
+            AT TIME ZONE 'Africa/Dar_es_Salaam'
+          )
+        GROUP BY channel
+        ORDER BY channel`,
+      [`auto-upload:${tick}%`],
+    );
+
+    // Atomic claim — only one BRAIN process sends the SMS.
+    const claim = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, 'sending')
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [notifKey],
+    );
+    if (!claim.rows.length) continue;
+
+    let text;
+    let resultLabel;
+    if (stats.rows.length === 0) {
+      // No finalized batches yet. If past +20 min grace → error SMS. Otherwise
+      // release claim and wait for next 60s tick.
+      if (minutesPastTick < FAILURE_GRACE_MIN) {
+        await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
+        continue;
+      }
+      text = `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — check POC/scrapers/phone`;
+      resultLabel = 'err';
+    } else {
+      const parts = stats.rows.map((r) => {
+        const ch = r.channel === 'nmbnew' ? 'NMB'
+                 : r.channel === 'bank' ? 'Bnk'
+                 : r.channel === 'iphone_bank' ? 'Iph'
+                 : r.channel;
+        const tzs = Number(r.paid_total) || 0;
+        const tzsStr = tzs >= 1_000_000
+          ? `${(tzs / 1_000_000).toFixed(2)}M`
+          : tzs >= 1_000
+          ? `${(tzs / 1_000).toFixed(0)}k`
+          : String(tzs);
+        return `${ch} ${r.paid_count}p/${tzsStr}`;
+      });
+      text = `BRAIN ${tick} ✓ ${parts.join(' ')}`;
+      resultLabel = 'ok';
+    }
+
+    const smsResult = await sendNextSms(POC_FAILURE_ALERT_PHONE, text);
+    await pool.query(
+      `UPDATE app_settings SET value=$2, updated_at=now() WHERE key=$1`,
+      [notifKey, resultLabel + (smsResult.ok === false ? ':sms_failed' : '')],
+    );
+    console.log(`[m6pm/tick-notif] ${tick} → ${resultLabel} sms="${text}"`);
+  }
+}
+
+/**
+ * Start all three watchers on BRAIN boot. Each runs every 60s. They're
+ * best-effort — exceptions are caught and logged so a watcher hiccup
+ * never crashes BRAIN.
  */
 export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   let running = false;
@@ -527,6 +621,8 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/autofire watcher]', err.message); }
       try { await pocFailureAlertWatcher({ pool }); }
       catch (err) { console.error('[m6pm/poc-alert watcher]', err.message); }
+      try { await tickResultNotifierWatcher({ pool }); }
+      catch (err) { console.error('[m6pm/tick-notif watcher]', err.message); }
     } finally {
       running = false;
     }
@@ -535,5 +631,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert watchers armed (60s interval, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif watchers armed (60s, no overlap)');
 }
