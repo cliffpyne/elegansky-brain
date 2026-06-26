@@ -469,7 +469,11 @@ export async function cdcSync(entity) {
     // with that exact second, but the overlap window + QB webhook backstop
     // catch stragglers, and this beats infinite stall.
     let advanceTo = maxLastUpdated;
-    if (rows === CDC_MAX_ROWS) {
+    // Stall-escape: any time max <= baseline (regardless of page size),
+    // we're spinning on the same rows. Page-full was the original trigger
+    // but CreditMemo proves it: getting rows=1 per tick all at the same
+    // baseline timestamp also stalls. Drop the page-full requirement.
+    {
       const baselineMs = baseline.getTime();
       const maxMs = new Date(maxLastUpdated).getTime();
       if (maxMs <= baselineMs) {
