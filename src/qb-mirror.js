@@ -473,11 +473,14 @@ export async function cdcSync(entity) {
       const baselineMs = baseline.getTime();
       const maxMs = new Date(maxLastUpdated).getTime();
       if (maxMs <= baselineMs) {
-        const bumpedMs = maxMs + 1000;
+        // Force-advance past the BASELINE, not the max — max can be ≤ baseline
+        // when QB's clock + our prior store rounded to the same second, and
+        // bumping past max would re-land on baseline (GREATEST(...) keeps it).
+        const bumpedMs = baselineMs + 1000;
         advanceTo = new Date(bumpedMs).toISOString();
         console.warn(
-          `[cdc] ${entity}: STUCK on duplicate timestamps at ${maxLastUpdated} ` +
-            `(page full + max<=baseline) — forcing +1s advance to ${advanceTo}`,
+          `[cdc] ${entity}: STUCK on duplicate timestamps (max=${maxLastUpdated} ≤ ` +
+            `baseline=${baseline.toISOString()}) — forcing baseline+1s to ${advanceTo}`,
         );
       }
     }
