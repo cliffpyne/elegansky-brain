@@ -78,13 +78,17 @@ const auth = { Authorization: `Bearer ${API_TOKEN}` };
 let polling = false;
 
 client.on('qr', (qr) => {
-  // Print to logs so the operator can scan from the Render dashboard.
-  // Flush by calling .write directly — qrcode-terminal uses console.log
-  // which Render usually flushes immediately, but be safe.
+  // Render's log viewer uses a tall-aspect monospace font that mangles
+  // qrcode-terminal's ASCII art (each ▄/█ char is ~2x as tall as wide
+  // → QR squished vertical → camera can't lock). Log a real PNG URL via
+  // a public QR-rendering service so the operator can open it in any
+  // browser tab and scan a clean image from the screen.
   process.stdout.write('\n────────────────────────────────────────────\n');
-  process.stdout.write('  Scan this QR with WhatsApp → Linked Devices\n');
-  process.stdout.write('  (Operator phone: 255752900450)\n');
-  process.stdout.write('────────────────────────────────────────────\n\n');
+  process.stdout.write('  WhatsApp QR ready — phone 255752900450\n');
+  process.stdout.write('────────────────────────────────────────────\n');
+  const url = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`;
+  process.stdout.write(`\n  → OPEN THIS URL IN A BROWSER, THEN SCAN THE PNG:\n  ${url}\n\n`);
+  process.stdout.write('  (ASCII version below — usually unreadable in browser log viewers)\n\n');
   qrcode.generate(qr, { small: true });
 });
 
