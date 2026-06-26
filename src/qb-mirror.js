@@ -460,6 +460,27 @@ export async function cdcSync(entity) {
     }
   }
   if (maxLastUpdated) {
+    // Duplicate-timestamp escape: when QB returns a full page of CDC_MAX_ROWS
+    // rows AND maxLastUpdated <= baseline, we're stuck on a cluster of rows
+    // sharing the same MetaData.LastUpdatedTime (e.g. a bulk import or sync
+    // operation in QB that timestamped >1000 rows identically). Without
+    // escaping we re-query the same 1000 rows every tick forever. Force-
+    // advance by +1 second past the stuck timestamp — may skip a few rows
+    // with that exact second, but the overlap window + QB webhook backstop
+    // catch stragglers, and this beats infinite stall.
+    let advanceTo = maxLastUpdated;
+    if (rows === CDC_MAX_ROWS) {
+      const baselineMs = baseline.getTime();
+      const maxMs = new Date(maxLastUpdated).getTime();
+      if (maxMs <= baselineMs) {
+        const bumpedMs = maxMs + 1000;
+        advanceTo = new Date(bumpedMs).toISOString();
+        console.warn(
+          `[cdc] ${entity}: STUCK on duplicate timestamps at ${maxLastUpdated} ` +
+            `(page full + max<=baseline) — forcing +1s advance to ${advanceTo}`,
+        );
+      }
+    }
     await db().query(
       `UPDATE qb_mirror_state
           SET last_cdc_at = GREATEST(last_cdc_at, $1),
@@ -467,7 +488,7 @@ export async function cdcSync(entity) {
               last_error = NULL,
               last_error_at = NULL
         WHERE entity = $3`,
-      [maxLastUpdated, rows, entity],
+      [advanceTo, rows, entity],
     );
   }
   return { entity, rows, deleted: 0, max_last_updated: maxLastUpdated, took_ms: Date.now() - t0 };
