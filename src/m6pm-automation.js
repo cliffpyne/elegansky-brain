@@ -662,6 +662,18 @@ async function phoneHeartbeatWatcher({ pool }) {
   const eatMin = eatNow.getUTCMinutes();
   const eatTotalMin = eatHr * 60 + eatMin;
 
+  // Ensure the table exists before querying. Phone APK creates it on first
+  // POST too — making it idempotent here means the watcher works cleanly
+  // even before the APK has ever checked in (just always flags "offline").
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS phone_heartbeats (
+       id BIGSERIAL PRIMARY KEY,
+       phone TEXT NOT NULL,
+       battery_pct INT,
+       received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
+  );
+
   // Find heartbeats for the master admin phone in last HEARTBEAT_STALE_MIN.
   const hb = await pool.query(
     `SELECT battery_pct, received_at
