@@ -1,0 +1,19 @@
+{
+  "name": "elegansky-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WhatsApp Web bridge — polls m6pm whatsapp_deliveries queue and delivers report files to a configured WhatsApp group.",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "list-groups": "LIST_GROUPS=1 node bridge.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}
