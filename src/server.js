@@ -1623,7 +1623,7 @@ app.get('/api/nmb-pull/state', async (req, res) => {
   try {
     const pool = (await import('./db/pool.js')).db();
     const rows = (await pool.query(
-      `SELECT key, value FROM app_settings WHERE key IN ('nmb_pull_requested_at','nmb_pull_completed_at','nmb_pull_result_json')`,
+      `SELECT key, value FROM app_settings WHERE key IN ('nmb_pull_requested_at','nmb_pull_completed_at','nmb_pull_result_json','nmb_pull_last_ok_completed_at')`,
     )).rows;
     const m = {};
     for (const r of rows) m[r.key] = r.value;
@@ -1637,6 +1637,7 @@ app.get('/api/nmb-pull/state', async (req, res) => {
     res.json({
       requested_at: requested || null,
       completed_at: completed || null,
+      last_ok_completed_at: m.nmb_pull_last_ok_completed_at || null,
       pending,
       result,
     });
@@ -1663,6 +1664,17 @@ app.post('/api/nmb-pull/complete', async (req, res) => {
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [JSON.stringify(result)],
     );
+    // Track the most recent SUCCESSFUL POC cycle separately so the
+    // statement-pull worker can tell "sheet has fresh rows from a recent
+    // good cycle" from "POC is wedged with stale data". On-demand failures
+    // overwrite completed_at + result, but last_ok_completed_at survives.
+    if (result && result.ok === true) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_last_ok_completed_at', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [now],
+      );
+    }
     res.json({ ok: true, completed_at: now });
   } catch (err) {
     console.error('[POST /api/nmb-pull/complete]', err);
