@@ -473,14 +473,25 @@ export async function cdcSync(entity) {
       const baselineMs = baseline.getTime();
       const maxMs = new Date(maxLastUpdated).getTime();
       if (maxMs <= baselineMs) {
-        // Force-advance past the BASELINE, not the max — max can be ≤ baseline
-        // when QB's clock + our prior store rounded to the same second, and
-        // bumping past max would re-land on baseline (GREATEST(...) keeps it).
-        const bumpedMs = baselineMs + 1000;
-        advanceTo = new Date(bumpedMs).toISOString();
+        // Stuck on a cluster of duplicate timestamps. Bump by 1 HOUR past
+        // baseline to escape. At 1s/tick we'd take 58 days to catch up; at
+        // 1hr/tick a 2-day lag closes in ~24 min real-time. The overlap
+        // window (CDC_OVERLAP_MS=5min) catches rows just below the new
+        // baseline on the next tick. Rows further back in the skipped hour
+        // that didn't make our 1000-row page are lost — acceptable because
+        // (a) this only triggers when QB clustered >1000 rows at one second,
+        // which is a bulk-import scenario, and (b) the next backfill/recon
+        // pass can be used to recover any genuinely missed rows.
+        const bumpedMs = baselineMs + 60 * 60 * 1000;
+        // Don't bump past "now" — if QB is genuinely caught up to our
+        // baseline and a tiny cluster of dups exists, bumping to a future
+        // timestamp would cause us to miss all future changes too.
+        const nowMs = Date.now();
+        const safeBumpMs = Math.min(bumpedMs, nowMs);
+        advanceTo = new Date(safeBumpMs).toISOString();
         console.warn(
-          `[cdc] ${entity}: STUCK on duplicate timestamps (max=${maxLastUpdated} ≤ ` +
-            `baseline=${baseline.toISOString()}) — forcing baseline+1s to ${advanceTo}`,
+          `[cdc] ${entity}: STUCK on duplicate-timestamp cluster (max=${maxLastUpdated} ≤ ` +
+            `baseline=${baseline.toISOString()}) — forcing +1h advance to ${advanceTo}`,
         );
       }
     }
