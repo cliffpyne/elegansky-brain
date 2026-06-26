@@ -1682,6 +1682,58 @@ app.post('/api/nmb-pull/complete', async (req, res) => {
   }
 });
 
+// Phone-side heartbeat — the OTP-relay phone APK POSTs this every ~60s
+// with {phone, battery_pct}. m6pm-automation's phoneHeartbeatWatcher reads
+// the table 15 min before every scheduled tick and SMSes the master admin
+// (255752900450) if the phone is offline or battery <50%.
+//
+// Auth: PHONE_API_KEY (same key the notifications APK already uses).
+// Table is created on first POST so no separate migration is needed.
+app.post('/api/phone/heartbeat', requirePhoneKey, async (req, res) => {
+  try {
+    const phone = String(req.body?.phone || '').replace(/[^0-9]/g, '');
+    const batteryPct = req.body?.battery_pct != null ? Number(req.body.battery_pct) : null;
+    if (!phone) return res.status(400).json({ error: 'phone required (E.164 digits)' });
+    if (batteryPct != null && (Number.isNaN(batteryPct) || batteryPct < 0 || batteryPct > 100)) {
+      return res.status(400).json({ error: 'battery_pct must be 0-100' });
+    }
+    const pool = (await import('./db/pool.js')).db();
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS phone_heartbeats (
+         id BIGSERIAL PRIMARY KEY,
+         phone TEXT NOT NULL,
+         battery_pct INT,
+         received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+       )`,
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_phone_hb_phone_received ON phone_heartbeats(phone, received_at DESC)`,
+    );
+    await pool.query(
+      `INSERT INTO phone_heartbeats (phone, battery_pct) VALUES ($1, $2)`,
+      [phone, batteryPct],
+    );
+    res.json({ ok: true, received_at: new Date().toISOString() });
+  } catch (err) {
+    console.error('[POST /api/phone/heartbeat]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Read-only inspector for the master admin's latest heartbeat (debug + dashboard).
+app.get('/api/phone/heartbeat', requireSecretOrJwt, async (_req, res) => {
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const r = await pool.query(
+      `SELECT phone, battery_pct, received_at FROM phone_heartbeats ORDER BY received_at DESC LIMIT 5`,
+    ).catch(() => ({ rows: [] }));
+    res.json({ heartbeats: r.rows });
+  } catch (err) {
+    console.error('[GET /api/phone/heartbeat]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 3-way reconciliation: compare BRAIN's payment_uploads vs QB's Payments
 // vs the sheet's processed rows for a given TxnDate. Groups by channel
 // suffix (N=nmbnew, B=bank, P=iphone_bank — detected from the trailing

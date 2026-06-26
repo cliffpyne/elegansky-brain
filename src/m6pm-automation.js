@@ -282,10 +282,14 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
 //      with stale numbers.
 // ────────────────────────────────────────────────────────────────────────────
 
+// Frank 2026-06-26: morning trigger is meru0300 (NOT meru0100 — that was the
+// pre-existing wrong mapping). kili1615 fires a COMPARISON report (morning vs
+// evening debt), not another debt report — handled separately in
+// fireKili1615Comparison() below since it needs two xls files.
 const REPORT_TICKS = {
-  meru0100: 'morning',
+  meru0300: 'morning',
   lengai1230: 'afternoon',
-  kili1615: 'evening',
+  // kili1615 handled via the comparison path — see fireKili1615Comparison.
 };
 
 // All 9 scheduled ticks with EAT fire time (24h). Used by the failure
@@ -303,8 +307,27 @@ const TICK_SCHEDULE_EAT = [
 ];
 
 const POC_FAILURE_THRESHOLD = 3;
-const POC_FAILURE_ALERT_PHONE = '255752900450';
+// Master admin = Frank's primary phone. Receives heartbeat-only alerts (15-min
+// pre-tick phone-offline check, battery <50%). Broadcast alerts (upload
+// success/error, 3-consec-failure) go to BROADCAST_PHONES instead.
+const MASTER_ADMIN_PHONE = '255752900450';
+// Default broadcast list mirrors m6pm's ADMIN_ALERT_NUMBERS (app.py:3536).
+// Override via SMS_BROADCAST_PHONES env var (comma-separated).
+const DEFAULT_BROADCAST_PHONES = [
+  '255752900450', // CLIFORD DENIS MASUI
+  '255719864511', // BIG BOWSSSS
+  '255785422245', // MADAM HAPPY
+  '255713123778', // FRANK MLAKI
+];
+function broadcastPhones() {
+  const raw = (process.env.SMS_BROADCAST_PHONES || '').trim();
+  if (!raw) return DEFAULT_BROADCAST_PHONES;
+  return raw.split(',').map((p) => p.trim()).filter(Boolean);
+}
 const FAILURE_GRACE_MIN = 20; // wait 20 min after scheduled tick before declaring failure
+const HEARTBEAT_PRE_TICK_MIN = 15; // pre-tick phone-online check
+const HEARTBEAT_STALE_MIN = 5; // heartbeat older than this = phone offline
+const BATTERY_ALERT_THRESHOLD = 50; // SMS Frank if battery drops below this
 const NEXTSMS_API = 'https://messaging-service.co.tz/api/sms/v1/text/single';
 
 /**
@@ -503,7 +526,10 @@ async function pocFailureAlertWatcher({ pool }) {
         continue;
       }
       const text = `BRAIN: ${failures} consecutive scheduled-tick failures today (${today}). Latest fail: ${tick}. Check POC/relay/phone.`;
-      await sendNextSms(POC_FAILURE_ALERT_PHONE, text);
+      // Broadcast — same list m6pm uses for completion alerts (ADMIN_ALERT_NUMBERS).
+      for (const phone of broadcastPhones()) {
+        await sendNextSms(phone, text);
+      }
       await pool.query(
         `INSERT INTO app_settings (key, value) VALUES ($1, $2)
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
@@ -597,17 +623,96 @@ async function tickResultNotifierWatcher({ pool }) {
       resultLabel = 'ok';
     }
 
-    const smsResult = await sendNextSms(POC_FAILURE_ALERT_PHONE, text);
+    // Broadcast to the full alert list — every tick result (success or
+    // error) reaches all admins, matching m6pm's send-notification flow.
+    let anyFailed = false;
+    for (const phone of broadcastPhones()) {
+      const r = await sendNextSms(phone, text);
+      if (r.ok === false) anyFailed = true;
+    }
     await pool.query(
       `UPDATE app_settings SET value=$2, updated_at=now() WHERE key=$1`,
-      [notifKey, resultLabel + (smsResult.ok === false ? ':sms_failed' : '')],
+      [notifKey, resultLabel + (anyFailed ? ':sms_partial' : '')],
     );
     console.log(`[m6pm/tick-notif] ${tick} → ${resultLabel} sms="${text}"`);
   }
 }
 
 /**
- * Start all three watchers on BRAIN boot. Each runs every 60s. They're
+ * Watcher #4: phone heartbeat — 15 min before every scheduled tick, check
+ * the phone_heartbeats table. If no fresh entry (<5 min old) → phone is
+ * offline → SMS Frank ONLY (master admin). Also alert Frank ONCE per day
+ * when battery drops below 50% so he can plug it in before a tick fires.
+ *
+ * Per-tick-per-day dedup (offline alert) + per-day dedup (battery alert).
+ * The phone-side APK is OWED separately (Frank's plan) — until it POSTs
+ * to /api/phone/heartbeat, the table is empty and this watcher correctly
+ * surfaces the gap to the master admin before every tick.
+ *
+ * Stored in app_settings:
+ *   m6pm_phone_offline:${ymd}:${tick} = "alerted"
+ *   m6pm_phone_battery_alerted_ymd    = "YYYY-MM-DD"
+ */
+async function phoneHeartbeatWatcher({ pool }) {
+  if (process.env.PHONE_HEARTBEAT_ALERTS !== 'true') return;
+  const today = todayYmdEat();
+  const now = new Date();
+  const eatNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const eatHr = eatNow.getUTCHours();
+  const eatMin = eatNow.getUTCMinutes();
+  const eatTotalMin = eatHr * 60 + eatMin;
+
+  // Find heartbeats for the master admin phone in last HEARTBEAT_STALE_MIN.
+  const hb = await pool.query(
+    `SELECT battery_pct, received_at
+       FROM phone_heartbeats
+      WHERE phone = $1
+        AND received_at >= now() - ($2 || ' minutes')::interval
+      ORDER BY received_at DESC LIMIT 1`,
+    [MASTER_ADMIN_PHONE, String(HEARTBEAT_STALE_MIN)],
+  );
+  const phoneOnline = hb.rows.length > 0;
+  const batteryPct = hb.rows[0]?.battery_pct ?? null;
+
+  // 1. Pre-tick offline check: 15 min before each scheduled tick.
+  for (const { tick, hour, min } of TICK_SCHEDULE_EAT) {
+    const tickTotalMin = hour * 60 + min;
+    const minutesUntilTick = tickTotalMin - eatTotalMin;
+    // Window: between T-15 and T+0. After T+0 the failure watcher takes over.
+    if (minutesUntilTick > HEARTBEAT_PRE_TICK_MIN || minutesUntilTick < 0) continue;
+    if (phoneOnline) continue; // good — no alert needed
+
+    const offKey = `m6pm_phone_offline:${today}:${tick}`;
+    const claimed = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, 'alerted')
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [offKey],
+    );
+    if (!claimed.rows.length) continue;
+    const text = `BRAIN: phone 255752900450 offline ${minutesUntilTick}min before ${tick}. OTP relay will fail — bring phone online.`;
+    await sendNextSms(MASTER_ADMIN_PHONE, text);
+    console.warn(`[m6pm/phone-hb] offline alert sent for ${tick} (T-${minutesUntilTick}min)`);
+  }
+
+  // 2. Battery low — once per day, only if phone is online and reporting.
+  if (phoneOnline && typeof batteryPct === 'number' && batteryPct < BATTERY_ALERT_THRESHOLD) {
+    const batKey = 'm6pm_phone_battery_alerted_ymd';
+    const last = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [batKey]);
+    if (last.rows[0]?.value !== today) {
+      const text = `BRAIN: phone 255752900450 battery at ${batteryPct}% — plug in before next tick.`;
+      await sendNextSms(MASTER_ADMIN_PHONE, text);
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [batKey, today],
+      );
+      console.warn(`[m6pm/phone-hb] battery alert sent (${batteryPct}%)`);
+    }
+  }
+}
+
+/**
+ * Start all four watchers on BRAIN boot. Each runs every 60s. They're
  * best-effort — exceptions are caught and logged so a watcher hiccup
  * never crashes BRAIN.
  */
@@ -623,6 +728,8 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/poc-alert watcher]', err.message); }
       try { await tickResultNotifierWatcher({ pool }); }
       catch (err) { console.error('[m6pm/tick-notif watcher]', err.message); }
+      try { await phoneHeartbeatWatcher({ pool }); }
+      catch (err) { console.error('[m6pm/phone-hb watcher]', err.message); }
     } finally {
       running = false;
     }
@@ -631,5 +738,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif watchers armed (60s, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb watchers armed (60s, no overlap)');
 }
