@@ -315,14 +315,25 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
 //      with stale numbers.
 // ────────────────────────────────────────────────────────────────────────────
 
-// Frank 2026-06-26: morning trigger is meru0300 (NOT meru0100 — that was the
-// pre-existing wrong mapping). kili1615 fires a COMPARISON report (morning vs
-// evening debt), not another debt report — handled separately in
-// fireKili1615Comparison() below since it needs two xls files.
-const REPORT_TICKS = {
-  meru0300: 'morning',
-  lengai1230: 'afternoon',
-  // kili1615 handled via the comparison path — see fireKili1615Comparison.
+// Frank 2026-06-27 redesign: each MODE is gated separately and has a
+// failover chain of trigger ticks. The first ticks's finalize "arms" the
+// morning report (yesterday is fully closed because meru0100 catches up
+// kibo2100→00:00 EAT overnight tail), but the actual report fire is held
+// until minHourEat to avoid SMSing admins at 01:10 AM. If the first tick
+// fails (NMB POC dies — common pattern), subsequent ticks in triggerTicks
+// can still arm the morning fire. The per-mode gate (m6pm_auto_fired:${ymd}:${mode})
+// ensures the report fires exactly once per day across all trigger ticks.
+//
+// kili1615 fires a COMPARISON report (morning vs evening debt), not another
+// debt report — handled separately in fireKili1615Comparison() below.
+const REPORT_MODES = {
+  morning: {
+    triggerTicks: ['meru0100', 'meru0300', 'hanang0700'],
+    minHourEat: 5,  // Frank rule: hold delivery until 05:00 EAT
+  },
+  afternoon: {
+    triggerTicks: ['lengai1230'],
+  },
 };
 
 // All 9 scheduled ticks with EAT fire time (24h). Used by the failure
@@ -417,23 +428,36 @@ async function sendNextSms(phone, text) {
 async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
   if (process.env.M6PM_AUTO_FIRE !== 'true') return;
   const today = todayYmdEat();
-  for (const [tick, mode] of Object.entries(REPORT_TICKS)) {
-    const gateKey = `m6pm_auto_fired:${today}:${tick}`;
-    const gate = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [gateKey]);
-    if (gate.rows.length) continue; // already fired today
+  const eatNow = new Date(Date.now() + 3 * 60 * 60 * 1000);
+  const eatHour = eatNow.getUTCHours();
 
-    // Need at least one finalized batch for this tick within the last 30 min.
+  for (const [mode, cfg] of Object.entries(REPORT_MODES)) {
+    const gateKey = `m6pm_auto_fired:${today}:${mode}`;
+    const gate = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [gateKey]);
+    if (gate.rows.length) continue; // mode already fired today
+
+    // Holdoff: even if a trigger tick has finalized batches, hold the report
+    // fire until minHourEat EAT (so admins don't get an SMS at 01:10 AM).
+    if (cfg.minHourEat != null && eatHour < cfg.minHourEat) continue;
+
+    // Need at least one trigger tick to have finalized batches today (EAT day,
+    // not 30-min window — the report should fire after 05:00 EAT even if
+    // meru0100 finalized at 01:08 EAT, 4 hours earlier).
+    const tickPatterns = cfg.triggerTicks.map((t) => `auto-upload:${t}%`);
     const recent = await pool.query(
-      `SELECT id FROM payment_batches
-        WHERE created_by LIKE $1
-          AND status = 'finalized'
-          AND finalized_at > now() - interval '30 minutes'
+      `SELECT created_by FROM payment_batches
+        WHERE status = 'finalized'
+          AND created_at >= (
+            date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
+            AT TIME ZONE 'Africa/Dar_es_Salaam'
+          )
+          AND created_by LIKE ANY ($1::text[])
         LIMIT 1`,
-      [`auto-upload:${tick}%`],
+      [tickPatterns],
     );
     if (!recent.rows.length) continue;
 
-    // Atomic gate acquire — only one BRAIN process wins.
+    // Atomic gate acquire — only one BRAIN process wins per mode per day.
     const acquired = await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ($1, 'firing')
          ON CONFLICT (key) DO NOTHING
@@ -442,7 +466,8 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     );
     if (!acquired.rows.length) continue;
 
-    console.log(`[m6pm/autofire] ${tick} → mode=${mode} — starting report fire`);
+    const armingTick = (recent.rows[0].created_by || '').match(/auto-upload:([^:]+)/)?.[1] || '?';
+    console.log(`[m6pm/autofire] mode=${mode} armed by ${armingTick} — starting report fire (eatHour=${eatHour})`);
     try {
       // excludeToday: officers' reports should match QB's "Overdue" status
       // filter (today's daily invoices not yet overdue). Payment app keeps
@@ -457,7 +482,7 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         if (got) {
           try {
             syncResult = await postSyncMobile();
-            console.log(`[m6pm/autofire] ${tick} sync-mobile fired (morning gate acquired)`);
+            console.log(`[m6pm/autofire] mode=${mode} sync-mobile fired (morning gate acquired)`);
           } catch (e) {
             console.error(`[m6pm/autofire] sync-mobile failed:`, e.message);
             syncResult = { error: e.message };
@@ -471,7 +496,7 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
         [gateKey],
       );
-      console.log(`[m6pm/autofire] ${tick} DONE arrears=${arrears.length} sync=${syncResult ? 'fired' : 'n/a'}`);
+      console.log(`[m6pm/autofire] mode=${mode} DONE arrears=${arrears.length} sync=${syncResult ? 'fired' : 'n/a'}`);
 
       // SMS-with-link broadcast: send a public download link to all admins
       // so they (and anyone they forward it to) can grab the report file
@@ -483,12 +508,12 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         for (const phone of broadcastPhones()) {
           await sendNextSms(phone, text);
         }
-        console.log(`[m6pm/autofire] ${tick} SMSed report link to ${broadcastPhones().length} admins`);
+        console.log(`[m6pm/autofire] mode=${mode} SMSed report link to ${broadcastPhones().length} admins`);
       } else {
-        console.warn(`[m6pm/autofire] ${tick} REPORT_LINK_SECRET unset — skipping SMS-with-link`);
+        console.warn(`[m6pm/autofire] mode=${mode} REPORT_LINK_SECRET unset — skipping SMS-with-link`);
       }
     } catch (err) {
-      console.error(`[m6pm/autofire] ${tick} failed:`, err.message);
+      console.error(`[m6pm/autofire] mode=${mode} (armed by ${armingTick}) failed:`, err.message);
       // Roll back the gate so a later retry can pick it up.
       await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
     }
