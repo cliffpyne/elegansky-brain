@@ -142,6 +142,53 @@ function buildArrearsXls(arrears, asOf) {
 }
 
 /**
+ * Parse a QB-format .xls buffer back into the same arrears row shape that
+ * fetchAllArrears produces. Used to reconstruct a frozen morning baseline
+ * (e.g. from Frank's hand-exported overduejuneXXmorning.xls) so the
+ * kili1615 evening comparison can diff against it.
+ *
+ * Returns an array of {date, type, no, customer, memo, balance, amount, status}.
+ * Handles both the metadata-row + header-row layout (BRAIN's builder) and
+ * QB's own header-only layout.
+ */
+function parseArrearsXls(xlsBuffer) {
+  const wb = XLSX.read(xlsBuffer, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  // Find the header row (contains a 'Customer' cell, case-insensitive)
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 10); i++) {
+    if (rows[i].some((c) => String(c || '').trim().toLowerCase() === 'customer')) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) throw new Error('parseArrearsXls: no header row with Customer column');
+  const header = rows[headerIdx].map((c) => String(c || '').trim().toLowerCase());
+  const col = (name) => header.indexOf(name);
+  const ci = { date: col('date'), type: col('type'), no: col('no.') >= 0 ? col('no.') : col('no'), customer: col('customer'), memo: col('memo'), balance: col('balance'), amount: col('amount'), status: col('status') };
+  const out = [];
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r.length || r.every((c) => String(c).trim() === '')) continue;
+    const get = (idx) => (idx >= 0 ? r[idx] : '');
+    const customer = String(get(ci.customer) || '').trim();
+    if (!customer) continue;
+    out.push({
+      date: String(get(ci.date) || '').trim(),
+      type: String(get(ci.type) || 'Invoice').trim(),
+      no: String(get(ci.no) || '').trim(),
+      customer,
+      memo: String(get(ci.memo) || '').trim(),
+      balance: Number(get(ci.balance) || 0) || 0,
+      amount: Number(get(ci.amount) || 0) || 0,
+      status: String(get(ci.status) || 'overdue').trim(),
+    });
+  }
+  return out;
+}
+
+/**
  * POST the xls to m6pm's existing /api/generate-debt-reports endpoint.
  * Returns m6pm's JSON response. Times out after 5 min — debt-report
  * generation against 14k+ invoices typically takes 1-3 min.
@@ -166,6 +213,31 @@ async function postArrearsToM6pm(xlsBuffer, modeLabel) {
   });
   const text = await r.text();
   if (!r.ok) throw new Error(`m6pm /api/generate-debt-reports ${r.status}: ${text.slice(0, 300)}`);
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+/**
+ * POST both morning + evening xls to m6pm's /api/generate-comparison-reports.
+ * m6pm diffs them into per-agent comparison files (Morning Amount vs Evening
+ * Amount) so officers can see what each customer paid that day.
+ *
+ * modeLabel is forwarded as report_mode form field so m6pm tags files
+ * "{agent}_{date}__{mode}.xlsx" (no COMPARISON_ prefix), keeping the
+ * mode-locked-link mechanism uniform with debt reports.
+ */
+async function postComparisonToM6pm(morningXls, eveningXls, modeLabel) {
+  const form = new FormData();
+  form.append('morning', new Blob([morningXls]), 'brain-morning.xls');
+  form.append('evening', new Blob([eveningXls]), 'brain-evening.xls');
+  if (modeLabel) form.append('report_mode', modeLabel);
+  const r = await fetch(`${M6PM_BASE}/api/generate-comparison-reports`, {
+    method: 'POST',
+    body: form,
+    headers: m6pmBrowserHeaders(),
+    signal: AbortSignal.timeout(10 * 60_000),  // comparison parses 2× xls + builds diff
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`m6pm /api/generate-comparison-reports ${r.status}: ${text.slice(0, 300)}`);
   try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
@@ -306,6 +378,50 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       updated_at: r.rows[0]?.updated_at || null,
       today_eat: todayYmdEat(),
     });
+  });
+
+  // Seed today's morning_arrears so the kili1615 evening comparison has a
+  // real start-of-day baseline. Used when the 05:00 EAT autofire didn't
+  // happen (e.g. before mode-segmentation existed) and operator has the
+  // morning export.
+  //
+  // Two accepted shapes:
+  //   1. JSON body: {arrears: [{date,type,no,customer,memo,balance,amount,status}, ...], date?: "YYYY-MM-DD"}
+  //   2. JSON body: {xls_b64: "...", date?: "YYYY-MM-DD"} — server parses xls
+  //
+  // Either way the arrears JSON gets persisted in app_settings under
+  // morning_arrears:${date}. The kili1615 watcher reads from there.
+  app.post('/api/admin/m6pm/seed-morning-arrears', requireSecretOrJwt, async (req, res) => {
+    try {
+      let arrears;
+      if (Array.isArray(req.body?.arrears)) {
+        arrears = req.body.arrears;
+      } else if (typeof req.body?.xls_b64 === 'string' && req.body.xls_b64.length > 0) {
+        const buf = Buffer.from(req.body.xls_b64, 'base64');
+        arrears = parseArrearsXls(buf);
+      } else {
+        return res.status(400).json({
+          error: 'POST JSON with either {arrears:[...]} or {xls_b64:"..."}',
+        });
+      }
+      const ymd = (req.body?.date || req.query.date || todayYmdEat()).toString();
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [`morning_arrears:${ymd}`, JSON.stringify(arrears)],
+      );
+      const totalBalance = arrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      res.json({
+        ok: true,
+        date: ymd,
+        rows: arrears.length,
+        total_balance: totalBalance,
+        message: `morning_arrears:${ymd} seeded — kili1615 evening comparison will use this baseline`,
+      });
+    } catch (err) {
+      console.error('[m6pm/seed-morning-arrears]', err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.post('/api/admin/m6pm/morning-gate-reset', requireSecretOrJwt, async (_req, res) => {
@@ -504,6 +620,22 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
       const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
       const buf = buildArrearsXls(arrears, null);
       await postArrearsToM6pm(buf, mode);
+      // Persist morning arrears JSON so the kili1615 evening comparison can
+      // diff against the actual start-of-day baseline. Only saved on the
+      // morning fire path. Stored as app_settings value (Postgres TEXT can
+      // hold the ~3-5 MB JSON without trouble). Never miss a catchup brother.
+      if (mode === 'morning') {
+        try {
+          await pool.query(
+            `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+            [`morning_arrears:${today}`, JSON.stringify(arrears)],
+          );
+          console.log(`[m6pm/autofire] morning arrears JSON saved (${arrears.length} rows) for evening comparison`);
+        } catch (e) {
+          console.error('[m6pm/autofire] failed to save morning_arrears:', e.message);
+        }
+      }
       let syncResult = null;
       if (mode === 'morning') {
         const got = await morningGateAcquired(pool, today);
@@ -560,6 +692,115 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
   // OR a previous heisenberg) was >30 min ago. The cooldown stops rapid-fire
   // heisenbergs from spamming admins with 5 SMSes.
   await maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, today });
+  await maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, today });
+}
+
+/**
+ * Watcher: when kili1615 finalizes its batches, fire a MORNING vs EVENING
+ * comparison report (not another plain debt report). Tonight's evening
+ * SMS goes out only ONCE — the comparison shows officers what each
+ * customer paid that day. No second evening debt report is sent.
+ *
+ * Source of morning baseline:
+ *   1. Preferred: app_settings.morning_arrears:${date} (saved by autofire)
+ *   2. Fallback: if no morning JSON, log + abort (so we never silently
+ *      ship a "comparison" with garbage baseline)
+ *
+ * Sequence:
+ *   1. Wait for kili1615 finalize today
+ *   2. Per-day gate m6pm_evening_fired:${date}
+ *   3. Read morning_arrears JSON, rebuild morning xls
+ *   4. fetchAllArrears live → evening xls
+ *   5. POST both to m6pm /api/generate-comparison-reports with
+ *      report_mode=evening
+ *   6. SMS evening link with &mode=evening
+ */
+async function maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, today }) {
+  if (process.env.M6PM_AUTO_FIRE !== 'true') return;
+  const gateKey = `m6pm_evening_fired:${today}`;
+  const gate = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [gateKey]);
+  if (gate.rows.length) return;
+
+  // Need kili1615 batches finalized today (EAT day).
+  const recent = await pool.query(
+    `SELECT created_by FROM payment_batches
+      WHERE status = 'finalized'
+        AND created_at >= (
+          date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
+          AT TIME ZONE 'Africa/Dar_es_Salaam'
+        )
+        AND created_by LIKE 'auto-upload:kili1615%'
+      LIMIT 1`,
+  );
+  if (!recent.rows.length) return;
+
+  // Atomic claim
+  const acquired = await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ($1, 'firing')
+       ON CONFLICT (key) DO NOTHING
+       RETURNING value`,
+    [gateKey],
+  );
+  if (!acquired.rows.length) return;
+
+  console.log('[m6pm/autofire/evening] kili1615 finalized — building comparison');
+  try {
+    // Morning baseline — REQUIRED. Never ship a comparison with stale or
+    // wrong baseline (Frank's rule 2026-06-27: "office could go mad").
+    const morn = await pool.query(
+      `SELECT value FROM app_settings WHERE key = $1`,
+      [`morning_arrears:${today}`],
+    );
+    if (!morn.rows.length) {
+      await pool.query(
+        `UPDATE app_settings SET value='no_morning_baseline', updated_at=now() WHERE key=$1`,
+        [gateKey],
+      );
+      console.error(`[m6pm/autofire/evening] NO morning baseline saved for ${today} — aborting`);
+      const text = `BRAIN evening comparison ABORTED (${today}): no morning baseline. Seed it via /api/admin/m6pm/seed-morning-arrears.`;
+      await sendNextSms(MASTER_ADMIN_PHONE, text);
+      return;
+    }
+    const morningArrears = JSON.parse(morn.rows[0].value);
+    const morningXls = buildArrearsXls(morningArrears, null);
+
+    const eveningArrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+    const eveningXls = buildArrearsXls(eveningArrears, null);
+
+    await postComparisonToM6pm(morningXls, eveningXls, 'evening');
+
+    // Mark fired + bump last-fire so heisenberg cooldown sees it
+    await pool.query(
+      `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
+      [gateKey],
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('m6pm_last_report_fire_at', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [new Date().toISOString()],
+    );
+    console.log(`[m6pm/autofire/evening] DONE morning=${morningArrears.length} evening=${eveningArrears.length}`);
+
+    const link = signedReportUrl({ path: 'page', date: today, name: '*', mode: 'evening' });
+    if (link) {
+      const morningTotal = morningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const eveningTotal = eveningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const collected = morningTotal - eveningTotal;
+      const fmt = (n) => Math.round(n).toLocaleString('en-US');
+      const text =
+        `BRAIN Evening comparison (${today}) ready.\n` +
+        `Morning: ${fmt(morningTotal)} TZS\n` +
+        `Evening: ${fmt(eveningTotal)} TZS\n` +
+        `Collected: ${fmt(collected)} TZS\n${link}`;
+      for (const phone of broadcastPhones()) {
+        await sendNextSms(phone, text);
+      }
+      console.log(`[m6pm/autofire/evening] SMSed comparison link to ${broadcastPhones().length} admins`);
+    }
+  } catch (err) {
+    console.error('[m6pm/autofire/evening] failed:', err.message);
+    await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
+  }
 }
 
 async function maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, today }) {
