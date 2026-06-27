@@ -20,9 +20,36 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import XLSX from 'xlsx';
+import crypto from 'node:crypto';
 
 const M6PM_BASE = process.env.M6PM_BASE_URL || 'https://elegansky-m6pm.onrender.com';
 const ARREARS_PAGE_SIZE = 1000;
+// Public report link config. Shared secret must match m6pm REPORT_LINK_SECRET.
+// Links default to 72h TTL — long enough for an admin who gets the SMS at 03:00
+// to still click it Monday morning.
+const REPORT_LINK_SECRET = process.env.REPORT_LINK_SECRET || '';
+const REPORT_LINK_BASE = process.env.REPORT_LINK_BASE || 'https://www.eleganskyboda.com';
+const REPORT_LINK_TTL_HOURS = 72;
+
+/**
+ * Generate a signed link to the m6pm public report endpoints. The signature
+ * is HMAC-SHA256 of `date|name|exp` — matches m6pm's _verify_report_token.
+ *   path  = 'list' (use name='*') or 'file' (use name=filename)
+ * Returns null if secret is unset (so the SMS just gets the stats summary
+ * instead of a dead link).
+ */
+function signedReportUrl({ path, date, name }) {
+  if (!REPORT_LINK_SECRET) return null;
+  const exp = Math.floor(Date.now() / 1000) + REPORT_LINK_TTL_HOURS * 3600;
+  const payload = `${date}|${name}|${exp}`;
+  const sig = crypto.createHmac('sha256', REPORT_LINK_SECRET).update(payload).digest('hex');
+  const u = new URL(`/api/p/reports/${path}`, REPORT_LINK_BASE);
+  u.searchParams.set('date', date);
+  if (path === 'file') u.searchParams.set('name', name);
+  u.searchParams.set('exp', String(exp));
+  u.searchParams.set('sig', sig);
+  return u.toString();
+}
 
 /**
  * Internal helper — paginate the /arrears endpoint and return all invoice
@@ -435,6 +462,21 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         [gateKey],
       );
       console.log(`[m6pm/autofire] ${tick} DONE arrears=${arrears.length} sync=${syncResult ? 'fired' : 'n/a'}`);
+
+      // SMS-with-link broadcast: send a public download link to all admins
+      // so they (and anyone they forward it to) can grab the report file
+      // without logging into m6pm. Signed token expires in 72h.
+      const link = signedReportUrl({ path: 'list', date: today, name: '*' });
+      if (link) {
+        const modeLabel = mode === 'morning' ? 'Morning' : mode === 'afternoon' ? 'Afternoon' : 'Evening';
+        const text = `BRAIN ${modeLabel} report (${today}) ready: ${link}`;
+        for (const phone of broadcastPhones()) {
+          await sendNextSms(phone, text);
+        }
+        console.log(`[m6pm/autofire] ${tick} SMSed report link to ${broadcastPhones().length} admins`);
+      } else {
+        console.warn(`[m6pm/autofire] ${tick} REPORT_LINK_SECRET unset — skipping SMS-with-link`);
+      }
     } catch (err) {
       console.error(`[m6pm/autofire] ${tick} failed:`, err.message);
       // Roll back the gate so a later retry can pick it up.
