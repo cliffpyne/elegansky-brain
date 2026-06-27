@@ -5,7 +5,7 @@
 // untouched. This module only:
 //   1. Produces a QB-format .xls from BRAIN's live /arrears query
 //   2. POSTs it to m6pm's existing /api/generate-debt-reports endpoint after
-//      each scheduled tick (morning/afternoon/evening)
+//      each scheduled tick (morning/noon/evening, plus heisenberg catch-up)
 //   3. Triggers m6pm's /api/sync-mobile + notification dispatch ONCE per day
 //      after the MORNING report only (Frank's rule — re-sync would void
 //      officers' work in flight)
@@ -14,7 +14,7 @@
 //
 // Frank's once-a-day rule (2026-06-25): the morning sync-mobile + officer
 // notification happen ONCE per day, after the meru0100 debt report. The
-// afternoon (lengai1230) and evening (kili1615) runs ONLY generate reports —
+// noon (lengai1230) and evening (kili1615) runs ONLY generate reports —
 // they do NOT sync mobile and do NOT send SMS notifications. Re-syncing
 // would overwrite officers' in-progress collection work and is destructive.
 // ────────────────────────────────────────────────────────────────────────────
@@ -33,25 +33,32 @@ const REPORT_LINK_TTL_HOURS = 72;
 
 /**
  * Generate a signed link to the m6pm public report endpoints. The signature
- * is HMAC-SHA256 of `date|name|exp` — matches m6pm's _verify_report_token.
+ * is HMAC-SHA256 of `date|name|exp` (legacy) or `date|mode|name|exp` (mode-
+ * segmented, since 2026-06-27) — matches m6pm's _verify_report_token.
  *   path  = 'list' (use name='*') or 'file' (use name=filename)
+ *   mode  = optional 'morning'|'noon'|'evening'|'heisenberg'. When set, link
+ *           page filters to only that mode's frozen files — so a morning
+ *           link clicked at noon still shows morning's numbers.
  * Returns null if secret is unset (so the SMS just gets the stats summary
  * instead of a dead link).
  */
-function signedReportUrl({ path, date, name }) {
+function signedReportUrl({ path, date, name, mode = '' }) {
   if (!REPORT_LINK_SECRET) return null;
   const exp = Math.floor(Date.now() / 1000) + REPORT_LINK_TTL_HOURS * 3600;
   // Page + list endpoints share the same signature payload (name='*')
   // because both list a date's files. File downloads have their own
   // signature with the actual filename in the payload.
   const sigName = path === 'file' ? name : '*';
-  const payload = `${date}|${sigName}|${exp}`;
+  const payload = mode
+    ? `${date}|${mode}|${sigName}|${exp}`
+    : `${date}|${sigName}|${exp}`;
   const sig = crypto.createHmac('sha256', REPORT_LINK_SECRET).update(payload).digest('hex');
   const u = new URL(`/api/p/reports/${path}`, REPORT_LINK_BASE);
   u.searchParams.set('date', date);
   if (path === 'file') u.searchParams.set('name', name);
   u.searchParams.set('exp', String(exp));
   u.searchParams.set('sig', sig);
+  if (mode) u.searchParams.set('mode', mode);
   return u.toString();
 }
 
@@ -138,10 +145,15 @@ function buildArrearsXls(arrears, asOf) {
  * POST the xls to m6pm's existing /api/generate-debt-reports endpoint.
  * Returns m6pm's JSON response. Times out after 5 min — debt-report
  * generation against 14k+ invoices typically takes 1-3 min.
+ *
+ * modeLabel doubles as the report_mode form field — m6pm tags filenames
+ * "{agent}_{date}__{mode}.xlsx" so each fire keeps its own frozen snapshot
+ * on the persistent disk (since 2026-06-27 mode segmentation).
  */
 async function postArrearsToM6pm(xlsBuffer, modeLabel) {
   const form = new FormData();
   form.append('file', new Blob([xlsBuffer]), `brain-arrears-${modeLabel}.xls`);
+  if (modeLabel) form.append('report_mode', modeLabel);
   const r = await fetch(`${M6PM_BASE}/api/generate-debt-reports`, {
     method: 'POST',
     body: form,
@@ -247,9 +259,12 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
 
   app.post('/api/admin/m6pm/trigger', requireSecretOrJwt, async (req, res) => {
     try {
-      const mode = String(req.query.mode || req.body?.mode || '').toLowerCase();
-      if (!['morning', 'afternoon', 'evening'].includes(mode)) {
-        return res.status(400).json({ error: 'mode must be morning, afternoon, or evening' });
+      let mode = String(req.query.mode || req.body?.mode || '').toLowerCase();
+      // Backward compat: accept legacy 'afternoon' as alias for 'noon' so any
+      // existing scripts / curls from before the 2026-06-27 rename still work.
+      if (mode === 'afternoon') mode = 'noon';
+      if (!['morning', 'noon', 'evening', 'heisenberg'].includes(mode)) {
+        return res.status(400).json({ error: 'mode must be morning, noon, evening, or heisenberg' });
       }
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
       // Optional ?includeToday=true escape hatch for debugging; defaults to
@@ -335,7 +350,9 @@ const REPORT_MODES = {
     triggerTicks: ['meru0100', 'meru0300', 'hanang0700'],
     minHourEat: 5,  // Frank rule: hold delivery until 05:00 EAT
   },
-  afternoon: {
+  noon: {
+    // Frank calls lengai1230 the "noon fire" (12:30 EAT). Internally was
+    // "afternoon" up through 2026-06-27, renamed to match his vocabulary.
     triggerTicks: ['lengai1230'],
   },
 };
@@ -518,9 +535,11 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
       // SMS-with-link broadcast: send a public download link to all admins
       // so they (and anyone they forward it to) can grab the report file
       // without logging into m6pm. Signed token expires in 72h.
-      const link = signedReportUrl({ path: 'page', date: today, name: '*' });
+      // Link includes mode= so morning's link at noon still shows morning's
+      // frozen files (Frank 2026-06-27 mode-segmentation requirement).
+      const link = signedReportUrl({ path: 'page', date: today, name: '*', mode });
       if (link) {
-        const modeLabel = mode === 'morning' ? 'Morning' : mode === 'afternoon' ? 'Afternoon' : 'Evening';
+        const modeLabel = mode === 'morning' ? 'Morning' : mode === 'noon' ? 'Noon' : 'Evening';
         const text = `BRAIN ${modeLabel} report (${today}) ready: ${link}`;
         for (const phone of broadcastPhones()) {
           await sendNextSms(phone, text);
@@ -581,11 +600,12 @@ async function maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, to
   try {
     const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
     const buf = buildArrearsXls(arrears, null);
-    // Heisenberg fires happen mid-day; tag as 'afternoon' so m6pm-side cache
-    // keys don't collide with the scheduled morning fire (which has its
-    // own per-mode gate).
-    await postArrearsToM6pm(buf, 'afternoon');
-    const link = signedReportUrl({ path: 'page', date: today, name: '*' });
+    // Heisenberg fires are manual catch-ups (Frank fires when a scrapper
+    // fails). Tag with own 'heisenberg' mode so the on-disk file doesn't
+    // overwrite the scheduled morning/noon frozen snapshots — admins can
+    // still open the morning link later and see morning's numbers.
+    await postArrearsToM6pm(buf, 'heisenberg');
+    const link = signedReportUrl({ path: 'page', date: today, name: '*', mode: 'heisenberg' });
     if (link) {
       const text = `BRAIN catch-up report (${today}) ready: ${link}`;
       for (const phone of broadcastPhones()) {
