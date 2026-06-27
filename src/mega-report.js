@@ -92,6 +92,12 @@ const CHANNEL_TABS = {
     failed: 'FAILED',
     suffix: 'B',
   },
+  bank_sav: {
+    sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o',
+    passed: 'PASSED_SAV',
+    failed: null,
+    suffix: 'B',
+  },
   iphone_bank: {
     sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ',
     passed: 'BANK_PASSED',

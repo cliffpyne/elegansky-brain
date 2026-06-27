@@ -1217,6 +1217,9 @@ const ALL_CHANNEL_SHEETS = [
   { channel: 'nmbnew',      sheetId: NMB_PASSED_SHEET_ID,  tab: NMB_PASSED_TAB },
   { channel: 'bank',        sheetId: CRDB_PASSED_SHEET_ID, tab: CRDB_PASSED_TAB },
   { channel: 'iphone_bank', sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+  // SAVCOM tabs on the NMB / CRDB sheets — share sheetId, separate tab.
+  { channel: 'nmbnew_sav',  sheetId: NMB_PASSED_SHEET_ID,  tab: 'PASSED_SAV_NMB' },
+  { channel: 'bank_sav',    sheetId: CRDB_PASSED_SHEET_ID, tab: 'PASSED_SAV' },
 ];
 
 /**

@@ -109,8 +109,8 @@ export function mountPaymentBatchesApi(app, deps) {
   //   { since_iso?: ISO8601, until_iso?: ISO8601 }   — defaults: last 24h
   app.post('/api/payment-batches/auto-upload/:channel', requireSecretOrJwt, async (req, res) => {
     const channel = req.params.channel;
-    if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
-      return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
+    if (!['nmbnew', 'bank', 'iphone_bank', 'nmbnew_sav', 'bank_sav'].includes(channel)) {
+      return res.status(400).json({ error: 'channel must be nmbnew, bank, iphone_bank, nmbnew_sav, or bank_sav' });
     }
     // Hard requirement (2026-06-07): every fire MUST carry an explicit
     // txn_date. No wall-clock fallback — silent defaults previously let
@@ -465,8 +465,8 @@ export function mountPaymentBatchesApi(app, deps) {
   //   marker AND payment_batches.created_by attribution.
   app.post('/api/payment-batches/start/:channel', requireSecretOrJwt, async (req, res) => {
     const channel = req.params.channel;
-    if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
-      return res.status(400).json({ error: 'channel must be nmbnew, bank, or iphone_bank' });
+    if (!['nmbnew', 'bank', 'iphone_bank', 'nmbnew_sav', 'bank_sav'].includes(channel)) {
+      return res.status(400).json({ error: 'channel must be nmbnew, bank, iphone_bank, nmbnew_sav, or bank_sav' });
     }
     const dryRun = req.body?.dry_run === true;
     const buttonTickName = String(req.body?.tick_name || 'start_button').toLowerCase();
@@ -3688,8 +3688,8 @@ export function mountPaymentBatchesApi(app, deps) {
   app.post('/api/admin/force-release-channel-lock', requireSecretOrJwt, async (req, res) => {
     try {
       const channel = String(req.body?.channel || '');
-      if (!['nmbnew', 'bank', 'iphone_bank'].includes(channel)) {
-        return res.status(400).json({ error: 'channel must be nmbnew | bank | iphone_bank' });
+      if (!['nmbnew', 'bank', 'iphone_bank', 'nmbnew_sav', 'bank_sav'].includes(channel)) {
+        return res.status(400).json({ error: 'channel must be nmbnew | bank | iphone_bank | nmbnew_sav | bank_sav' });
       }
       const r = await db().query(
         `DELETE FROM auto_upload_locks WHERE channel = $1 RETURNING holder, locked_at`,
@@ -4677,6 +4677,10 @@ const CHANNEL_SHEETS = {
   nmbnew:      { sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED' },
   bank:        { sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED' },
   iphone_bank: { sheetId: '1Y2cOyObQvP502kvEbC-uGDP-3Sf5X9JKnDDYmR0BPRQ', tab: 'BANK_PASSED' },
+  // SAVCOM channels — same NMB / CRDB sheets, separate tabs for the
+  // SAVCOM book. Same payment algorithm, just different source rows.
+  nmbnew_sav:  { sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED_SAV_NMB' },
+  bank_sav:    { sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED_SAV' },
 };
 
 // ──────────────────────────────────────────────────────────────────────────
