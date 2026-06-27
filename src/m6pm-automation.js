@@ -57,7 +57,7 @@ function signedReportUrl({ path, date, name }) {
  * secret so we get the same exact data + customer enrichment without
  * duplicating that 150-line query loop.
  */
-async function fetchAllArrears({ asOf, brainSelfBase, sharedSecret }) {
+async function fetchAllArrears({ asOf, brainSelfBase, sharedSecret, excludeToday = false }) {
   const out = [];
   let start = 1;
   for (;;) {
@@ -65,6 +65,7 @@ async function fetchAllArrears({ asOf, brainSelfBase, sharedSecret }) {
     url.searchParams.set('pageSize', String(ARREARS_PAGE_SIZE));
     url.searchParams.set('start', String(start));
     if (asOf) url.searchParams.set('asOf', asOf);
+    if (excludeToday) url.searchParams.set('excludeToday', 'true');
     const r = await fetch(url.toString(), {
       headers: { 'X-Report-Secret': sharedSecret },
       signal: AbortSignal.timeout(120_000),
@@ -438,7 +439,11 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
 
     console.log(`[m6pm/autofire] ${tick} → mode=${mode} — starting report fire`);
     try {
-      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret });
+      // excludeToday: officers' reports should match QB's "Overdue" status
+      // filter (today's daily invoices not yet overdue). Payment app keeps
+      // <= so today's invoices still get applied — that path doesn't go
+      // through fetchAllArrears.
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
       const buf = buildArrearsXls(arrears, null);
       await postArrearsToM6pm(buf, mode);
       let syncResult = null;

@@ -839,6 +839,13 @@ app.get('/arrears', async (req, res) => {
     const wantSummary = req.query.summary === '1' || req.query.summary === 'true';
     const branchFilter = (req.query.branch || '').toString().toLowerCase();
     const qFilter = (req.query.q || '').toString().toLowerCase();
+    // ?excludeToday=true → use DueDate < asOf instead of <= asOf.
+    // The DEFAULT (<=) is what the payment app needs so today's daily
+    // invoices get applied. Reports for officers should use < to match
+    // QB's "Overdue" status filter (which excludes today). Frank rule:
+    // payment code stays untouched, only the report path passes this flag.
+    const excludeToday = req.query.excludeToday === '1' || req.query.excludeToday === 'true';
+    const dueOp = excludeToday ? '<' : '<=';
 
     const customerMap = await getCustomerPathMap();
 
@@ -884,7 +891,7 @@ app.get('/arrears', async (req, res) => {
       while (start < 200_000) {
         const sql =
           `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-          `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
+          `FROM Invoice WHERE Balance > '0' AND DueDate ${dueOp} '${asOf}' ` +
           `STARTPOSITION ${start} MAXRESULTS ${PAGE}`;
         const r = await qbQuery(sql);
         const invs = r.QueryResponse?.Invoice ?? [];
@@ -914,7 +921,7 @@ app.get('/arrears', async (req, res) => {
     const fetchSize = branchFilter || qFilter ? Math.min(1000, pageSize * 4) : pageSize;
     const sql =
       `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
-      `FROM Invoice WHERE Balance > '0' AND DueDate <= '${asOf}' ` +
+      `FROM Invoice WHERE Balance > '0' AND DueDate ${dueOp} '${asOf}' ` +
       `STARTPOSITION ${start} MAXRESULTS ${fetchSize}`;
     const r = await qbQuery(sql);
     const raw = r.QueryResponse?.Invoice ?? [];
