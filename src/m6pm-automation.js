@@ -41,7 +41,11 @@ const REPORT_LINK_TTL_HOURS = 72;
 function signedReportUrl({ path, date, name }) {
   if (!REPORT_LINK_SECRET) return null;
   const exp = Math.floor(Date.now() / 1000) + REPORT_LINK_TTL_HOURS * 3600;
-  const payload = `${date}|${name}|${exp}`;
+  // Page + list endpoints share the same signature payload (name='*')
+  // because both list a date's files. File downloads have their own
+  // signature with the actual filename in the payload.
+  const sigName = path === 'file' ? name : '*';
+  const payload = `${date}|${sigName}|${exp}`;
   const sig = crypto.createHmac('sha256', REPORT_LINK_SECRET).update(payload).digest('hex');
   const u = new URL(`/api/p/reports/${path}`, REPORT_LINK_BASE);
   u.searchParams.set('date', date);
@@ -336,6 +340,13 @@ const REPORT_MODES = {
   },
 };
 
+// Heisenberg (manual catch-up) report cooldown. Frank fires heisenberg when a
+// scrapper fails so he can recover. After ANY heisenberg-tagged batch
+// finalizes, we re-fire the report + SMS — but skip if the last report (of
+// any kind: scheduled morning/afternoon OR a previous heisenberg) was less
+// than this long ago, so 5 rapid-fire heisenbergs don't spam admins.
+const HEISENBERG_COOLDOWN_MS = 30 * 60 * 1000;
+
 // All 9 scheduled ticks with EAT fire time (24h). Used by the failure
 // watcher to know which ticks should have produced batches by now.
 const TICK_SCHEDULE_EAT = [
@@ -491,17 +502,23 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
           syncResult = '(skipped — morning gate already claimed today)';
         }
       }
-      // Mark fired
+      // Mark fired (per-mode gate) AND update the global last-fire timestamp
+      // so heisenberg cooldown sees scheduled fires too.
       await pool.query(
         `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
         [gateKey],
+      );
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('m6pm_last_report_fire_at', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [new Date().toISOString()],
       );
       console.log(`[m6pm/autofire] mode=${mode} DONE arrears=${arrears.length} sync=${syncResult ? 'fired' : 'n/a'}`);
 
       // SMS-with-link broadcast: send a public download link to all admins
       // so they (and anyone they forward it to) can grab the report file
       // without logging into m6pm. Signed token expires in 72h.
-      const link = signedReportUrl({ path: 'list', date: today, name: '*' });
+      const link = signedReportUrl({ path: 'page', date: today, name: '*' });
       if (link) {
         const modeLabel = mode === 'morning' ? 'Morning' : mode === 'afternoon' ? 'Afternoon' : 'Evening';
         const text = `BRAIN ${modeLabel} report (${today}) ready: ${link}`;
@@ -517,6 +534,70 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
       // Roll back the gate so a later retry can pick it up.
       await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
     }
+  }
+
+  // Heisenberg-triggered catch-up report. Fires whenever a heisenberg batch
+  // finalises AND the last report (of any kind: scheduled morning/afternoon
+  // OR a previous heisenberg) was >30 min ago. The cooldown stops rapid-fire
+  // heisenbergs from spamming admins with 5 SMSes.
+  await maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, today });
+}
+
+async function maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, today }) {
+  // Any heisenberg-tagged batch finalize in the last 5 min?
+  const recent = await pool.query(
+    `SELECT id FROM payment_batches
+      WHERE created_by LIKE 'auto-upload:heisenberg%'
+        AND status = 'finalized'
+        AND finalized_at > now() - interval '5 minutes'
+      LIMIT 1`,
+  );
+  if (!recent.rows.length) return;
+
+  // Cooldown check — read last_fire_at and bail if within COOLDOWN.
+  const lastRow = await pool.query(
+    `SELECT value FROM app_settings WHERE key = 'm6pm_last_report_fire_at'`,
+  );
+  if (lastRow.rows.length) {
+    const lastMs = new Date(lastRow.rows[0].value).getTime();
+    const sinceMs = Date.now() - lastMs;
+    if (sinceMs < HEISENBERG_COOLDOWN_MS) {
+      const minLeft = Math.ceil((HEISENBERG_COOLDOWN_MS - sinceMs) / 60_000);
+      console.log(`[m6pm/autofire/heisenberg] cooldown active (${minLeft}min left) — skip`);
+      return;
+    }
+  }
+
+  // Atomic claim: set last_fire_at to NOW BEFORE the fire so a concurrent
+  // watcher tick sees the cooldown and bails. If the fire fails we leave
+  // the timestamp set — operator can manually re-fire via /api/admin/m6pm/trigger.
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('m6pm_last_report_fire_at', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [new Date().toISOString()],
+  );
+
+  console.log('[m6pm/autofire/heisenberg] cooldown clear — firing catch-up report');
+  try {
+    const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+    const buf = buildArrearsXls(arrears, null);
+    // Heisenberg fires happen mid-day; tag as 'afternoon' so m6pm-side cache
+    // keys don't collide with the scheduled morning fire (which has its
+    // own per-mode gate).
+    await postArrearsToM6pm(buf, 'afternoon');
+    const link = signedReportUrl({ path: 'page', date: today, name: '*' });
+    if (link) {
+      const text = `BRAIN catch-up report (${today}) ready: ${link}`;
+      for (const phone of broadcastPhones()) {
+        await sendNextSms(phone, text);
+      }
+      console.log(`[m6pm/autofire/heisenberg] DONE arrears=${arrears.length} SMSed ${broadcastPhones().length} admins`);
+    }
+  } catch (err) {
+    console.error('[m6pm/autofire/heisenberg] failed:', err.message);
+    // Don't roll back last_fire_at — operator can manually re-fire after
+    // fixing whatever broke. Rolling back would cause an infinite retry
+    // loop hitting m6pm/QB while the watcher runs every 60s.
   }
 }
 
