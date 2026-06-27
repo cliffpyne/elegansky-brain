@@ -248,11 +248,16 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         return res.status(400).json({ error: 'mode must be morning, afternoon, or evening' });
       }
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
-      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret });
+      // Optional ?includeToday=true escape hatch for debugging; defaults to
+      // the same excludeToday=true the production autofire path uses so this
+      // /trigger endpoint reproduces what officers will actually see.
+      const includeToday = req.query.includeToday === '1' || req.query.includeToday === 'true';
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: !includeToday });
       const buf = buildArrearsXls(arrears, null);
       const m6pmReports = await postArrearsToM6pm(buf, mode);
       const result = {
         mode,
+        excludeToday: !includeToday,
         arrears_count: arrears.length,
         m6pm_reports: m6pmReports,
         sync_mobile: null,
