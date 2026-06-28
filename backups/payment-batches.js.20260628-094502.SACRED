@@ -28,7 +28,6 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers, markSheetRowsAsQbDuplicate } from './sheets.js';
 import { qbQuery, qbReport, qbPatchPaymentTxnDate } from './qb-client.js';
-import { processInvoicePaymentsWithForwardPay } from './payment-algorithm-v2.js';
 
 const { STATEMENT_REPORT_SECRET, SUPABASE_URL } = process.env;
 
@@ -5480,11 +5479,8 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     console.error('[captureInvoiceSnapshot] failed (non-fatal):', e.message);
   }
 
-  // 4. Algorithm (Frank 2026-06-28: switched to V2 — cap-no-overflow
-  // Phase 1 + forward-pay Phase 2 baby. Sacred processInvoicePayments
-  // function at line 4926 is left untouched and unused for instant
-  // rollback by swapping the identifier back.)
-  const result = await processInvoicePaymentsWithForwardPay(invoices, txnsClean);
+  // 4. Algorithm
+  const result = processInvoicePayments(invoices, txnsClean);
   let paid = result.filter((p) => !p.isUnused && p.amount > 0);
   let unused = result.filter((p) => p.isUnused);
 
