@@ -611,7 +611,12 @@ function broadcastPhones() {
 }
 const FAILURE_GRACE_MIN = 20; // wait 20 min after scheduled tick before declaring failure
 const HEARTBEAT_PRE_TICK_MIN = 15; // pre-tick phone-online check
-const HEARTBEAT_STALE_MIN = 5; // heartbeat older than this = phone offline
+// Heartbeat staleness threshold. Default 10 min — brain-ping APK reports at
+// ~3-6 min cadence (battery-friendly), so 5 min generated false-positive
+// "phone offline" alerts every time the cadence hit the long end of its
+// range. 10 min keeps the 15-min pre-tick warning useful while tolerating
+// the APK's natural drift. Override with HEARTBEAT_STALE_MIN env var.
+const HEARTBEAT_STALE_MIN = Number(process.env.HEARTBEAT_STALE_MIN || 10);
 const BATTERY_ALERT_THRESHOLD = 50; // SMS Frank if battery drops below this
 const NEXTSMS_API = 'https://messaging-service.co.tz/api/sms/v1/text/single';
 
@@ -1118,10 +1123,13 @@ async function detectStaleSubsystems(pool) {
     }
   } catch (_) { /* ignore — diagnostic SMS shouldn't crash on probe errors */ }
   try {
+    // Column is `received_at` (per CREATE TABLE in phoneHeartbeatWatcher).
+    // Earlier `seen_at` query threw silently and dropped phone-stale signals
+    // from tick-failure SMS hints — fixed 2026-06-28.
     const r = await pool.query(
-      `SELECT seen_at FROM phone_heartbeats ORDER BY seen_at DESC LIMIT 1`,
+      `SELECT received_at FROM phone_heartbeats ORDER BY received_at DESC LIMIT 1`,
     );
-    const last = r.rows[0]?.seen_at;
+    const last = r.rows[0]?.received_at;
     if (!last) {
       hints.push('phone (never)');
     } else {
