@@ -23,6 +23,7 @@ import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recover
 import { mountQbMirrorApi } from './qb-mirror-api.js';
 import { mountM6pmApi, startM6pmWatchers } from './m6pm-automation.js';
 import { mountErpApi } from './erp-api.js';
+import { mountFrappeWebhookApi } from './frappe-webhook.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
 import { getPrewarmHooks, computeAccountBalanceForSnapshot, computeSheetTotalsForSnapshot } from './mega-report.js';
@@ -687,6 +688,7 @@ mountM6pmApi(app, {
   pool: db(),
 });
 mountErpApi(app, { pool: db() });
+mountFrappeWebhookApi(app, { pool: db() });
 startM6pmWatchers({
   pool: db(),
   sharedSecret: process.env.STATEMENT_REPORT_SECRET,
