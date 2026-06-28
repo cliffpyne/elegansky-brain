@@ -582,18 +582,26 @@ export async function runSavFrappeUpload({
             SET status = 'pushed_to_frappe',
                 qb_response = $2::jsonb,
                 failure_reason = $3
-          WHERE id = ANY($1::bigint[])`,
+          WHERE id = ANY($1::uuid[])`,
         [g.pu_ids, JSON.stringify(r || {}), `Frappe ingest_payment ${r?.status || 'ok'}`],
       );
       frappeResults.push({ bank_ref: ref, status: r?.status || 'ok', frappe: r });
     } catch (err) {
-      await db().query(
-        `UPDATE payment_uploads
-            SET status = 'failed',
-                failure_reason = $2
-          WHERE id = ANY($1::bigint[])`,
-        [g.pu_ids, String(err.message || err).slice(0, 500)],
-      );
+      // Defensive: if the catch-block UPDATE ALSO throws (schema drift, type
+      // bug, etc) we MUST keep the outer loop running. Otherwise one DB
+      // hiccup kills the whole batch + leaves partially-fired ingest_payment
+      // calls with no BRAIN tracking. Swallow + log.
+      try {
+        await db().query(
+          `UPDATE payment_uploads
+              SET status = 'failed',
+                  failure_reason = $2
+            WHERE id = ANY($1::uuid[])`,
+          [g.pu_ids, String(err.message || err).slice(0, 500)],
+        );
+      } catch (dbErr) {
+        console.error(`[sav-frappe] catch-block UPDATE failed for ref=${ref}:`, dbErr.message);
+      }
       frappeResults.push({ bank_ref: ref, status: 'error', error: err.message });
     }
   }
