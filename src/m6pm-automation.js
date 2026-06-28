@@ -263,9 +263,16 @@ function m6pmBrowserHeaders() {
  * morningGateAcquired() guard.
  */
 async function postSyncMobile() {
+  // m6pm /api/sync-mobile requires Content-Type: application/json + a body
+  // (415 Unsupported Media Type otherwise — confirmed 2026-06-28 from prod
+  // morning-autofire run). Empty {} body satisfies it; no extra fields needed.
   const r = await fetch(`${M6PM_BASE}/api/sync-mobile`, {
     method: 'POST',
-    headers: m6pmBrowserHeaders(),
+    headers: {
+      ...m6pmBrowserHeaders(),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
     signal: AbortSignal.timeout(5 * 60_000),
   });
   const text = await r.text();
