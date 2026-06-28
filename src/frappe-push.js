@@ -28,6 +28,7 @@
 
 import { db } from './db/pool.js';
 import { getOpenInvoices, ingestPayment } from './frappe-client.js';
+import { resolveSavcom, getCacheStats, runCoverage } from './savcom-resolver.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
 
@@ -78,13 +79,33 @@ export async function buildFrappePayloadsFromBatch(batchId) {
   for (const g of groups.values()) {
     const total = g.rows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
     const memo = g.rows.find((r) => r.memo)?.memo || null;
-    // Fetch the customer's open invoices on Frappe. Best-effort — failures
-    // become "no allocations" and the full amount lands as customer credit.
+    // Resolve the customer against Frappe's savcom_customers cache (292
+    // total: 18 QB-originated by plate, 274 Wakandi by account/wakandi_id).
+    // Without this, Wakandi-only rows would all miss because BRAIN's QB
+    // mirror never had them.
     let frappeInvoices = [];
     let lookupStatus = 'ok';
+    let resolved = null;       // the cached Frappe customer object on hit
+    let resolvedVia = null;    // which signal matched (plate/account/...)
+    let frappeCustomerKey = null;  // identifier used in ingest_payment call
     if (g.customer_name) {
+      const sample = g.rows[0] || {};
+      const reso = await resolveSavcom({
+        // BRAIN's stored customer_name already includes the plate for QB
+        // rows; the resolver's `name` matcher handles the QB side and
+        // `extracted_plate`/`extracted_account` covers free-form bank
+        // memos. `freeText` captures memo lines that contain the
+        // Wakandi account number verbatim.
+        name: g.customer_name,
+        freeText: [g.customer_name, sample.memo, g.bank_ref].filter(Boolean).join(' | '),
+      });
+      if (reso.match) {
+        resolved = reso.match;
+        resolvedVia = reso.via;
+        frappeCustomerKey = reso.match.customer;
+      }
       try {
-        const r = await getOpenInvoices(g.customer_name);
+        const r = await getOpenInvoices(frappeCustomerKey || g.customer_name);
         frappeInvoices = r.invoices || [];
       } catch (err) {
         if (err.status === 417) lookupStatus = 'no_match';
@@ -127,7 +148,10 @@ export async function buildFrappePayloadsFromBatch(batchId) {
 
     out.push({
       bank_ref: g.bank_ref,
-      customer: g.customer_name,
+      customer: frappeCustomerKey || g.customer_name,
+      customer_brain_name: g.customer_name,
+      customer_resolved_via: resolvedVia,
+      customer_source: resolved?.source || null,
       customer_lookup_status: lookupStatus,
       amount: total,
       date: ymdFromTimestamp(null),
@@ -198,6 +222,57 @@ export function mountFrappePushApi(app, { requireSecretOrJwt }) {
       res.json(result);
     } catch (err) {
       console.error('[frappe/dry-run-from-batch]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // SAVCOM resolver cache stats — confirms BRAIN has the full 292 loaded.
+  // Safe to call from a browser with the admin secret; no Frappe write.
+  app.get('/api/admin/savcom/cache', requireSecretOrJwt, async (_req, res) => {
+    try {
+      res.json(await getCacheStats());
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Coverage pre-flight: pass an array of trial rows and see which would
+  // resolve / which would miss / which signal matched. Use this BEFORE a
+  // real SAV fire to confirm the matcher recognizes today's bank rows.
+  //   POST /api/admin/savcom/coverage  body: { rows: [{name, plate, account, freeText}, ...] }
+  app.post('/api/admin/savcom/coverage', requireSecretOrJwt, async (req, res) => {
+    try {
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      if (!rows.length) return res.status(400).json({ error: 'rows[] required' });
+      res.json(await runCoverage(rows));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Per-batch coverage: pull every row from a finalized batch and resolve
+  // each against the savcom cache. Reports hit/miss without touching
+  // Frappe further than the cache load.
+  app.get('/api/admin/savcom/coverage-by-batch', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.query.batch_id || '').trim();
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      const { rows } = await db().query(
+        `SELECT id, bank_ref, customer_id, customer_name, memo
+           FROM payment_uploads
+          WHERE batch_id = $1
+          ORDER BY id`,
+        [batchId],
+      );
+      const trial = rows.map((r) => ({
+        name: r.customer_name,
+        freeText: [r.customer_name, r.memo, r.bank_ref].filter(Boolean).join(' | '),
+        _row_id: r.id,
+        _bank_ref: r.bank_ref,
+      }));
+      const cov = await runCoverage(trial);
+      res.json({ batch_id: batchId, ...cov });
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
