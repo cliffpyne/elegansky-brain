@@ -50,18 +50,50 @@ function appendSavSuffix(ref, channel) {
 
 function round2(n) { return Math.round(Number(n) * 100) / 100; }
 
+// Verbatim port of the production parser at payment-batches.js:4878.
+// Handles the three sheet date shapes BRAIN sees in the wild + the EAT→UTC
+// 3-hour offset that the old hacky parser was missing — without that, even
+// rows that DID parse landed 3h ahead of the operator's window and got
+// silently filtered as "out of window". The DD.MM.YYYY format is what the
+// SAV NMB / SAV CRDB sheets actually use. Critical incident 2026-06-04
+// already lit this up on the QB side; the new SAV path inherits the fix.
+const MONTH_NAMES = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 function parseTsAny(s) {
-  if (!s) return null;
-  const v = String(s).trim();
-  // Try ISO first
-  let d = new Date(v);
-  if (!isNaN(d.getTime())) return d;
-  // dd/mm/yyyy hh:mm
-  const m = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{1,2}))?/);
+  const str = String(s || '').trim();
+  if (!str) return null;
+
+  // Format 1: DD.MM.YYYY HH:MM:SS — today's CRDB/iPhone/NMB rows (incl. SAV).
+  // Sheet stores EAT wall-clock; subtract 3h so the Date is real UTC.
+  let m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
   if (m) {
-    const [, dd, mm, yy, hh, mi] = m;
-    d = new Date(Date.UTC(Number(yy), Number(mm) - 1, Number(dd), Number(hh || 0), Number(mi || 0)));
-    return isNaN(d.getTime()) ? null : d;
+    const d = +m[1], mo = +m[2];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(+m[3], mo - 1, d, +m[4] - 3, +m[5], +m[6]));
+    }
+    return null;
+  }
+
+  // Format 2: DD MMM YYYY, HH:MM (or no time) — legacy NMB.
+  m = str.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?:\s*(am|pm))?)?(?:\s*\(EAT\))?$/i);
+  if (m) {
+    const d = m[1].padStart(2, '0');
+    const monIdx = MONTH_NAMES.indexOf(m[2].toLowerCase());
+    if (monIdx < 0) return null;
+    const mo = String(monIdx + 1).padStart(2, '0');
+    let h = m[4] ? +m[4] : 0;
+    const mins = m[5] || '00';
+    if (m[6] && m[6].toLowerCase() === 'pm' && h < 12) h += 12;
+    if (m[6] && m[6].toLowerCase() === 'am' && h === 12) h = 0;
+    return new Date(`${m[3]}-${mo}-${d}T${String(h).padStart(2,'0')}:${mins}:00Z`);
+  }
+
+  // Format 3: MM/DD/YYYY — original BODA/IPHONE/LIPA sheets.
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const mo = +m[1], d = +m[2];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return new Date(`${m[3]}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00Z`);
+    }
   }
   return null;
 }
