@@ -424,6 +424,55 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     }
   });
 
+  // Worker self-report: the eleganskyCrdb statement-pull worker POSTs
+  // here at the end of each tick run with what it believes it did. The
+  // tick-result watcher reads this BEFORE deciding to fire any SMS so a
+  // transient BRAIN restart that ate a batch row doesn't read as a tick
+  // failure to admins (Frank 2026-06-28 — boss-watches-the-SMS rule).
+  //
+  // Body shape (all fields optional except tick + status):
+  //   {
+  //     tick: "loolmalas1000",
+  //     status: "ok" | "fail",
+  //     rows_seen?: number,        // rows the worker saw on the sheets
+  //     channels?: {               // per-channel outcome
+  //       nmbnew: "ok"|"fail"|"skip",
+  //       bank: "ok"|"fail"|"skip",
+  //       iphone_bank: "ok"|"fail"|"skip"
+  //     },
+  //     reason?: string,           // short error reason when status=fail
+  //     finalized_at?: ISO8601
+  //   }
+  app.post('/api/admin/tick-outcome', requireSecretOrJwt, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const tick = String(body.tick || '').trim();
+      const status = String(body.status || '').trim();
+      if (!tick) return res.status(400).json({ error: 'tick required' });
+      if (!['ok', 'fail'].includes(status)) {
+        return res.status(400).json({ error: 'status must be ok or fail' });
+      }
+      const ymd = todayYmdEat();
+      const payload = JSON.stringify({
+        tick,
+        status,
+        rows_seen: Number.isFinite(Number(body.rows_seen)) ? Number(body.rows_seen) : null,
+        channels: body.channels && typeof body.channels === 'object' ? body.channels : null,
+        reason: body.reason ? String(body.reason).slice(0, 200) : null,
+        finalized_at: body.finalized_at ? String(body.finalized_at) : new Date().toISOString(),
+      });
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [`tick_outcome:${ymd}:${tick}`, payload],
+      );
+      res.json({ ok: true, key: `tick_outcome:${ymd}:${tick}` });
+    } catch (err) {
+      console.error('[tick-outcome]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/admin/m6pm/morning-gate-reset', requireSecretOrJwt, async (_req, res) => {
     await pool.query(
       `DELETE FROM app_settings WHERE key = 'm6pm_morning_done_ymd'`,
@@ -1013,6 +1062,34 @@ async function detectStaleSubsystems(pool) {
   return hints;
 }
 
+/**
+ * Read the worker's self-reported outcome for a tick, if any.
+ *
+ * The eleganskyCrdb statement-pull worker POSTs to BRAIN's
+ * /api/admin/tick-outcome at the end of each tick run with what it
+ * believes it did. We store it under app_settings.tick_outcome:<ymd>:<tick>
+ * as a small JSON. Watcher reads it BEFORE deciding to fire any SMS so
+ * a transient BRAIN restart that ate the batch row doesn't get reported
+ * as a tick failure to admins.
+ *
+ * Returns the parsed outcome, or null when the worker hasn't reported.
+ * Legacy worker (pre-2026-06-28) doesn't POST outcomes — watcher then
+ * falls back to the row-based behavior (compatible mode).
+ */
+async function readWorkerOutcome(pool, today, tick) {
+  try {
+    const r = await pool.query(
+      `SELECT value FROM app_settings WHERE key = $1`,
+      [`tick_outcome:${today}:${tick}`],
+    );
+    const raw = r.rows[0]?.value;
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
 async function tickResultNotifierWatcher({ pool }) {
   if (process.env.TICK_RESULT_SMS !== 'true') return;
   const today = todayYmdEat();
@@ -1050,6 +1127,10 @@ async function tickResultNotifierWatcher({ pool }) {
       [`auto-upload:${tick}%`],
     );
 
+    // Pull worker outcome BEFORE the atomic claim. Watcher decisions
+    // below depend on the {worker says, DB shows} combo, not just DB.
+    const outcome = await readWorkerOutcome(pool, today, tick);
+
     // Atomic claim — only one BRAIN process sends the SMS.
     const claim = await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ($1, 'sending')
@@ -1061,21 +1142,50 @@ async function tickResultNotifierWatcher({ pool }) {
     let text;
     let resultLabel;
     if (stats.rows.length === 0) {
-      // No finalized batches yet. If past +20 min grace → error SMS. Otherwise
-      // release claim and wait for next 60s tick.
-      if (minutesPastTick < FAILURE_GRACE_MIN) {
-        await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
-        continue;
-      }
+      // No finalized batches yet. Decision tree distinguishes the
+      // three cases that all used to fire the same "no batches" SMS:
+      //   A. Worker reported ok with rows_seen>0 but DB empty
+      //      → transient persistence (e.g. BRAIN restart during fire).
+      //         SILENT log; admins do not see panic SMS for our problem.
+      //   B. Worker reported ok with rows_seen=0
+      //      → no transactions in the window. Legitimate "ok empty".
+      //         Send INFO SMS without blaming any subsystem.
+      //   C. Worker reported fail (or no outcome and past grace)
+      //      → real failure. SMS with the specific subsystem hints.
+      if (outcome?.status === 'ok') {
+        const rowsSeen = Number(outcome.rows_seen || 0);
+        if (rowsSeen > 0) {
+          // Case A — silent
+          await pool.query(
+            `UPDATE app_settings SET value='ok_persistence_drift', updated_at=now() WHERE key=$1`,
+            [notifKey],
+          );
+          console.log(`[m6pm/tick-notif] ${tick} worker says ok rows=${rowsSeen} but DB empty — silent log (transient persistence)`);
+          continue;
+        }
+        // Case B — informational
+        text = `BRAIN ${tick} ✓ no transactions in window`;
+        resultLabel = 'ok_empty';
+      } else {
+        // Case C
+        if (minutesPastTick < FAILURE_GRACE_MIN) {
+          await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
+          continue;
+        }
       // Frank 2026-06-28: build the suggestion clause from ACTUAL subsystem
       // health checks instead of the blanket "POC/scrapers/phone" blame.
       // Only name a subsystem when its own state says it is stale. Avoids
       // misleading messages (e.g. "check POC" when POC is fine).
       const hints = await detectStaleSubsystems(pool);
+      // Prefer the worker's own error reason when it reported one.
+      const workerReason = outcome?.status === 'fail' && outcome.reason
+        ? ` — worker: ${String(outcome.reason).slice(0, 80)}`
+        : '';
       text = hints.length
-        ? `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale`
-        : `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — all subsystems look healthy, investigate worker logs`;
+        ? `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale${workerReason}`
+        : `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min${workerReason || ' — all subsystems look healthy, investigate worker logs'}`;
       resultLabel = 'err';
+      }
     } else {
       const parts = stats.rows.map((r) => {
         const ch = r.channel === 'nmbnew' ? 'NMB'
