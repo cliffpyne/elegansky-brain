@@ -230,10 +230,8 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
                 <SelectItem value="nmbnew">NMB</SelectItem>
                 <SelectItem value="bank">CRDB</SelectItem>
                 <SelectItem value="iphone_bank">iPhone</SelectItem>
-                <SelectItem value="nmbnew_sav">SAVCOM NMB (legacy → QB)</SelectItem>
-                <SelectItem value="bank_sav">SAVCOM CRDB (legacy → QB)</SelectItem>
-                <SelectItem value="sav_nmb">SAV NMB (→ Frappe)</SelectItem>
-                <SelectItem value="sav_crdb">SAV CRDB (→ Frappe)</SelectItem>
+                <SelectItem value="sav_nmb">SAV NMB</SelectItem>
+                <SelectItem value="sav_crdb">SAV CRDB</SelectItem>
               </SelectContent>
             </Select>
           </label>
