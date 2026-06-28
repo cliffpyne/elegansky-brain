@@ -42,8 +42,42 @@ async function ensureSchema(pool) {
   _schemaApplied = true;
 }
 
+/**
+ * Map a Frappe event name to its source doctype. The 2026-06-28 webhook
+ * config uses custom event names (payment_submitted / payment_cancelled
+ * / invoice_updated) that don't carry the doctype in the body, so we
+ * infer it from the prefix so indexing + downstream sync still works.
+ */
+function inferDoctypeFromEvent(eventName) {
+  if (!eventName) return null;
+  const e = String(eventName).toLowerCase();
+  if (e.startsWith('payment_')) return 'Payment Entry';
+  if (e.startsWith('invoice_')) return 'Sales Invoice';
+  return null;
+}
+
+// Per-route urlencoded + raw body parsers as a safety net behind the
+// app-wide express.json(). If Frappe ever flips a webhook to a
+// non-JSON layout, the route still captures the body without bouncing.
+import express from 'express';
+const URLENCODED_PARSER = express.urlencoded({ extended: true, limit: '10mb' });
+const TEXT_PARSER = express.text({ limit: '10mb', type: '*/*' });
+
 export function mountFrappeWebhookApi(app, { pool }) {
-  app.post('/api/frappe/webhook', async (req, res) => {
+  app.post(
+    '/api/frappe/webhook',
+    (req, res, next) => {
+      // Only fall through to urlencoded / text parsers if express.json()
+      // didn't populate the body (already ran upstream). Cheap: bail on
+      // anything that looks like it parsed cleanly.
+      if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) return next();
+      URLENCODED_PARSER(req, res, (e) => {
+        if (e) return next(e);
+        if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) return next();
+        TEXT_PARSER(req, res, next);
+      });
+    },
+    async (req, res) => {
     // 1. Auth — fail closed.
     const expected = process.env.FRAPPE_WEBHOOK_SECRET;
     if (!expected) {
@@ -58,12 +92,30 @@ export function mountFrappeWebhookApi(app, { pool }) {
     // so a bug in the handlers can't lose the data.
     try {
       await ensureSchema(pool);
-      const body = req.body || {};
-      // Frappe Webhook payload shape: top-level fields vary by doctype, plus
-      // a sometimes-present `doc` envelope. Extract the most likely fields
-      // for indexing without forcing a specific shape.
+      // Lenient body extraction. Frappe normally sends application/json
+      // resolved by express.json() into req.body. The Jinja webhook_json
+      // template is the canonical path. But other Frappe webhook layouts
+      // can fall through as urlencoded or even a `payload` field — handle
+      // them all so a receiver tweak never silently swallows the body.
+      let body = (req.body && typeof req.body === 'object') ? req.body : null;
+      if (!body || Object.keys(body).length === 0) {
+        if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
+          try { body = JSON.parse(req.body); } catch (_) { /* leave null */ }
+        }
+      }
+      if ((!body || Object.keys(body).length === 0) && typeof req.body?.payload === 'string') {
+        try { body = JSON.parse(req.body.payload); } catch (_) { /* leave null */ }
+      }
+      body = body || {};
+      // Event shape (per Frappe dev 2026-06-28):
+      //   payment_submitted   → Payment Entry created/submitted
+      //   payment_cancelled   → Payment Entry cancelled
+      //   invoice_updated     → Sales Invoice status changed
+      // Older Frappe defaults use on_submit/on_cancel/on_update with a
+      // doctype field. Index both styles.
       const eventName = String(body.event || body.action || req.header('x-frappe-event') || '').slice(0, 80) || null;
-      const doctype = String(body.doctype || body?.doc?.doctype || '').slice(0, 120) || null;
+      const inferredDoctype = inferDoctypeFromEvent(eventName);
+      const doctype = String(body.doctype || body?.doc?.doctype || inferredDoctype || '').slice(0, 120) || null;
       const docName = String(body.name || body?.doc?.name || '').slice(0, 200) || null;
       const inserted = await pool.query(
         `INSERT INTO frappe_webhook_events (event_name, doctype, doc_name, raw_json)
