@@ -262,17 +262,20 @@ function m6pmBrowserHeaders() {
  * state to officers' phones. CRITICAL: called ONCE per day max — see
  * morningGateAcquired() guard.
  */
-async function postSyncMobile() {
-  // m6pm /api/sync-mobile requires Content-Type: application/json + a body
-  // (415 Unsupported Media Type otherwise — confirmed 2026-06-28 from prod
-  // morning-autofire run). Empty {} body satisfies it; no extra fields needed.
+async function postSyncMobile(xlsBuffer) {
+  // Frank 2026-06-28: send the morning xls as multipart so m6pm parses it
+  // INLINE and doesn't depend on in-memory session state. Makes the call
+  // safe after any m6pm restart and removes the "session gone" fragility.
+  // When xlsBuffer is omitted (e.g. legacy callers), m6pm falls back to
+  // the session path — original behavior preserved.
+  const form = new FormData();
+  if (xlsBuffer) form.append('file', new Blob([xlsBuffer]), 'brain-morning-arrears.xls');
   const r = await fetch(`${M6PM_BASE}/api/sync-mobile`, {
     method: 'POST',
-    headers: {
-      ...m6pmBrowserHeaders(),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({}),
+    headers: xlsBuffer
+      ? m6pmBrowserHeaders()  // FormData sets its own Content-Type with boundary
+      : { ...m6pmBrowserHeaders(), 'Content-Type': 'application/json' },
+    body: xlsBuffer ? form : JSON.stringify({}),
     signal: AbortSignal.timeout(5 * 60_000),
   });
   const text = await r.text();
@@ -727,7 +730,7 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         if (got) {
           // Step 2 of the morning ritual — sync mobile (refresh officers' app).
           try {
-            syncResult = await postSyncMobile();
+            syncResult = await postSyncMobile(buf);
             console.log(`[m6pm/autofire] mode=${mode} sync-mobile fired (morning gate acquired)`);
           } catch (e) {
             console.error(`[m6pm/autofire] sync-mobile failed:`, e.message);
