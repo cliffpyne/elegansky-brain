@@ -32,9 +32,31 @@ import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
 
+// SAV sheets have a NINTH data column at index 8 (column I) holding the
+// wakandi_member_id — direct Frappe lookup key. So the marker columns are
+// shifted RIGHT by 1 vs the QB convention:
+//   QB convention:   I=Fetched-at, J=QB-pushed,    K=end-of-tick
+//   SAV convention:  J=Fetched-at, K=Frappe-pushed, L=end-of-tick
+// Column letters → array indices: I=8, J=9, K=10, L=11.
 const SAV_CHANNEL_SHEETS = {
-  sav_nmb:  { sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED_SAV_NMB' },
-  sav_crdb: { sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED_SAV' },
+  sav_nmb: {
+    sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek',
+    tab: 'PASSED_SAV_NMB',
+    wakandiIdCol: 8,   // column I — wakandi_member_id (resolver feedstock)
+    fetchedAtCol: 9,   // column J — "Fetched at: ..."
+    pushedCol: 10,     // column K — "Frappe pushed: ..."
+    endTickCol: 11,    // column L — "end of <tick>"
+    fetchedAtLetter: 'J', pushedLetter: 'K', endTickLetter: 'L',
+  },
+  sav_crdb: {
+    sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o',
+    tab: 'PASSED_SAV',
+    wakandiIdCol: 8,
+    fetchedAtCol: 9,
+    pushedCol: 10,
+    endTickCol: 11,
+    fetchedAtLetter: 'J', pushedLetter: 'K', endTickLetter: 'L',
+  },
 };
 
 export const SAV_FRAPPE_CHANNELS = Object.keys(SAV_CHANNEL_SHEETS);
@@ -110,27 +132,40 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso }) {
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
 
-  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
+  // Read A:M — one past endTickCol(L) so the K-boundary check has room.
+  const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:M200000`);
   const sheet = sheetData.values || sheetData.data || [];
 
-  // Find the highest row index whose Column K carries an "end of <tick>"
-  // marker (same boundary semantics as the QB path).
+  // SAV sheets do NOT have a header row — row 1 is the first data row
+  // (operator never set up a header on these tabs). Iterate from index 0.
+  // (QB-path sheets do have a header at row 1; that's why the QB code skips i=0.)
+  //
+  // Find the highest row index whose endTickCol carries an "end of <tick>"
+  // marker. Same boundary semantics as the QB path, just one column over.
   let maxKRow = 0;
-  for (let i = 1; i < sheet.length; i++) {
-    const colK = String(sheet[i][10] || '').trim().toLowerCase();
-    if (colK.startsWith('end of ') && !colK.includes('(dry_run)')) maxKRow = i + 1;
+  for (let i = 0; i < sheet.length; i++) {
+    const endTick = String(sheet[i][cfg.endTickCol] || '').trim().toLowerCase();
+    if (endTick.startsWith('end of ') && !endTick.includes('(dry_run)')) maxKRow = i + 1;
   }
 
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedAlreadyPushed = 0;
   let includedBadFormat = 0;
-  for (let i = 1; i < sheet.length; i++) {
+  for (let i = 0; i < sheet.length; i++) {
     if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
-    const colI = String(sheet[i][8] || '').trim();
-    const colJ = String(sheet[i][9] || '').trim();
-    const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
-    const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
-    if (colIReal || colJReal) { skippedAlreadyPushed++; continue; }
+    // "Fetched at" / "Frappe pushed" markers live in shifted columns
+    // (J/K instead of I/J) so the wakandi_member_id in col I doesn't trip
+    // the "already pushed" check. We ALSO require the marker text to
+    // start with the canonical prefix — bare data in the wrong column
+    // shouldn't fool the gate.
+    const fetched = String(sheet[i][cfg.fetchedAtCol] || '').trim();
+    const pushed = String(sheet[i][cfg.pushedCol] || '').trim();
+    const fetchedReal = (fetched.startsWith('Fetched at') && !fetched.includes('(DRY_RUN)')) ? fetched : '';
+    const pushedReal  = (
+      (pushed.startsWith('Frappe pushed') || pushed.startsWith('Frappe pending') || pushed.startsWith('QB pushed'))
+      && !pushed.includes('(DRY_RUN)')
+    ) ? pushed : '';
+    if (fetchedReal || pushedReal) { skippedAlreadyPushed++; continue; }
 
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
@@ -140,9 +175,15 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso }) {
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`,
       channel,
-      customerPhone: sheet[i][5] || null,
+      // Column 5 holds the PLATE on SAV sheets (not a phone — operator
+      // schema). Capturing it lets the resolver hit by-plate for the 18
+      // QB-resident SAVCOM customers without needing the free-text fallback.
+      plate: String(sheet[i][5] || '').trim() || null,
       customerName: sheet[i][6] || null,
       contractName: sheet[i][6] || null,
+      // Column 8 holds the WAKANDI MEMBER ID — direct Frappe match for the
+      // 274 Wakandi-only customers. This is the cleanest signal of all.
+      wakandi_member_id: String(sheet[i][cfg.wakandiIdCol] || '').trim() || null,
       amount: sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null,
       receivedTimestamp: ts ? ts.getTime() : null,
       transactionId: sheet[i][7] || null,
@@ -282,7 +323,13 @@ export async function runSavFrappeUpload({
   let resolvedCount = 0;
   const unresolved = [];
   for (const t of txnsClean) {
+    // Feed the resolver the strongest signals first: plate (col F)
+    // for QB-resident customers, wakandi_member_id (col I) for Wakandi.
+    // These are direct primary keys in the 292-customer book — no
+    // ambiguity, no normalization risk.
     const r = await resolveSavcom({
+      plate: t.plate,
+      wakandi_member_id: t.wakandi_member_id,
       name: t.customerName,
       freeText: [t.customerName, t.contractName, t.transactionId].filter(Boolean).join(' | '),
     });
@@ -434,8 +481,11 @@ export async function runSavFrappeUpload({
     );
   }
 
-  // 9. Sheet markers (I/J/K) — same convention as QB path so the
-  //    operator sees the same visual state.
+  // 9. Sheet markers — SHIFTED one column right vs the QB path so the
+  //    wakandi_member_id in column I stays untouched. Operator sees:
+  //      J = "Fetched at: <iso>"        (was I on QB tabs)
+  //      K = "Frappe pending/pushed"    (was J on QB tabs)
+  //      L = "end of <tick>"            (was K on QB tabs)
   const fetchedAt = new Date().toISOString();
   const fetchRows = new Set();
   for (const t of txnsClean) if (t.sheet_row_number) fetchRows.add(t.sheet_row_number);
@@ -443,21 +493,30 @@ export async function runSavFrappeUpload({
     const updates = [];
     const dryTag = dryRun ? ' (DRY_RUN)' : '';
     for (const row of fetchRows) {
-      updates.push({ range: `${cfg.tab}!I${row}`, value: `Fetched at: ${fetchedAt}${dryTag}` });
-      updates.push({ range: `${cfg.tab}!J${row}`, value: `${dryRun ? 'DRY_RUN' : 'Frappe pending'}${dryTag}` });
+      updates.push({ range: `${cfg.tab}!${cfg.fetchedAtLetter}${row}`, value: `Fetched at: ${fetchedAt}${dryTag}` });
+      updates.push({ range: `${cfg.tab}!${cfg.pushedLetter}${row}`,    value: `${dryRun ? 'DRY_RUN' : 'Frappe pending'}${dryTag}` });
     }
     try {
       const r = await writeSheetCells(cfg.sheetId, updates);
-      console.log(`[sav-frappe] I+J markers: ${r.updatedCells} cells, ${fetchRows.size} rows, tab=${cfg.tab}, dryRun=${dryRun}`);
+      console.log(`[sav-frappe] ${cfg.fetchedAtLetter}+${cfg.pushedLetter} markers: ${r.updatedCells} cells, ${fetchRows.size} rows, tab=${cfg.tab}, dryRun=${dryRun}`);
     } catch (e) {
-      console.error('[sav-frappe] sheet I+J marker write failed (non-fatal):', e.message);
+      console.error('[sav-frappe] sheet marker write failed (non-fatal):', e.message);
     }
-    // K marker on the last sheet row processed.
+    // End-of-tick marker on the last sheet row processed. paintRowEndMarker
+    // writes to column K by default — for SAV we override the column letter
+    // via a 5th positional arg if supported, otherwise we write the L cell
+    // directly and skip the row-coloring helper.
     try {
       const lastRow = Math.max(...fetchRows);
-      await paintRowEndMarker(cfg.sheetId, cfg.tab, lastRow, tickName || 'heisenberg', { dryRun });
+      // Direct cell write to column L — keeps the data shape simple even
+      // without the helper's row-paint side effect. The dashboard's
+      // "consume" check uses prefix match on "end of " which works in any column.
+      await writeSheetCells(cfg.sheetId, [{
+        range: `${cfg.tab}!${cfg.endTickLetter}${lastRow}`,
+        value: `end of ${tickName || 'heisenberg'}${dryTag}`,
+      }]);
     } catch (e) {
-      console.error('[sav-frappe] K marker paint failed (non-fatal):', e.message);
+      console.error('[sav-frappe] end-of-tick marker write failed (non-fatal):', e.message);
     }
   }
 
