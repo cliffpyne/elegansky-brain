@@ -100,7 +100,7 @@ function tomorrowEat(): string {
 }
 
 function HeisenbergForm({ onFired }: { onFired: () => void }) {
-  const [channel, setChannel] = useState<'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav'>('nmbnew');
+  const [channel, setChannel] = useState<'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav' | 'sav_nmb' | 'sav_crdb'>('nmbnew');
   const [windowMode, setWindowMode] = useState<'from_last' | 'explicit'>('from_last');
   const [sinceIso, setSinceIso] = useState<string>('');
   const [untilIso, setUntilIso] = useState<string>(nowEat());
@@ -116,7 +116,7 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
   // form value at the moment of the dry-run so any subsequent edits to
   // the form don't bleed into the push.
   const [lastDryRun, setLastDryRun] = useState<{
-    channel: 'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav';
+    channel: 'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav' | 'sav_nmb' | 'sav_crdb';
     windowMode: 'from_last' | 'explicit';
     sinceIso: string;
     untilIso: string;
@@ -224,14 +224,16 @@ function HeisenbergForm({ onFired }: { onFired: () => void }) {
         <div className="grid grid-cols-2 gap-3">
           <label className="space-y-1">
             <span className="text-sm font-medium">Channel</span>
-            <Select value={channel} onValueChange={(v) => setChannel(v as 'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav')}>
+            <Select value={channel} onValueChange={(v) => setChannel(v as 'nmbnew' | 'bank' | 'iphone_bank' | 'nmbnew_sav' | 'bank_sav' | 'sav_nmb' | 'sav_crdb')}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="nmbnew">NMB</SelectItem>
                 <SelectItem value="bank">CRDB</SelectItem>
                 <SelectItem value="iphone_bank">iPhone</SelectItem>
-                <SelectItem value="nmbnew_sav">SAVCOM NMB</SelectItem>
-                <SelectItem value="bank_sav">SAVCOM CRDB</SelectItem>
+                <SelectItem value="nmbnew_sav">SAVCOM NMB (legacy → QB)</SelectItem>
+                <SelectItem value="bank_sav">SAVCOM CRDB (legacy → QB)</SelectItem>
+                <SelectItem value="sav_nmb">SAV NMB (→ Frappe)</SelectItem>
+                <SelectItem value="sav_crdb">SAV CRDB (→ Frappe)</SelectItem>
               </SelectContent>
             </Select>
           </label>

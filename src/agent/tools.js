@@ -141,8 +141,8 @@ export const TOOLS = [
       properties: {
         channel: {
           type: 'string',
-          enum: ['nmbnew', 'bank', 'iphone_bank'],
-          description: 'nmbnew=NMB, bank=CRDB, iphone_bank=iPhone M-Pesa',
+          enum: ['nmbnew', 'bank', 'iphone_bank', 'sav_nmb', 'sav_crdb'],
+          description: 'nmbnew=NMB→QB, bank=CRDB→QB, iphone_bank=iPhone M-Pesa→QB, sav_nmb=SAVCOM NMB→Frappe, sav_crdb=SAVCOM CRDB→Frappe. SAV channels read PASSED_SAV sheets and push payments to Frappe (not QB) using elegansky.api.ingest_payment with explicit allocations from the V2 algorithm against Frappe open invoices.',
         },
         since_iso: {
           type: 'string',
@@ -266,7 +266,14 @@ export async function dispatch(toolName, input, ctx) {
           dry_run: ctx.mode === 'plan',
           tick_name: input.tick_name || 'heisenberg',
         };
-        const r = await fetch(`${base}/api/payment-batches/auto-upload/${encodeURIComponent(input.channel)}`, {
+        // SAV channels go through the Frappe-end-to-end pipeline (separate
+        // endpoint, separate runner, sacred V2 algorithm preserved). QB
+        // channels stay on the existing /auto-upload path.
+        const isFrappeChannel = ['sav_nmb', 'sav_crdb'].includes(input.channel);
+        const endpoint = isFrappeChannel
+          ? `${base}/api/payment-batches/auto-upload-frappe/${encodeURIComponent(input.channel)}`
+          : `${base}/api/payment-batches/auto-upload/${encodeURIComponent(input.channel)}`;
+        const r = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Report-Secret': secret },
           body: JSON.stringify(body),

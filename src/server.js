@@ -26,6 +26,7 @@ import { mountErpApi } from './erp-api.js';
 import { mountFrappeWebhookApi } from './frappe-webhook.js';
 import { mountFrappePushApi } from './frappe-push.js';
 import { mountFrappeSavApi } from './frappe-push-sav.js';
+import { mountSavFrappeApi } from './payment-batches-frappe.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
 import { getPrewarmHooks, computeAccountBalanceForSnapshot, computeSheetTotalsForSnapshot } from './mega-report.js';
@@ -693,6 +694,7 @@ mountErpApi(app, { pool: db() });
 mountFrappeWebhookApi(app, { pool: db() });
 mountFrappePushApi(app, { requireSecretOrJwt });
 mountFrappeSavApi(app, { requireSecretOrJwt });
+mountSavFrappeApi(app, { requireSecretOrJwt });
 startM6pmWatchers({
   pool: db(),
   sharedSecret: process.env.STATEMENT_REPORT_SECRET,
