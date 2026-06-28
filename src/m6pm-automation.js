@@ -281,6 +281,34 @@ async function postSyncMobile() {
 }
 
 /**
+ * Trigger m6pm's /api/autofire/send-overdue-sms — the customer-overdue
+ * SMS dispatch (the SEND NOTIFICATION tab automated). Posts the morning
+ * arrears xls; m6pm internally filters to yesterday's unpaid balances,
+ * looks up phones via pikipiki, queues + dispatches via NextSMS, and
+ * SMSes admins when the batch completes.
+ *
+ * Frank 2026-06-28: this is the 3rd leg of the morning ritual after
+ * report generation and sync-mobile. Must run ONCE per day, in that order.
+ */
+async function postSendOverdueSms(xlsBuffer, { dryRun = false } = {}) {
+  const form = new FormData();
+  form.append('file', new Blob([xlsBuffer]), 'brain-morning-overdue.xls');
+  const url = `${M6PM_BASE}/api/autofire/send-overdue-sms${dryRun ? '?dry_run=1' : ''}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    body: form,
+    headers: {
+      ...m6pmBrowserHeaders(),
+      'X-Report-Secret': process.env.STATEMENT_REPORT_SECRET || '',
+    },
+    signal: AbortSignal.timeout(10 * 60_000),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`m6pm /api/autofire/send-overdue-sms ${r.status}: ${text.slice(0, 300)}`);
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+/**
  * Once-a-day morning gate. Atomically claims today's morning slot in
  * app_settings — only the first caller succeeds. Returns true if THIS
  * call acquired the gate (caller proceeds with sync + SMS), false if
@@ -693,9 +721,11 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         }
       }
       let syncResult = null;
+      let overdueSmsResult = null;
       if (mode === 'morning') {
         const got = await morningGateAcquired(pool, today);
         if (got) {
+          // Step 2 of the morning ritual — sync mobile (refresh officers' app).
           try {
             syncResult = await postSyncMobile();
             console.log(`[m6pm/autofire] mode=${mode} sync-mobile fired (morning gate acquired)`);
@@ -703,8 +733,20 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
             console.error(`[m6pm/autofire] sync-mobile failed:`, e.message);
             syncResult = { error: e.message };
           }
+          // Step 3 of the morning ritual — customer overdue SMS (yesterday-only).
+          // m6pm /api/autofire/send-overdue-sms internally filters to yesterday's
+          // unpaid balances, dispatches via NextSMS in a daemon thread, and
+          // SMSes admins on completion. Same morning gate keeps it once-a-day.
+          try {
+            overdueSmsResult = await postSendOverdueSms(buf);
+            console.log(`[m6pm/autofire] mode=${mode} overdue-sms dispatched: batch=${overdueSmsResult.batch_id} eligible=${overdueSmsResult.eligible_count}`);
+          } catch (e) {
+            console.error(`[m6pm/autofire] overdue-sms failed:`, e.message);
+            overdueSmsResult = { error: e.message };
+          }
         } else {
           syncResult = '(skipped — morning gate already claimed today)';
+          overdueSmsResult = '(skipped — morning gate already claimed today)';
         }
       }
       // Mark fired (per-mode gate) AND update the global last-fire timestamp
