@@ -1142,49 +1142,41 @@ async function tickResultNotifierWatcher({ pool }) {
     let text;
     let resultLabel;
     if (stats.rows.length === 0) {
-      // No finalized batches yet. Decision tree distinguishes the
-      // three cases that all used to fire the same "no batches" SMS:
-      //   A. Worker reported ok with rows_seen>0 but DB empty
-      //      → transient persistence (e.g. BRAIN restart during fire).
-      //         SILENT log; admins do not see panic SMS for our problem.
-      //   B. Worker reported ok with rows_seen=0
-      //      → no transactions in the window. Legitimate "ok empty".
-      //         Send INFO SMS without blaming any subsystem.
-      //   C. Worker reported fail (or no outcome and past grace)
-      //      → real failure. SMS with the specific subsystem hints.
+      // No finalized batches yet. Frank 2026-06-28: EVERY tick gets an
+      // SMS — no silencing. The text just has to ACCURATELY describe
+      // what happened. We combine the worker's self-report with DB
+      // state and pick the right wording so boss + admin team know
+      // exactly where the gap is.
       if (outcome?.status === 'ok') {
         const rowsSeen = Number(outcome.rows_seen || 0);
         if (rowsSeen > 0) {
-          // Case A — silent
-          await pool.query(
-            `UPDATE app_settings SET value='ok_persistence_drift', updated_at=now() WHERE key=$1`,
-            [notifKey],
-          );
-          console.log(`[m6pm/tick-notif] ${tick} worker says ok rows=${rowsSeen} but DB empty — silent log (transient persistence)`);
-          continue;
+          // Worker says ok with rows seen — but DB has no batches yet.
+          // Most common cause: BRAIN was restarting when the batch
+          // INSERT happened. Tell admins exactly that so they don't
+          // panic about scrapers/phone/POC.
+          text = `BRAIN ${tick} ⚠ worker ok (${rowsSeen} rows) but no batches persisted — likely BRAIN restart during fire, investigate`;
+          resultLabel = 'ok_persistence_drift';
+        } else {
+          text = `BRAIN ${tick} ✓ no transactions in window`;
+          resultLabel = 'ok_empty';
         }
-        // Case B — informational
-        text = `BRAIN ${tick} ✓ no transactions in window`;
-        resultLabel = 'ok_empty';
+      } else if (outcome?.status === 'fail') {
+        const reason = outcome.reason ? String(outcome.reason).slice(0, 100) : 'unspecified';
+        text = `BRAIN ${tick} ✗ worker: ${reason}`;
+        resultLabel = 'err';
       } else {
-        // Case C
+        // No worker outcome reported. Within grace → wait for next 60s
+        // tick (worker may still be running). Past grace → "no outcome"
+        // SMS — the only truly silent failure the watcher can detect.
         if (minutesPastTick < FAILURE_GRACE_MIN) {
           await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
           continue;
         }
-      // Frank 2026-06-28: build the suggestion clause from ACTUAL subsystem
-      // health checks instead of the blanket "POC/scrapers/phone" blame.
-      // Only name a subsystem when its own state says it is stale. Avoids
-      // misleading messages (e.g. "check POC" when POC is fine).
-      const hints = await detectStaleSubsystems(pool);
-      // Prefer the worker's own error reason when it reported one.
-      const workerReason = outcome?.status === 'fail' && outcome.reason
-        ? ` — worker: ${String(outcome.reason).slice(0, 80)}`
-        : '';
-      text = hints.length
-        ? `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale${workerReason}`
-        : `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min${workerReason || ' — all subsystems look healthy, investigate worker logs'}`;
-      resultLabel = 'err';
+        const hints = await detectStaleSubsystems(pool);
+        text = hints.length
+          ? `BRAIN ${tick} ✗ no worker outcome by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale`
+          : `BRAIN ${tick} ✗ no worker outcome by +${FAILURE_GRACE_MIN}min — all subsystems look healthy, investigate worker logs`;
+        resultLabel = 'err_no_outcome';
       }
     } else {
       const parts = stats.rows.map((r) => {
