@@ -968,6 +968,51 @@ async function pocFailureAlertWatcher({ pool }) {
  * Stored in app_settings:
  *   m6pm_tick_notif:${ymd}:${tick} = "ok" | "err" (mark so we don't re-SMS)
  */
+/**
+ * Inspect each upstream subsystem and return ONLY the names of the ones
+ * that look stale RIGHT NOW. Empty array = all healthy.
+ *
+ * Frank 2026-06-28: stops the misleading blanket "POC/scrapers/phone"
+ * blame in tick-failure SMS — only name a subsystem when its own state
+ * timestamps say it's actually stuck.
+ *
+ * Thresholds match the operational rule of thumb each subsystem already
+ * uses elsewhere:
+ *   - POC stale  → no successful nmb-pull cycle in 10 min
+ *   - phone stale → no heartbeat in 5 min (matches HEARTBEAT_STALE_MIN)
+ *
+ * Doesn't check the local CRDB / iPhone scrapers because they have no
+ * heartbeat row to read; their failure mode is the worker's own log.
+ */
+async function detectStaleSubsystems(pool) {
+  const hints = [];
+  try {
+    const r = await pool.query(
+      `SELECT value FROM app_settings WHERE key = 'nmb_pull_last_ok_completed_at'`,
+    );
+    const lastOk = r.rows[0]?.value;
+    if (lastOk) {
+      const ageMin = (Date.now() - new Date(lastOk).getTime()) / 60_000;
+      if (ageMin > 10) hints.push(`POC (${Math.floor(ageMin)}m)`);
+    } else {
+      hints.push('POC (never)');
+    }
+  } catch (_) { /* ignore — diagnostic SMS shouldn't crash on probe errors */ }
+  try {
+    const r = await pool.query(
+      `SELECT seen_at FROM phone_heartbeats ORDER BY seen_at DESC LIMIT 1`,
+    );
+    const last = r.rows[0]?.seen_at;
+    if (!last) {
+      hints.push('phone (never)');
+    } else {
+      const ageMin = (Date.now() - new Date(last).getTime()) / 60_000;
+      if (ageMin > HEARTBEAT_STALE_MIN) hints.push(`phone (${Math.floor(ageMin)}m)`);
+    }
+  } catch (_) { /* table may not exist yet on first boot — ignore */ }
+  return hints;
+}
+
 async function tickResultNotifierWatcher({ pool }) {
   if (process.env.TICK_RESULT_SMS !== 'true') return;
   const today = todayYmdEat();
@@ -1022,7 +1067,14 @@ async function tickResultNotifierWatcher({ pool }) {
         await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
         continue;
       }
-      text = `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — check POC/scrapers/phone`;
+      // Frank 2026-06-28: build the suggestion clause from ACTUAL subsystem
+      // health checks instead of the blanket "POC/scrapers/phone" blame.
+      // Only name a subsystem when its own state says it is stale. Avoids
+      // misleading messages (e.g. "check POC" when POC is fine).
+      const hints = await detectStaleSubsystems(pool);
+      text = hints.length
+        ? `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale`
+        : `BRAIN ${tick} ✗ no batches by +${FAILURE_GRACE_MIN}min — all subsystems look healthy, investigate worker logs`;
       resultLabel = 'err';
     } else {
       const parts = stats.rows.map((r) => {
