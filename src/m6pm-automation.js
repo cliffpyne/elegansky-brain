@@ -550,8 +550,17 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
 // debt report — handled separately in fireKili1615Comparison() below.
 const REPORT_MODES = {
   morning: {
-    triggerTicks: ['meru0100', 'meru0300', 'hanang0700'],
-    minHourEat: 5,  // Frank rule: hold delivery until 05:00 EAT
+    // Frank 2026-06-28: trigger off the new meru0500 catchup (added because
+    // meru0300 has been failing many mornings in a row). The other ticks
+    // remain as fallback so any successful overnight tick still arms the
+    // morning ritual.
+    triggerTicks: ['meru0500', 'meru0100', 'meru0300', 'hanang0700'],
+    minHourEat: 5,        // Frank rule: hold delivery until 05:00 EAT
+    forceAtHourEat: 6,    // Frank 2026-06-28: if NO tick has finalized by
+                          // 06:00 EAT, fire the morning ritual anyway. The
+                          // arrears endpoint reads QB live, so we can still
+                          // produce a meaningful report even when all
+                          // overnight ticks failed.
   },
   noon: {
     // Frank calls lengai1230 the "noon fire" (12:30 EAT). Internally was
@@ -572,6 +581,7 @@ const HEISENBERG_COOLDOWN_MS = 30 * 60 * 1000;
 const TICK_SCHEDULE_EAT = [
   { tick: 'meru0100', hour: 1, min: 0 },
   { tick: 'meru0300', hour: 3, min: 0 },
+  { tick: 'meru0500', hour: 5, min: 0 },
   { tick: 'hanang0700', hour: 7, min: 0 },
   { tick: 'loolmalas1000', hour: 10, min: 0 },
   { tick: 'lengai1230', hour: 12, min: 30 },
@@ -686,7 +696,15 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
         LIMIT 1`,
       [tickPatterns],
     );
-    if (!recent.rows.length) continue;
+    // Frank 2026-06-28: forceAtHourEat fallback. If NO trigger tick has
+    // finalized today AND the clock has passed the force hour, fire the
+    // ritual anyway with whatever current arrears we can pull. The arrears
+    // endpoint reads QB live, so a meaningful morning report is still
+    // produceable even when all overnight upload ticks failed.
+    const forced = !recent.rows.length
+      && cfg.forceAtHourEat != null
+      && eatHour >= cfg.forceAtHourEat;
+    if (!recent.rows.length && !forced) continue;
 
     // Atomic gate acquire — only one BRAIN process wins per mode per day.
     const acquired = await pool.query(
