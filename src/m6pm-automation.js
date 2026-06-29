@@ -863,6 +863,16 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
           await sendNextSms(phone, text);
         }
         console.log(`[m6pm/autofire] mode=${mode} SMSed report link to ${broadcastPhones().length} admins`);
+        // Fix #2 — stamp dispatch time so morningLinkProbeWatcher knows the
+        // link actually went out. If this row isn't here by the probe's
+        // deadline, master admin gets a direct "LINK NOT DELIVERED" alert.
+        try {
+          await pool.query(
+            `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+            [`m6pm_link_sms_sent_at:${today}:${mode}`, new Date().toISOString()],
+          );
+        } catch (e) { console.error('[m6pm/autofire] stamp link-sent failed:', e.message); }
       } else {
         console.warn(`[m6pm/autofire] mode=${mode} REPORT_LINK_SECRET unset — skipping SMS-with-link`);
       }
@@ -1441,6 +1451,63 @@ async function phoneHeartbeatWatcher({ pool }) {
  * best-effort — exceptions are caught and logged so a watcher hiccup
  * never crashes BRAIN.
  */
+/**
+ * Fix #2 (Frank 2026-06-29): end-to-end "morning link delivered" probe.
+ *
+ * The morning ritual's `m6pm_morning_done_ymd` only proves BRAIN started
+ * the chain — it gets set BEFORE the SMS broadcast loop. If anything between
+ * that flag and the SMS dispatch breaks (NextSMS down, broadcastPhones
+ * misconfigured, autofire crashed mid-chain), the operator silently never
+ * receives the link and has to notice the gap themselves.
+ *
+ * Probe: at 05:30 EAT (a 5-min grace after the 05:00 morning fire), check
+ * for the dispatch stamp `m6pm_link_sms_sent_at:<today>:morning`. If absent,
+ * send ONE direct alert to MASTER_ADMIN_PHONE with the rescue command, then
+ * dedup for the day so we don't spam.
+ *
+ * Same alert deadline applies whether the failure mode is /arrears down,
+ * postArrearsToM6pm timeout, NextSMS rejection, or anything else — the
+ * probe checks the END state (was an SMS dispatched?), not any individual
+ * step.
+ */
+async function morningLinkProbeWatcher({ pool }) {
+  const today = todayYmdEat();
+  const now = new Date();
+  const eatNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();
+  // Probe runs only in the 05:30 → 06:30 EAT window. Before 05:30 the
+  // autofire still has time to fire the SMS legitimately; after 06:30 the
+  // operator is awake anyway and the alert SMS adds nothing.
+  const PROBE_START = 5 * 60 + 30;
+  const PROBE_END = 6 * 60 + 30;
+  if (eatTotalMin < PROBE_START || eatTotalMin > PROBE_END) return;
+
+  // Did the SMS broadcast loop stamp dispatch today? If yes, all good.
+  const stamp = await pool.query(
+    `SELECT updated_at FROM app_settings WHERE key = $1`,
+    [`m6pm_link_sms_sent_at:${today}:morning`],
+  );
+  if (stamp.rows.length > 0) return;
+
+  // Atomic dedup — only one BRAIN process sends the alert per day.
+  const alertKey = `m6pm_morning_link_alert_ymd:${today}`;
+  const claim = await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ($1, 'alerted')
+       ON CONFLICT (key) DO NOTHING RETURNING value`,
+    [alertKey],
+  );
+  if (!claim.rows.length) return;
+
+  const text = `BRAIN morning ${today}: link SMS NOT DISPATCHED by 05:30 EAT. ` +
+    `Rescue: POST /api/admin/m6pm/trigger?mode=morning&source=cache&fire_all=1`;
+  try {
+    await sendNextSms(MASTER_ADMIN_PHONE, text);
+    console.warn(`[m6pm/morning-probe] alert sent to master admin (no link by 05:30 EAT)`);
+  } catch (e) {
+    console.error('[m6pm/morning-probe] alert SMS failed:', e.message);
+  }
+}
+
 export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   let running = false;
   const tick = async () => {
@@ -1455,6 +1522,8 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/tick-notif watcher]', err.message); }
       try { await phoneHeartbeatWatcher({ pool }); }
       catch (err) { console.error('[m6pm/phone-hb watcher]', err.message); }
+      try { await morningLinkProbeWatcher({ pool }); }
+      catch (err) { console.error('[m6pm/morning-probe watcher]', err.message); }
     } finally {
       running = false;
     }
@@ -1463,5 +1532,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb watchers armed (60s, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe watchers armed (60s, no overlap)');
 }
