@@ -370,35 +370,63 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
   app.post('/api/admin/m6pm/trigger', requireSecretOrJwt, async (req, res) => {
     try {
       let mode = String(req.query.mode || req.body?.mode || '').toLowerCase();
-      // Backward compat: accept legacy 'afternoon' as alias for 'noon' so any
-      // existing scripts / curls from before the 2026-06-27 rename still work.
       if (mode === 'afternoon') mode = 'noon';
       if (!['morning', 'noon', 'evening', 'heisenberg'].includes(mode)) {
         return res.status(400).json({ error: 'mode must be morning, noon, evening, or heisenberg' });
       }
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
-      // Optional ?includeToday=true escape hatch for debugging; defaults to
-      // the same excludeToday=true the production autofire path uses so this
-      // /trigger endpoint reproduces what officers will actually see.
       const includeToday = req.query.includeToday === '1' || req.query.includeToday === 'true';
-      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: !includeToday });
+      // Frank 2026-06-29: rescue flags after /arrears outage left officers
+      // waiting on the morning link. source=cache reads the morning_arrears
+      // snapshot the autofire already captured at 05:01 EAT so we can keep
+      // moving when /arrears is down. fire_all=1 lets a manual trigger
+      // chain sync-mobile + send-overdue-sms (the third leg of the morning
+      // ritual that normally only the auto path runs).
+      const source = String(req.query.source || '').toLowerCase();
+      const fireAll = req.query.fire_all === '1' || req.query.fire_all === 'true';
+      let arrears;
+      let arrearsSource = 'live';
+      if (source === 'cache') {
+        const ymd = todayYmdEat();
+        const r = await pool.query(
+          `SELECT value FROM app_settings WHERE key = $1`, [`morning_arrears:${ymd}`]);
+        if (!r.rows[0]?.value) {
+          return res.status(404).json({ error: `no morning_arrears:${ymd} cache — autofire didn't run yet today` });
+        }
+        try { arrears = JSON.parse(r.rows[0].value); }
+        catch (e) { return res.status(500).json({ error: `cache parse failed: ${e.message}` }); }
+        arrearsSource = `cache(morning_arrears:${ymd})`;
+      } else {
+        arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: !includeToday });
+      }
       const buf = buildArrearsXls(arrears, null);
       const m6pmReports = await postArrearsToM6pm(buf, mode);
       const result = {
         mode,
+        arrears_source: arrearsSource,
         excludeToday: !includeToday,
         arrears_count: arrears.length,
         m6pm_reports: m6pmReports,
         sync_mobile: null,
+        send_overdue_sms: null,
       };
-      // SAFETY: the manual /trigger endpoint NEVER fires sync-mobile, even
-      // for mode=morning. Frank 2026-06-25: each sync-mobile re-fire WIPES
-      // officers' in-progress work. Sync-mobile only fires from the auto
-      // path (post-meru0100 hook in production), gated by morningGateAcquired().
-      // Manual /trigger is for testing report generation in isolation.
-      if (mode === 'morning') {
-        result.sync_mobile = '(SKIPPED — manual /trigger never syncs mobile; auto path only)';
-        result.morning_gate = '(not touched by manual /trigger)';
+      // Chain sync-mobile + send-overdue-sms when fire_all=1 (operator
+      // override for recovery; sync-mobile wipes officer in-progress so
+      // ONLY fire when you mean it).
+      if (mode === 'morning' && fireAll) {
+        try {
+          result.sync_mobile = await postSyncMobile(buf);
+        } catch (e) {
+          result.sync_mobile = { error: String(e.message || e).slice(0, 400) };
+        }
+        try {
+          result.send_overdue_sms = await postSendOverdueSms(buf, { dryRun: false });
+        } catch (e) {
+          result.send_overdue_sms = { error: String(e.message || e).slice(0, 400) };
+        }
+      } else if (mode === 'morning') {
+        result.sync_mobile = '(SKIPPED — pass ?fire_all=1 to chain sync-mobile + send-overdue-sms)';
+        result.send_overdue_sms = '(SKIPPED — pass ?fire_all=1 to chain)';
       }
       res.json(result);
     } catch (err) {
