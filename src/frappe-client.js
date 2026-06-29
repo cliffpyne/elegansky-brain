@@ -172,3 +172,25 @@ export async function pingFrappe() {
   const r = await callFrappe('GET', '/api/method/ping');
   return r.message || r;
 }
+
+/**
+ * Fetch a Payment Entry by name — returns the full doc with references[]
+ * (the invoice allocations) and reference_no (where we put bank_ref+V).
+ */
+export async function getPaymentEntry(name) {
+  if (!name) throw new Error('getPaymentEntry: name required');
+  const r = await callFrappe('GET',
+    `/api/resource/Payment Entry/${encodeURIComponent(name)}`);
+  return r.data || r;
+}
+
+/**
+ * Fetch a Sales Invoice by name — used by verification path to confirm the
+ * allocated invoice's posting_date is past/today (not future) per AS_OF.
+ */
+export async function getSalesInvoice(name) {
+  if (!name) throw new Error('getSalesInvoice: name required');
+  const r = await callFrappe('GET',
+    `/api/resource/Sales Invoice/${encodeURIComponent(name)}`);
+  return r.data || r;
+}

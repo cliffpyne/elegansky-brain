@@ -26,7 +26,7 @@
 
 import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
-import { getOpenInvoices, ingestPayment, reversePayment } from './frappe-client.js';
+import { getOpenInvoices, ingestPayment, reversePayment, getPaymentEntry, getSalesInvoice } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
 import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
 
@@ -1059,6 +1059,77 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     } catch (err) {
       await lift();
       console.error('[savcom-recall]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // GET /api/admin/savcom/verify-customer?customer=<name>&since=<iso>
+  //
+  // End-to-end proof that the recall + re-fire produced correctly-allocated
+  // payments. For a named customer, returns:
+  //   - every payment_uploads row from the recent replay batches
+  //   - the Frappe Payment Entry it produced (reference_no, with V suffix)
+  //   - the Sales Invoice each PE allocation hit (posting_date proves the
+  //     AS_OF gate worked — date must be ≤ batch's txn_date / AS_OF)
+  // Sample: ?customer=ISIHAKA RAMADHANI MKAMIA
+  // ───────────────────────────────────────────────────────────────────────
+  app.get('/api/admin/savcom/verify-customer', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customer = String(req.query.customer || '').trim();
+      if (!customer) return res.status(400).json({ error: 'customer required' });
+      const since = String(req.query.since || '2026-06-29T17:00:00Z');
+
+      const pus = await db().query(`
+        SELECT pu.bank_ref, pu.invoice_qb_id, pu.amount, pu.qb_response,
+               pb.channel, pb.txn_date, pb.created_by, pb.created_at
+          FROM payment_uploads pu
+          JOIN payment_batches pb ON pb.id = pu.batch_id
+         WHERE pu.customer_name = $1
+           AND pu.status = 'pushed_to_frappe'
+           AND pu.qb_response->>'status' = 'posted'
+           AND pb.created_at >= $2
+         ORDER BY pb.created_at`, [customer, since]);
+
+      const out = [];
+      for (const r of pus.rows) {
+        const peName = r.qb_response?.payment;
+        let pe = null, invoice = null, peErr = null, invErr = null;
+        try { pe = peName ? await getPaymentEntry(peName) : null; }
+        catch (e) { peErr = e.message; }
+        try { invoice = r.invoice_qb_id ? await getSalesInvoice(r.invoice_qb_id) : null; }
+        catch (e) { invErr = e.message; }
+
+        const txnDate = String(r.txn_date).slice(0, 10);
+        const invoiceDate = invoice?.posting_date || invoice?.due_date || null;
+        const isFuture = invoiceDate && txnDate && invoiceDate > txnDate;
+
+        out.push({
+          bank_ref_internal: r.bank_ref,
+          frappe_pe: peName,
+          frappe_reference_no: pe?.reference_no,
+          v_suffix_present: pe?.reference_no?.endsWith('V') || false,
+          channel: r.channel,
+          batch_txn_date: txnDate,
+          batch_label: r.created_by,
+          allocated_invoice: r.invoice_qb_id,
+          allocated_invoice_date: invoiceDate,
+          allocated_amount: r.amount,
+          AS_OF_VIOLATED: isFuture,        // <-- the smoking-gun flag
+          pe_fetch_error: peErr,
+          invoice_fetch_error: invErr,
+        });
+      }
+      res.json({
+        customer,
+        since,
+        push_count: out.length,
+        v_suffix_count: out.filter((x) => x.v_suffix_present).length,
+        as_of_violations: out.filter((x) => x.AS_OF_VIOLATED).length,
+        details: out,
+      });
+    } catch (err) {
+      console.error('[savcom-verify-customer]', err);
       res.status(500).json({ error: err.message });
     }
   });
