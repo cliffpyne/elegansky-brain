@@ -696,7 +696,7 @@ mountFrappeWebhookApi(app, { pool: db() });
 mountFrappePushApi(app, { requireSecretOrJwt });
 mountFrappeSavApi(app, { requireSecretOrJwt });
 mountSavFrappeApi(app, { requireSecretOrJwt });
-mountSavcomMorningApi(app, { requireSecretOrJwt });
+mountSavcomMorningApi(app, { requireSecretOrJwt, pool: db() });
 startM6pmWatchers({
   pool: db(),
   sharedSecret: process.env.STATEMENT_REPORT_SECRET,

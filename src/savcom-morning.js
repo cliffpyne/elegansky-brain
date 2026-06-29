@@ -25,6 +25,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 import * as XLSX from 'xlsx';
+import crypto from 'crypto';
 import { lookupSavcomPhone, getPhoneCacheStats } from './savcom-phones.js';
 
 const FRAPPE_BASE = () => (process.env.FRAPPE_BASE_URL || '').replace(/\/$/, '');
@@ -34,6 +35,36 @@ const NEXTSMS_API = 'https://messaging-service.co.tz/api/sms/v1/text/single';
 
 // Re-use the same master-admin phone the existing watchers use.
 const MASTER_ADMIN_PHONE = '255752900450';
+
+// Signed-link config (mirrors signedReportUrl in m6pm-automation.js so the
+// admin broadcast link verifies on the m6pm receiver side).
+const REPORT_LINK_SECRET = () => process.env.REPORT_LINK_SECRET || '';
+const REPORT_LINK_BASE = () => process.env.REPORT_LINK_BASE || 'https://www.eleganskyboda.com';
+const REPORT_LINK_TTL_HOURS = 72;
+
+// Admin broadcast list (mirrors broadcastPhones() in m6pm-automation.js).
+const DEFAULT_BROADCAST_PHONES = [
+  '255752900450', '255719864511', '255785422245', '255713123778',
+];
+function broadcastPhones() {
+  const raw = (process.env.SMS_BROADCAST_PHONES || '').trim();
+  if (!raw) return DEFAULT_BROADCAST_PHONES;
+  return raw.split(',').map((p) => p.trim()).filter(Boolean);
+}
+
+function signedSavcomReportUrl({ date, mode = 'savcom_morning' }) {
+  const secret = REPORT_LINK_SECRET();
+  if (!secret) return null;
+  const exp = Math.floor(Date.now() / 1000) + REPORT_LINK_TTL_HOURS * 3600;
+  const payload = `${date}|${mode}|*|${exp}`;
+  const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  const u = new URL('/api/p/reports/page', REPORT_LINK_BASE());
+  u.searchParams.set('date', date);
+  u.searchParams.set('exp', String(exp));
+  u.searchParams.set('sig', sig);
+  u.searchParams.set('mode', mode);
+  return u.toString();
+}
 
 // ─── Frappe arrears fetch ──────────────────────────────────────────────────
 
@@ -145,8 +176,36 @@ function buildCustomerSmsBody({ name, total_arrears, overdue_invoices, oldest_du
 
 // ─── full ritual ───────────────────────────────────────────────────────────
 
-export async function runSavcomMorningRitual({ dryRun = false, officer = 'ESTHER SAVCOM' } = {}) {
+export async function runSavcomMorningRitual({
+  dryRun = false, officer = 'ESTHER SAVCOM', pool = null, force = false,
+} = {}) {
   const ymd = new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 10); // EAT date
+
+  // Idempotency gate (Frank 2026-06-29 — after a curl-timeout double-fire
+  // sent every customer 2 SMS). Once today's SAVCOM ritual succeeds, the
+  // gate row is set and subsequent fires no-op until tomorrow. force=true
+  // overrides (e.g. when operator confirms an earlier fire only partial-
+  // dispatched and wants to retry).
+  const gateKey = `savcom_morning_done:${ymd}`;
+  if (pool && !dryRun && !force) {
+    const r = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, 'firing')
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [gateKey],
+    );
+    if (!r.rows.length) {
+      const existing = await pool.query(`SELECT value, updated_at FROM app_settings WHERE key = $1`, [gateKey]);
+      return {
+        skipped: true,
+        reason: 'savcom_morning_already_fired_today',
+        ymd,
+        gate_state: existing.rows[0]?.value,
+        gate_set_at: existing.rows[0]?.updated_at,
+        hint: 'pass force=1 to override (operator confirms previous fire was partial)',
+      };
+    }
+  }
+
   // 1. Frappe arrears
   const arrears = await fetchFrappeArrears({ officer });
   // 2. xls
@@ -211,8 +270,8 @@ export async function runSavcomMorningRitual({ dryRun = false, officer = 'ESTHER
   const errCount = sent.length - okCount;
   const totalArrears = arrears.total_arrears || arrears.rows.reduce((s, r) => s + (Number(r.total_arrears) || 0), 0);
 
-  // 5. Admin completion SMS (master admin only — keeps SAVCOM separate
-  //    from the general broadcast list so admins know which run finished).
+  // 5. Admin completion SMS (master admin only — distinguishable from the
+  //    general broadcast list so admins know which run finished).
   const adminText = dryRun
     ? `BRAIN SAVCOM ${ymd} DRY-RUN: ${arrears.customers_in_arrears || arrears.rows.length} customers, ${totalArrears.toLocaleString('en-US')} TZS overdue. Would dispatch ${okCount}, skip ${skipped.length} (no phone). Report ${m6pmReport?.error ? 'FAILED' : 'ok'}.`
     : `BRAIN SAVCOM ${ymd} done: ${arrears.customers_in_arrears || arrears.rows.length} customers, ${totalArrears.toLocaleString('en-US')} TZS overdue. SMS sent: ${okCount}, errors: ${errCount}, no-phone: ${skipped.length}. Report ${m6pmReport?.error ? 'FAILED' : 'ok'}.`;
@@ -220,6 +279,38 @@ export async function runSavcomMorningRitual({ dryRun = false, officer = 'ESTHER
   if (!dryRun) {
     try { adminSms = await sendNextSms(MASTER_ADMIN_PHONE, adminText); }
     catch (e) { adminSms = { error: e.message }; }
+  }
+
+  // 6. Broadcast link SMS to all admins so they (and anyone they forward
+  //    to) can pull the SAVCOM debt-report file. Frank 2026-06-29 — same
+  //    shape as the regular morning broadcast, distinguished by "SAVCOM"
+  //    word in the text.
+  let broadcastResults = [];
+  if (!dryRun) {
+    const link = signedSavcomReportUrl({ date: ymd, mode: 'savcom_morning' });
+    if (link) {
+      const linkText = `BRAIN SAVCOM morning report (${ymd}) ready: ${link}`;
+      for (const phone of broadcastPhones()) {
+        try {
+          const r = await sendNextSms(phone, linkText);
+          broadcastResults.push({ phone, ok: r?.ok, status: r?.status });
+        } catch (e) {
+          broadcastResults.push({ phone, ok: false, error: String(e.message || e).slice(0, 200) });
+        }
+      }
+    } else {
+      broadcastResults = [{ skipped: true, reason: 'REPORT_LINK_SECRET unset' }];
+    }
+  }
+
+  // 7. Flip gate to 'done' so subsequent calls today no-op (unless force=1).
+  if (pool && !dryRun) {
+    try {
+      await pool.query(
+        `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
+        [gateKey],
+      );
+    } catch (e) { console.error('[savcom/morning] gate flip failed:', e.message); }
   }
 
   return {
@@ -238,6 +329,7 @@ export async function runSavcomMorningRitual({ dryRun = false, officer = 'ESTHER
     },
     admin_sms: adminSms,
     admin_text: adminText,
+    broadcast_link_sms: broadcastResults,
     skipped_no_phone_sample: skipped.slice(0, 10),
     sent_sample: sent.slice(0, 5),
   };
@@ -245,13 +337,16 @@ export async function runSavcomMorningRitual({ dryRun = false, officer = 'ESTHER
 
 // ─── API mount ─────────────────────────────────────────────────────────────
 
-export function mountSavcomMorningApi(app, { requireSecretOrJwt }) {
+export function mountSavcomMorningApi(app, { requireSecretOrJwt, pool }) {
   // Main entry — operator fires the full SAVCOM ritual.
+  // ?force=1 overrides the per-day idempotency gate (operator confirms a
+  // prior fire only partial-dispatched and wants to retry).
   app.post('/api/admin/savcom/morning-ritual', requireSecretOrJwt, async (req, res) => {
     try {
       const dryRun = req.query.dry_run === '1' || req.body?.dry_run === true;
+      const force = req.query.force === '1' || req.body?.force === true;
       const officer = String(req.query.officer || req.body?.officer || 'ESTHER SAVCOM');
-      const result = await runSavcomMorningRitual({ dryRun, officer });
+      const result = await runSavcomMorningRitual({ dryRun, officer, pool, force });
       res.json(result);
     } catch (err) {
       console.error('[savcom/morning-ritual]', err);
