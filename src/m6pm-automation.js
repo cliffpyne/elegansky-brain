@@ -1452,6 +1452,97 @@ async function phoneHeartbeatWatcher({ pool }) {
  * never crashes BRAIN.
  */
 /**
+ * Fix #4 (Frank 2026-06-29): one-shot auto-retry on scraper crash.
+ *
+ * When the worker posts tick_outcome with status:fail and a reason like
+ * "nmb_scrapper_failed" (or anything containing "scrap"), BRAIN schedules
+ * a single retry at +30 min by setting the existing nmb-pull request flag.
+ * POC picks it up and retries; the rest of the chain runs unchanged.
+ *
+ * Capped at 1 retry per tick per day so a permanently-broken scraper
+ * doesn't spin forever. Per-tick, per-day dedup keys:
+ *   tick_retry_scheduled:<ymd>:<tick>  - retry_at timestamp written
+ *   tick_retry_fired:<ymd>:<tick>      - the nmb-pull flag actually set
+ *
+ * After firing, also SMSes master admin with the new request time so we
+ * know an autonomous retry is in flight (not a silent surprise).
+ */
+const SCRAPER_RETRY_DELAY_MIN = 30;
+async function scraperRetryWatcher({ pool }) {
+  const today = todayYmdEat();
+  // Find any tick_outcome from today that is status:fail with a scraper reason.
+  const fails = await pool.query(
+    `SELECT key, value, updated_at FROM app_settings
+      WHERE key LIKE $1
+      ORDER BY updated_at DESC LIMIT 20`,
+    [`tick_outcome:${today}:%`],
+  );
+  for (const row of fails.rows) {
+    let outcome;
+    try { outcome = JSON.parse(row.value); } catch { continue; }
+    if (outcome?.status !== 'fail') continue;
+    const reason = String(outcome.reason || '').toLowerCase();
+    if (!reason.includes('scrap')) continue;
+    const tick = String(row.key).split(':')[2];
+    if (!tick) continue;
+
+    const scheduledKey = `tick_retry_scheduled:${today}:${tick}`;
+    const firedKey = `tick_retry_fired:${today}:${tick}`;
+
+    // Step 1: ensure a retry is scheduled with a concrete retry_at time.
+    const claim = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [scheduledKey, new Date(new Date(row.updated_at).getTime() + SCRAPER_RETRY_DELAY_MIN * 60_000).toISOString()],
+    );
+    if (claim.rows.length) {
+      console.log(`[m6pm/scraper-retry] scheduled retry for ${tick} (reason=${reason})`);
+    }
+
+    // Step 2: if retry_at <= now() and not yet fired, fire it.
+    const sched = await pool.query(`SELECT value FROM app_settings WHERE key = $1`, [scheduledKey]);
+    const retryAt = sched.rows[0]?.value;
+    if (!retryAt || new Date(retryAt).getTime() > Date.now()) continue;
+
+    const fireClaim = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [firedKey, new Date().toISOString()],
+    );
+    if (!fireClaim.rows.length) continue; // already fired by another instance
+
+    // Set the existing nmb-pull request flag — POC's polling loop picks it
+    // up the same way the scheduler would. Downstream (POC complete →
+    // BRAIN auto-upload) runs without further wiring.
+    try {
+      const nowIso = new Date().toISOString();
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_requested_at', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [nowIso],
+      );
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_completed_at', '')
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      );
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_result_json', '')
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      );
+      console.warn(`[m6pm/scraper-retry] FIRED autonomous retry for ${tick} (POC will pick up nmb_pull_requested_at)`);
+      try {
+        await sendNextSms(
+          MASTER_ADMIN_PHONE,
+          `BRAIN ${tick} auto-retry fired (${reason}) — POC NMB pull requested at ${nowIso.slice(11,19)}Z. Capped 1/day.`,
+        );
+      } catch (_) { /* ignore SMS hiccup */ }
+    } catch (err) {
+      console.error('[m6pm/scraper-retry] retry fire failed:', err.message);
+    }
+  }
+}
+
+/**
  * Fix #2 (Frank 2026-06-29): end-to-end "morning link delivered" probe.
  *
  * The morning ritual's `m6pm_morning_done_ymd` only proves BRAIN started
@@ -1524,6 +1615,8 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/phone-hb watcher]', err.message); }
       try { await morningLinkProbeWatcher({ pool }); }
       catch (err) { console.error('[m6pm/morning-probe watcher]', err.message); }
+      try { await scraperRetryWatcher({ pool }); }
+      catch (err) { console.error('[m6pm/scraper-retry watcher]', err.message); }
     } finally {
       running = false;
     }
@@ -1532,5 +1625,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe watchers armed (60s, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe + scraper-retry watchers armed (60s, no overlap)');
 }
