@@ -1064,6 +1064,26 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
   });
 
   // ───────────────────────────────────────────────────────────────────────
+  // POST /api/admin/savcom/lift-recall-gates
+  // Removes the savcom_post_tick:<ymd>:<tick> gate rows we pre-claimed
+  // ('MANUALLY HELD — pending asOf/Phase-2 fix') to block kibo1900 + kibo2100
+  // from auto-firing during the recall+re-fire. Run AFTER verification.
+  // ───────────────────────────────────────────────────────────────────────
+  app.post('/api/admin/savcom/lift-recall-gates', requireSecretOrJwt, async (req, res) => {
+    try {
+      const r = await db().query(`
+        DELETE FROM app_settings
+         WHERE key LIKE 'savcom_post_tick:%'
+           AND value LIKE 'MANUALLY HELD%'
+         RETURNING key, value`);
+      res.json({ lifted: r.rowCount, rows: r.rows });
+    } catch (err) {
+      console.error('[savcom-lift-recall-gates]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
   // GET /api/admin/savcom/verify-customer?customer=<name>&since=<iso>
   //
   // End-to-end proof that the recall + re-fire produced correctly-allocated
