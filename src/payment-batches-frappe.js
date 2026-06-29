@@ -134,7 +134,7 @@ function parseTsAny(s) {
  * config + diagnostic counters. Same shape as the QB-path's sheet
  * intake, including the I/J/K Column protections.
  */
-async function readSavSheetWindow({ channel, sinceIso, untilIso }) {
+async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow = false }) {
   const cfg = SAV_CHANNEL_SHEETS[channel];
   if (!cfg) throw new Error(`unknown SAV channel: ${channel}`);
   const winStart = new Date(sinceIso);
@@ -150,10 +150,16 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso }) {
   //
   // Find the highest row index whose endTickCol carries an "end of <tick>"
   // marker. Same boundary semantics as the QB path, just one column over.
+  // `forceSkipMaxKRow` disables this gate — used by the savcom-recall
+  // re-fire path when a rogue post-recall end-tick marker blocks the
+  // catchup windows. Per-row J/K marker checks still apply, so only
+  // rows we explicitly cleared become eligible.
   let maxKRow = 0;
-  for (let i = 0; i < sheet.length; i++) {
-    const endTick = String(sheet[i][cfg.endTickCol] || '').trim().toLowerCase();
-    if (endTick.startsWith('end of ') && !endTick.includes('(dry_run)')) maxKRow = i + 1;
+  if (!forceSkipMaxKRow) {
+    for (let i = 0; i < sheet.length; i++) {
+      const endTick = String(sheet[i][cfg.endTickCol] || '').trim().toLowerCase();
+      if (endTick.startsWith('end of ') && !endTick.includes('(dry_run)')) maxKRow = i + 1;
+    }
   }
 
   const txns = [];
@@ -321,6 +327,7 @@ function tickSuffix() {
  */
 export async function runSavFrappeUpload({
   channel, sinceIso, untilIso, asOf, txnDate, tickName, dryRun = false,
+  forceSkipMaxKRow = false,
 } = {}) {
   if (!SAV_FRAPPE_CHANNELS.includes(channel)) {
     throw new Error(`channel must be one of: ${SAV_FRAPPE_CHANNELS.join(', ')}`);
@@ -331,7 +338,7 @@ export async function runSavFrappeUpload({
   }
 
   // 1. Sheet intake.
-  const { cfg, txns, diagnostics } = await readSavSheetWindow({ channel, sinceIso, untilIso });
+  const { cfg, txns, diagnostics } = await readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow });
   if (txns.length === 0) {
     return {
       skipped: true,
@@ -848,6 +855,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         channel, sinceIso, untilIso,
         asOf: req.body?.as_of || txnDate,
         txnDate, tickName, dryRun,
+        forceSkipMaxKRow: req.body?.force_skip_max_k_row === true,
       });
       clearInterval(heartbeat);
       await releaseLock();
