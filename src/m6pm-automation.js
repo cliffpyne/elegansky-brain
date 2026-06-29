@@ -1397,8 +1397,24 @@ async function phoneHeartbeatWatcher({ pool }) {
      )`,
   );
 
-  // Find heartbeats for the master admin phone in last HEARTBEAT_STALE_MIN.
-  const hb = await pool.query(
+  // Fix #5 (Frank 2026-06-29): three-strike alert logic. A single missed
+  // heartbeat is NOT a real outage — the brain-ping APK has variable
+  // cadence (3-6 min between pings, sometimes longer). Today's false-
+  // positive at 00:57 EAT fired because ONE gap exceeded 10 min while
+  // the phone was actually fine.
+  //
+  // Two-stage check now:
+  //   recent  = any heartbeat in last HEARTBEAT_STALE_MIN (default 20 min)
+  //   extended = >= 2 heartbeats in last 2 × HEARTBEAT_STALE_MIN (40 min)
+  //
+  // Phone is considered offline ONLY when both checks fail — i.e. no recent
+  // ping AND not enough pings in the extended window to prove cadence is
+  // alive. One slow gap silently passes; real outages still alert.
+  //
+  // Long-term fix is in the brain-ping repo: APK should ping every 60s
+  // (currently 3-6 min variable). When that ships, drop HEARTBEAT_STALE_MIN
+  // to 3 min and this watcher catches a true outage in ~3 min.
+  const recentHb = await pool.query(
     `SELECT battery_pct, received_at
        FROM phone_heartbeats
       WHERE phone = $1
@@ -1406,8 +1422,27 @@ async function phoneHeartbeatWatcher({ pool }) {
       ORDER BY received_at DESC LIMIT 1`,
     [MASTER_ADMIN_PHONE, String(HEARTBEAT_STALE_MIN)],
   );
-  const phoneOnline = hb.rows.length > 0;
-  const batteryPct = hb.rows[0]?.battery_pct ?? null;
+  const hasRecent = recentHb.rows.length > 0;
+  let phoneOnline = hasRecent;
+  let batteryPct = recentHb.rows[0]?.battery_pct ?? null;
+  if (!hasRecent) {
+    // No recent ping — check the extended window. If we have ≥2 pings in
+    // 2×HEARTBEAT_STALE_MIN, the cadence is alive, just slow this cycle.
+    const extended = await pool.query(
+      `SELECT COUNT(*)::int AS n, MAX(battery_pct) AS bat
+         FROM phone_heartbeats
+        WHERE phone = $1
+          AND received_at >= now() - (($2 * 2) || ' minutes')::interval`,
+      [MASTER_ADMIN_PHONE, String(HEARTBEAT_STALE_MIN)],
+    );
+    if (extended.rows[0]?.n >= 2) {
+      phoneOnline = true;
+      batteryPct = extended.rows[0]?.bat ?? null;
+      // Log so we know the suppression kicked in — helps tuning the
+      // threshold without flying blind.
+      console.log(`[m6pm/phone-hb] suppressed false-positive: no ping in ${HEARTBEAT_STALE_MIN}min but ${extended.rows[0].n} pings in last ${HEARTBEAT_STALE_MIN * 2}min`);
+    }
+  }
 
   // 1. Pre-tick offline check: 15 min before each scheduled tick.
   for (const { tick, hour, min } of TICK_SCHEDULE_EAT) {
