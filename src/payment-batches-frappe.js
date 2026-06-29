@@ -690,7 +690,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
        VALUES ($1, now(), $2)
        ON CONFLICT (channel) DO UPDATE
          SET locked_at = now(), holder = EXCLUDED.holder
-         WHERE auto_upload_locks.locked_at < now() - interval '5 minutes'
+         WHERE auto_upload_locks.locked_at < now() - interval '90 seconds'
        RETURNING holder`,
       [channel, lockHolder],
     );
@@ -708,6 +708,18 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         [channel, lockHolder],
       ).catch(() => {});
     };
+
+    // Fix #3 (Frank 2026-06-29): 30-sec heartbeat keeps locked_at fresh
+    // for the duration of the SAV Frappe run (sheet read + resolver +
+    // per-customer Frappe calls + V2 algorithm + ingest_payment loop —
+    // easily 30-90s for typical batches). Paired with the 90-sec
+    // stale-reclaim, a dead bg job frees the lock in 90s.
+    const heartbeat = setInterval(() => {
+      db().query(
+        `UPDATE auto_upload_locks SET locked_at = now() WHERE channel = $1 AND holder = $2`,
+        [channel, lockHolder],
+      ).catch(() => {});
+    }, 30_000);
 
     try {
       // Default window — "from latest consumed ref's sheet-time" — matches
@@ -734,9 +746,11 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         asOf: req.body?.as_of || txnDate,
         txnDate, tickName, dryRun,
       });
+      clearInterval(heartbeat);
       await releaseLock();
       res.json(result);
     } catch (err) {
+      clearInterval(heartbeat);
       await releaseLock();
       console.error('[auto-upload-frappe]', err);
       res.status(500).json({ error: err.message });

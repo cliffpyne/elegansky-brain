@@ -180,7 +180,7 @@ export function mountPaymentBatchesApi(app, deps) {
        VALUES ($1, now(), $2)
        ON CONFLICT (channel) DO UPDATE
          SET locked_at = now(), holder = EXCLUDED.holder
-         WHERE auto_upload_locks.locked_at < now() - interval '5 minutes'
+         WHERE auto_upload_locks.locked_at < now() - interval '90 seconds'
        RETURNING holder`,
       [channel, lockHolder],
     );
@@ -390,7 +390,17 @@ export function mountPaymentBatchesApi(app, deps) {
 
       // Real run: hand off to background. Lock stays held; the background
       // task releases it when QB calls finish.
+      // Fix #3 (Frank 2026-06-29): 30-sec heartbeat keeps locked_at fresh
+      // while the bg job is alive. Paired with the new 90-sec stale-reclaim
+      // threshold, a crashed bg job frees the lock in 90s instead of 5 min
+      // (today's meru0500 zombied for 80 min — that's what this prevents).
       lockHeldForBackground = true;
+      const heartbeat = setInterval(() => {
+        db().query(
+          `UPDATE auto_upload_locks SET locked_at = now() WHERE channel = $1 AND holder = $2`,
+          [channel, lockHolder],
+        ).catch(() => {});
+      }, 30_000);
       setImmediate(() => {
         runAutoUploadBackground({
           batchId: result.batchId,
@@ -404,17 +414,13 @@ export function mountPaymentBatchesApi(app, deps) {
           qbBatchLookupCustomers,
           qbCreateCreditMemo,
           cfg: result.cfg,
-          // tick_name from request body identifies which scheduler tick
-          // (or button-fired manual run = 'heisenberg') triggered this fire.
-          // Used to paint the last processed sheet row purple + write
-          // "end of {tick}" to Column K so the operator can see visually
-          // where each tick stopped.
           tickName: String(req.body?.tick_name || 'heisenberg'),
         })
           .catch((err) => {
             console.error('[auto-upload background]', result.batchId, err);
           })
           .finally(async () => {
+            clearInterval(heartbeat);
             await db().query(
               `DELETE FROM auto_upload_locks WHERE channel=$1 AND holder=$2`,
               [channel, lockHolder],
@@ -496,7 +502,7 @@ export function mountPaymentBatchesApi(app, deps) {
        VALUES ($1, now(), $2)
        ON CONFLICT (channel) DO UPDATE
          SET locked_at = now(), holder = EXCLUDED.holder
-         WHERE auto_upload_locks.locked_at < now() - interval '5 minutes'
+         WHERE auto_upload_locks.locked_at < now() - interval '90 seconds'
        RETURNING holder`,
       [channel, lockHolder],
     );
@@ -545,6 +551,16 @@ export function mountPaymentBatchesApi(app, deps) {
       // dashboard can render progress + poll batch states.
       setImmediate(async () => {
         const batchIds = [];
+        // Fix #3 (Frank 2026-06-29): 30-sec heartbeat keeps locked_at fresh
+        // for the WHOLE catchup orchestration (which can span many windows
+        // and 5-15 minutes). Paired with the 90-sec stale-reclaim, a dead
+        // orchestrator frees the lock in 90s instead of 5+ min.
+        const heartbeat = setInterval(() => {
+          db().query(
+            `UPDATE auto_upload_locks SET locked_at = now() WHERE channel = $1 AND holder = $2`,
+            [channel, lockHolder],
+          ).catch(() => {});
+        }, 30_000);
         try {
           for (let pi = 0; pi < planResult.plan.length; pi++) {
             const entry = planResult.plan[pi];
@@ -653,6 +669,7 @@ export function mountPaymentBatchesApi(app, deps) {
         } catch (err) {
           console.error(`[start-channel ${channel}] background orchestrator threw:`, err);
         } finally {
+          clearInterval(heartbeat);
           await releaseLock();
         }
       });
