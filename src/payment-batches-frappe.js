@@ -134,7 +134,7 @@ function parseTsAny(s) {
  * config + diagnostic counters. Same shape as the QB-path's sheet
  * intake, including the I/J/K Column protections.
  */
-async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow = false }) {
+async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow = false, forceSkipMarkerCheck = false }) {
   const cfg = SAV_CHANNEL_SHEETS[channel];
   if (!cfg) throw new Error(`unknown SAV channel: ${channel}`);
   const winStart = new Date(sinceIso);
@@ -172,14 +172,16 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
     // the "already pushed" check. We ALSO require the marker text to
     // start with the canonical prefix — bare data in the wrong column
     // shouldn't fool the gate.
-    const fetched = String(sheet[i][cfg.fetchedAtCol] || '').trim();
-    const pushed = String(sheet[i][cfg.pushedCol] || '').trim();
-    const fetchedReal = (fetched.startsWith('Fetched at') && !fetched.includes('(DRY_RUN)')) ? fetched : '';
-    const pushedReal  = (
-      (pushed.startsWith('Frappe pushed') || pushed.startsWith('Frappe pending') || pushed.startsWith('QB pushed'))
-      && !pushed.includes('(DRY_RUN)')
-    ) ? pushed : '';
-    if (fetchedReal || pushedReal) { skippedAlreadyPushed++; continue; }
+    if (!forceSkipMarkerCheck) {
+      const fetched = String(sheet[i][cfg.fetchedAtCol] || '').trim();
+      const pushed = String(sheet[i][cfg.pushedCol] || '').trim();
+      const fetchedReal = (fetched.startsWith('Fetched at') && !fetched.includes('(DRY_RUN)')) ? fetched : '';
+      const pushedReal  = (
+        (pushed.startsWith('Frappe pushed') || pushed.startsWith('Frappe pending') || pushed.startsWith('QB pushed'))
+        && !pushed.includes('(DRY_RUN)')
+      ) ? pushed : '';
+      if (fetchedReal || pushedReal) { skippedAlreadyPushed++; continue; }
+    }
 
     const dCell = String(sheet[i][1] || '').trim();
     if (!dCell) { skippedNoDate++; continue; }
@@ -327,7 +329,7 @@ function tickSuffix() {
  */
 export async function runSavFrappeUpload({
   channel, sinceIso, untilIso, asOf, txnDate, tickName, dryRun = false,
-  forceSkipMaxKRow = false,
+  forceSkipMaxKRow = false, forceSkipMarkerCheck = false,
 } = {}) {
   if (!SAV_FRAPPE_CHANNELS.includes(channel)) {
     throw new Error(`channel must be one of: ${SAV_FRAPPE_CHANNELS.join(', ')}`);
@@ -338,7 +340,7 @@ export async function runSavFrappeUpload({
   }
 
   // 1. Sheet intake.
-  const { cfg, txns, diagnostics } = await readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow });
+  const { cfg, txns, diagnostics } = await readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRow, forceSkipMarkerCheck });
   if (txns.length === 0) {
     return {
       skipped: true,
@@ -856,6 +858,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         asOf: req.body?.as_of || txnDate,
         txnDate, tickName, dryRun,
         forceSkipMaxKRow: req.body?.force_skip_max_k_row === true,
+        forceSkipMarkerCheck: req.body?.force_skip_marker_check === true,
       });
       clearInterval(heartbeat);
       await releaseLock();
