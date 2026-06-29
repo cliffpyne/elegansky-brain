@@ -32,6 +32,8 @@ const FRAPPE_BASE = () => (process.env.FRAPPE_BASE_URL || '').replace(/\/$/, '')
 const FRAPPE_TOKEN = () => process.env.FRAPPE_API_TOKEN || '';
 const M6PM_BASE = () => process.env.M6PM_BASE_URL || 'https://elegansky-m6pm.onrender.com';
 const NEXTSMS_API = 'https://messaging-service.co.tz/api/sms/v1/text/single';
+const NEXTSMS_BULK_API = 'https://messaging-service.co.tz/api/sms/v1/text/multi';
+const NEXTSMS_BULK_CHUNK = 100;
 
 // Re-use the same master-admin phone the existing watchers use.
 const MASTER_ADMIN_PHONE = '255752900450';
@@ -162,6 +164,66 @@ async function sendNextSms(phone, text) {
   return { ok: r.ok, status, response: j };
 }
 
+/**
+ * Bulk SMS dispatch via NextSMS /api/sms/v1/text/multi — one HTTP call per
+ * chunk of up to 100 messages. Mirrors m6pm's nextsms_send_bulk pattern.
+ *
+ * Frank 2026-06-29: the single-message endpoint was making the SAVCOM
+ * customer dispatch loop 5+ minutes long (one HTTP roundtrip per customer).
+ * NextSMS's multi endpoint sends 100 messages in one POST in 2-5 sec.
+ *
+ * Args:
+ *   items: [{ to: '255...', text: '...' }, ...]
+ *
+ * Returns:
+ *   { ok: int, error: int, raw_responses: [...] }
+ */
+async function sendNextSmsBulk(items) {
+  const user = process.env.NEXTSMS_USERNAME;
+  const pass = process.env.NEXTSMS_PASSWORD;
+  const sender = process.env.NEXTSMS_SENDER_ID || 'NEXTSMS';
+  if (!user || !pass) return { ok: 0, error: items.length, skipped: true, reason: 'no_credentials' };
+  if (!items.length) return { ok: 0, error: 0 };
+  const auth = Buffer.from(`${user}:${pass}`).toString('base64');
+  let ok = 0, error = 0;
+  const responses = [];
+  for (let i = 0; i < items.length; i += NEXTSMS_BULK_CHUNK) {
+    const chunk = items.slice(i, i + NEXTSMS_BULK_CHUNK);
+    const payload = {
+      messages: chunk.map((m) => ({
+        from: sender, to: String(m.to), text: String(m.text),
+      })),
+    };
+    try {
+      const r = await fetch(NEXTSMS_BULK_API, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const j = await r.json().catch(() => ({}));
+      const msgs = j?.messages || [];
+      for (const msg of msgs) {
+        const gn = msg?.status?.groupName || '';
+        if (gn === 'PENDING' || gn === 'DELIVERED' || gn === 'PENDING_ENROUTE') ok++;
+        else error++;
+      }
+      // If NextSMS returns fewer per-message slots than we sent (rare),
+      // treat the gap as errors so the counters don't lie.
+      if (msgs.length < chunk.length) error += (chunk.length - msgs.length);
+      responses.push(j);
+    } catch (e) {
+      error += chunk.length;
+      responses.push({ error: String(e.message || e).slice(0, 200) });
+    }
+  }
+  return { ok, error, raw_responses: responses };
+}
+
 // ─── customer SMS body ─────────────────────────────────────────────────────
 
 // Canonical Elegansky overdue SMS template, mirrored verbatim from
@@ -244,9 +306,13 @@ export async function runSavcomMorningRitual({
     m6pmReport = { error: e.message };
   }
 
-  // 4. Per-customer phone lookup + SMS dispatch.
-  const sent = [];
+  // 4. Per-customer phone lookup + bulk SMS dispatch.
+  // Frank 2026-06-29: switched the dispatch loop to NextSMS bulk endpoint
+  // (chunked at 100). What used to be 5+ minutes is ~10 sec now. Lookup
+  // pass is still per-customer because the lookup is local (in-memory
+  // cache, no HTTP), so it's already sub-millisecond per call.
   const skipped = [];
+  const planned = [];   // [{ customer, phone, via, body, amount }]
   for (const c of arrears.rows) {
     const lookup = await lookupSavcomPhone({
       plate: c.plate,
@@ -268,29 +334,23 @@ export async function runSavcomMorningRitual({
       name: c.display_name || c.customer,
       total_arrears: c.total_arrears,
     });
-    if (dryRun) {
-      sent.push({
-        customer: c.display_name || c.customer, phone: lookup.phone, via: lookup.via,
-        body, amount: c.total_arrears, dry_run: true,
-      });
-      continue;
-    }
-    try {
-      const r = await sendNextSms(lookup.phone, body);
-      sent.push({
-        customer: c.display_name || c.customer, phone: lookup.phone, via: lookup.via,
-        status: r?.status, ok: r?.ok, amount: c.total_arrears,
-      });
-    } catch (e) {
-      sent.push({
-        customer: c.display_name || c.customer, phone: lookup.phone, via: lookup.via,
-        status: 'error', error: String(e.message || e).slice(0, 200),
-      });
-    }
+    planned.push({
+      customer: c.display_name || c.customer,
+      phone: lookup.phone, via: lookup.via, body, amount: c.total_arrears,
+    });
   }
 
-  const okCount = sent.filter((s) => s.ok || s.dry_run || s.status === 'sent' || s.status === 'Message sent to next instance').length;
-  const errCount = sent.length - okCount;
+  let okCount = 0, errCount = 0;
+  let bulkRaw = null;
+  if (dryRun) {
+    okCount = planned.length;
+  } else if (planned.length > 0) {
+    const bulk = await sendNextSmsBulk(planned.map((p) => ({ to: p.phone, text: p.body })));
+    okCount = bulk.ok;
+    errCount = bulk.error;
+    bulkRaw = { ok: bulk.ok, error: bulk.error };
+  }
+  const sent = planned; // for downstream summary (sample uses .slice)
   const totalArrears = arrears.total_arrears || arrears.rows.reduce((s, r) => s + (Number(r.total_arrears) || 0), 0);
 
   // 5. Admin completion SMS (master admin only — distinguishable from the

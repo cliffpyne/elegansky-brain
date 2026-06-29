@@ -1578,6 +1578,146 @@ async function scraperRetryWatcher({ pool }) {
 }
 
 /**
+ * SAVCOM post-tick watcher (Frank 2026-06-29).
+ *
+ * After every scheduled QB tick (meru/hanang/loolmalas/lengai/mawenzi/kili
+ * /kibo), BRAIN automatically fires the SAV NMB + SAV CRDB auto-upload
+ * channels so the Frappe-bound SAVCOM payments stay in sync with the QB
+ * tick cadence — without the operator having to fire them by hand.
+ *
+ * Behaviour:
+ *   - For each tick in TICK_SCHEDULE_EAT whose hour/min has passed at least
+ *     SAVCOM_POST_TICK_GRACE_MIN minutes ago (default 8 min — give the QB
+ *     upload time to finalize first).
+ *   - Atomic per-tick-per-day claim via
+ *     app_settings.savcom_post_tick:<ymd>:<tick>. First call sets 'firing',
+ *     then flips to 'done' on success. A second call same tick same day
+ *     is a no-op.
+ *   - Fires sav_nmb then sav_crdb via internal HTTP to
+ *     /api/payment-batches/auto-upload-frappe/<channel> with from-last
+ *     window semantics (server defaults to MAX(consumed.sheet_ts) + 1ms).
+ */
+const SAVCOM_POST_TICK_GRACE_MIN = Number(process.env.SAVCOM_POST_TICK_GRACE_MIN || 8);
+
+async function fireSavChannel(channel, tickName, brainSelfBase) {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret) {
+    console.warn(`[savcom/post-tick] STATEMENT_REPORT_SECRET unset — cannot fire ${channel}`);
+    return { skipped: true, reason: 'no_secret' };
+  }
+  const today = todayYmdEat();
+  const body = JSON.stringify({
+    as_of: today,
+    txn_date: today,
+    tick_name: `savcom-auto-${tickName}`,
+  });
+  const r = await fetch(`${brainSelfBase}/api/payment-batches/auto-upload-frappe/${channel}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Report-Secret': secret },
+    body,
+    signal: AbortSignal.timeout(10 * 60_000),
+  });
+  const text = await r.text();
+  let parsed; try { parsed = JSON.parse(text); } catch { parsed = { raw: text.slice(0, 300) }; }
+  if (!r.ok) return { ok: false, status: r.status, error: parsed?.error || text.slice(0, 200) };
+  return parsed;
+}
+
+async function savcomPostTickWatcher({ pool, brainSelfBase }) {
+  const today = todayYmdEat();
+  const eatNow = new Date(Date.now() + 3 * 3600_000);
+  const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();
+  for (const { tick, hour, min } of TICK_SCHEDULE_EAT) {
+    const tickTotalMin = hour * 60 + min;
+    const minutesSinceTick = eatTotalMin - tickTotalMin;
+    if (minutesSinceTick < SAVCOM_POST_TICK_GRACE_MIN) continue;
+    // Don't fire ticks that are more than 4h in the past — protects against
+    // a stuck/zombie row in app_settings holding the gate from an earlier
+    // BRAIN that crashed mid-fire, and also stops a fresh deploy at noon
+    // from retroactively trying to fire morning ticks.
+    if (minutesSinceTick > 4 * 60) continue;
+
+    const key = `savcom_post_tick:${today}:${tick}`;
+    const claim = await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ($1, 'firing')
+         ON CONFLICT (key) DO NOTHING RETURNING value`,
+      [key],
+    );
+    if (!claim.rows.length) continue; // already claimed by this BRAIN or another instance
+
+    console.log(`[savcom/post-tick] firing sav_nmb + sav_crdb for ${tick} (T+${minutesSinceTick}min)`);
+    let summary = { tick, sav_nmb: null, sav_crdb: null };
+    try {
+      summary.sav_nmb = await fireSavChannel('sav_nmb', tick, brainSelfBase);
+    } catch (e) {
+      summary.sav_nmb = { error: e.message.slice(0, 200) };
+    }
+    try {
+      summary.sav_crdb = await fireSavChannel('sav_crdb', tick, brainSelfBase);
+    } catch (e) {
+      summary.sav_crdb = { error: e.message.slice(0, 200) };
+    }
+    try {
+      await pool.query(
+        `UPDATE app_settings SET value=$2, updated_at=now() WHERE key=$1`,
+        [key, JSON.stringify(summary).slice(0, 4000)],
+      );
+    } catch (_) { /* gate write best-effort */ }
+    console.log(`[savcom/post-tick] ${tick} done`);
+  }
+}
+
+/**
+ * SAVCOM morning auto-fire (Frank 2026-06-29).
+ *
+ * Fires the SAVCOM morning ritual (Frappe arrears → m6pm report →
+ * customer overdue SMS → admin completion + broadcast link) once per
+ * day. Mirrors autoFireReportsWatcher but for the Frappe-resident
+ * SAVCOM book. The /api/admin/savcom/morning-ritual endpoint already
+ * has a per-day idempotency gate (savcom_morning_done:<ymd>), so the
+ * watcher just keeps poking at it and the first successful call wins.
+ *
+ * Trigger window: 05:05 EAT onwards (5 min after the QB morning fire to
+ * avoid contending for NextSMS bandwidth) until 06:30 EAT (after that,
+ * something's wrong and the operator should fire manually).
+ */
+async function savcomMorningAutoFireWatcher({ pool, brainSelfBase }) {
+  const today = todayYmdEat();
+  const eatNow = new Date(Date.now() + 3 * 3600_000);
+  const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();
+  if (eatTotalMin < 5 * 60 + 5) return;  // before 05:05 EAT
+  if (eatTotalMin > 6 * 60 + 30) return; // after 06:30 EAT, give up
+
+  // Check the existing idempotency gate the ritual sets itself.
+  const gate = await pool.query(
+    `SELECT value FROM app_settings WHERE key=$1`,
+    [`savcom_morning_done:${today}`],
+  );
+  if (gate.rows[0]?.value === 'done') return;
+
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret) {
+    console.warn('[savcom/morning-autofire] STATEMENT_REPORT_SECRET unset');
+    return;
+  }
+  try {
+    const r = await fetch(`${brainSelfBase}/api/admin/savcom/morning-ritual`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Report-Secret': secret },
+      signal: AbortSignal.timeout(15 * 60_000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j.skipped && j.reason === 'savcom_morning_already_fired_today') {
+      console.log('[savcom/morning-autofire] already fired today — gate held by another instance');
+    } else {
+      console.log(`[savcom/morning-autofire] fired SAVCOM ritual — dispatch ${j?.sms_dispatch?.ok || '?'}/${j?.sms_dispatch?.total || '?'}`);
+    }
+  } catch (e) {
+    console.error('[savcom/morning-autofire]', e.message);
+  }
+}
+
+/**
  * Fix #2 (Frank 2026-06-29): end-to-end "morning link delivered" probe.
  *
  * The morning ritual's `m6pm_morning_done_ymd` only proves BRAIN started
@@ -1652,6 +1792,10 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/morning-probe watcher]', err.message); }
       try { await scraperRetryWatcher({ pool }); }
       catch (err) { console.error('[m6pm/scraper-retry watcher]', err.message); }
+      try { await savcomPostTickWatcher({ pool, brainSelfBase: brainBase }); }
+      catch (err) { console.error('[savcom/post-tick watcher]', err.message); }
+      try { await savcomMorningAutoFireWatcher({ pool, brainSelfBase: brainBase }); }
+      catch (err) { console.error('[savcom/morning-autofire watcher]', err.message); }
     } finally {
       running = false;
     }
@@ -1660,5 +1804,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe + scraper-retry watchers armed (60s, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe + scraper-retry + savcom-post-tick + savcom-morning-autofire watchers armed (60s, no overlap)');
 }
