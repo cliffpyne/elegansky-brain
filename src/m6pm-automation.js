@@ -1599,16 +1599,50 @@ async function scraperRetryWatcher({ pool }) {
  */
 const SAVCOM_POST_TICK_GRACE_MIN = Number(process.env.SAVCOM_POST_TICK_GRACE_MIN || 8);
 
-async function fireSavChannel(channel, tickName, brainSelfBase) {
+/**
+ * Frank's operator convention (verbatim from feedback_asof_for_evening_tail):
+ *   bank txns in [00:00, 16:15:59] EAT on date D → AS_OF=D, TxnDate=D
+ *   bank txns in [16:16, 23:59:59] EAT on date D → AS_OF=D, TxnDate=D+1
+ *
+ * For an auto-fire keyed off a SCHEDULED tick (meru/hanang/loolmalas/lengai
+ * /mawenzi/kili/kibo), we derive both dates from the TICK's wall-clock
+ * hour:min — not from "now" (because the watcher runs T+8min after the
+ * tick, and a 14:08 wall-clock would otherwise mis-classify a 14:00 tick
+ * as pre-cutoff while the tick really covers some post-cutoff window too).
+ *
+ * For ticks at or before 16:15 EAT → both AS_OF and TxnDate = today's EAT date.
+ * For ticks at or after 16:16 EAT → AS_OF = today's EAT date, TxnDate = tomorrow.
+ *
+ * The asOf-only filter on the Frappe path then ensures the V2 algorithm
+ * only walks invoices due by AS_OF (newest-first), with anything later
+ * rolling forward via Phase-2 oldest-first.
+ */
+function asOfAndTxnDateForTick(hour, min) {
+  const ymd = todayYmdEat();
+  const tickMin = hour * 60 + min;
+  const CUTOFF = 16 * 60 + 16; // 16:16 EAT
+  if (tickMin < CUTOFF) return { asOf: ymd, txnDate: ymd };
+  // tomorrow's date in EAT
+  const d = new Date(ymd + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1);
+  const tomorrow = d.toISOString().slice(0, 10);
+  return { asOf: ymd, txnDate: tomorrow };
+}
+
+async function fireSavChannel(channel, tickName, brainSelfBase, dateOverride) {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret) {
     console.warn(`[savcom/post-tick] STATEMENT_REPORT_SECRET unset — cannot fire ${channel}`);
     return { skipped: true, reason: 'no_secret' };
   }
+  // dateOverride = { asOf, txnDate } from the tick hour/min — falls back
+  // to today/today if caller didn't compute (legacy path).
   const today = todayYmdEat();
+  const asOf = dateOverride?.asOf || today;
+  const txnDate = dateOverride?.txnDate || today;
   const body = JSON.stringify({
-    as_of: today,
-    txn_date: today,
+    as_of: asOf,
+    txn_date: txnDate,
     tick_name: `savcom-auto-${tickName}`,
   });
   const r = await fetch(`${brainSelfBase}/api/payment-batches/auto-upload-frappe/${channel}`, {
@@ -1645,15 +1679,16 @@ async function savcomPostTickWatcher({ pool, brainSelfBase }) {
     );
     if (!claim.rows.length) continue; // already claimed by this BRAIN or another instance
 
-    console.log(`[savcom/post-tick] firing sav_nmb + sav_crdb for ${tick} (T+${minutesSinceTick}min)`);
-    let summary = { tick, sav_nmb: null, sav_crdb: null };
+    const dateOverride = asOfAndTxnDateForTick(hour, min);
+    console.log(`[savcom/post-tick] firing sav_nmb + sav_crdb for ${tick} (T+${minutesSinceTick}min) asOf=${dateOverride.asOf} txnDate=${dateOverride.txnDate}`);
+    let summary = { tick, asOf: dateOverride.asOf, txnDate: dateOverride.txnDate, sav_nmb: null, sav_crdb: null };
     try {
-      summary.sav_nmb = await fireSavChannel('sav_nmb', tick, brainSelfBase);
+      summary.sav_nmb = await fireSavChannel('sav_nmb', tick, brainSelfBase, dateOverride);
     } catch (e) {
       summary.sav_nmb = { error: e.message.slice(0, 200) };
     }
     try {
-      summary.sav_crdb = await fireSavChannel('sav_crdb', tick, brainSelfBase);
+      summary.sav_crdb = await fireSavChannel('sav_crdb', tick, brainSelfBase, dateOverride);
     } catch (e) {
       summary.sav_crdb = { error: e.message.slice(0, 200) };
     }

@@ -218,11 +218,21 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso }) {
 
 /**
  * For each unique resolved Frappe customer in the txn list, fetch their
- * open invoices and convert to V2 algorithm shape. Returns invoices[]
- * keyed off the resolved Frappe customer name so V2's customer-grouping
- * lines up with the txn customerName field we'll override.
+ * open invoices and split into TWO buckets that mirror the QB path:
+ *
+ *   pastInvoices:   posting_date <= asOf  (the "arrears" set V2 walks
+ *                                          newest-first to allocate)
+ *   futureInvoices: posting_date >  asOf  (Phase-2 forward-pay pool, FIFO
+ *                                          oldest-first for leftover)
+ *
+ * Frank 2026-06-29: before this filter the Frappe SAV path was feeding
+ * V2 the customer's WHOLE schedule (months of future invoices). V2's
+ * "newest first" walked future invoices first, so today's money was
+ * paying e.g. August-due invoices before clearing February overdue. The
+ * QB side has always pre-filtered arrears via fetchAllArrears({asOf});
+ * this restores the same contract for Frappe.
  */
-async function fetchInvoicesForResolvedCustomers(txnsClean) {
+async function fetchInvoicesForResolvedCustomers(txnsClean, asOf) {
   const byCustomer = new Map();
   for (const t of txnsClean) {
     if (!t._resolved) continue;
@@ -231,7 +241,8 @@ async function fetchInvoicesForResolvedCustomers(txnsClean) {
     byCustomer.get(key).push(t);
   }
 
-  const invoices = [];
+  const invoices = [];          // past + today's, fed to V2 main pass
+  const futureInvoices = [];    // > asOf, fed to Phase-2 forward-pay
   const customerErrors = [];
   for (const [customerKey, txs] of byCustomer.entries()) {
     let r;
@@ -245,22 +256,39 @@ async function fetchInvoicesForResolvedCustomers(txnsClean) {
     for (const inv of list) {
       const out = Number(inv.outstanding_amount) || 0;
       if (out <= 0) continue;
-      if (!inv.posting_date && !inv.due_date) continue;
-      invoices.push({
-        // V2 keys customers by customerPhone || customerName.toLowerCase().
-        // We force-use customerKey so resolved txns and invoices share a
-        // grouping key regardless of upstream display-name drift.
-        customerName: customerKey,
-        customerPhone: null,
-        customerId: customerKey,
-        qbId: inv.name,              // Frappe Sales Invoice id (used in allocations)
-        invoiceNumber: inv.name,
-        invoiceDate: inv.posting_date || inv.due_date,
-        amount: out,
-      });
+      const date = inv.posting_date || inv.due_date;
+      if (!date) continue;
+      // asOf is "YYYY-MM-DD". Frappe posting_date is also "YYYY-MM-DD".
+      // Lexicographic compare works for ISO dates.
+      const isFuture = asOf && date > asOf;
+      if (isFuture) {
+        // Phase-2 shape: matches the `forwardPayLeftover` expectation
+        // (id, txnDate, docNumber, totalAmt, remainingBalance).
+        futureInvoices.push({
+          customerKey,
+          id: inv.name,
+          txnDate: date,
+          docNumber: inv.name,
+          totalAmt: out,
+          remainingBalance: out,
+        });
+      } else {
+        invoices.push({
+          // V2 keys customers by customerPhone || customerName.toLowerCase().
+          // We force-use customerKey so resolved txns and invoices share a
+          // grouping key regardless of upstream display-name drift.
+          customerName: customerKey,
+          customerPhone: null,
+          customerId: customerKey,
+          qbId: inv.name,              // Frappe Sales Invoice id (used in allocations)
+          invoiceNumber: inv.name,
+          invoiceDate: date,
+          amount: out,
+        });
+      }
     }
   }
-  return { invoices, customerErrors };
+  return { invoices, futureInvoices, customerErrors };
 }
 
 function tickSuffix() {
@@ -350,8 +378,10 @@ export async function runSavFrappeUpload({
   // The V2 algorithm only processes txns that have invoices, so anything
   // without _resolved will naturally fall to the unused bucket.
 
-  // 4. Fetch Frappe invoices for resolved customers.
-  const { invoices, customerErrors } = await fetchInvoicesForResolvedCustomers(txnsClean);
+  // 4. Fetch Frappe invoices for resolved customers, split by asOf into
+  //    past (V2 main pass) and future (Phase-2 forward-pay).
+  const { invoices, futureInvoices, customerErrors } =
+    await fetchInvoicesForResolvedCustomers(txnsClean, asOf);
 
   // 5. Adapt txns to V2 shape — override customerName with the resolved
   //    Frappe customer key so V2's grouping lines up with the invoices.
@@ -368,16 +398,68 @@ export async function runSavFrappeUpload({
     _ref_suffixed: appendSavSuffix(t.transactionId, channel),
   }));
 
-  // 6. Sacred V2 algorithm (cap-no-overflow). No forward-pay phase 2
-  //    here — Frappe doesn't expose a forward-invoice query yet, so
-  //    leftover becomes a hanging advance per the agreed contract.
+  // 6. Sacred V2 algorithm — cap-no-overflow over past+today's invoices
+  //    only (newest-first). Frank 2026-06-29: without the asOf filter,
+  //    V2 was walking future invoices first and paying e.g. August due
+  //    instead of February overdue. Same contract as the QB side now.
   const { payments, leftoverPerTx } = processInvoicePaymentsV2(invoices, v2Txns);
   const paid = payments.filter((p) => !p.isUnused && p.amount > 0);
   const unused = payments.filter((p) => p.isUnused);
 
-  // Phase-1 leftover (overpaid-past-balance) lands as credit too —
-  // emit a synthetic "unused" entry per leftover tx so it persists.
+  // 6b. Phase-2 forward-pay (Frappe-native, in-memory — no extra Frappe
+  //     query because we already split `futureInvoices` from the same
+  //     get_open_invoices call). Walk leftover tx oldest-first (so the
+  //     earliest payment consumes forward invoices first) and apply FIFO
+  //     onto future invoices grouped by customer, oldest-future first.
+  const forwardPaid = [];
+  if (leftoverPerTx.length > 0 && futureInvoices.length > 0) {
+    const futureByCust = new Map();
+    for (const fi of futureInvoices) {
+      if (!futureByCust.has(fi.customerKey)) futureByCust.set(fi.customerKey, []);
+      futureByCust.get(fi.customerKey).push(fi);
+    }
+    // FIFO oldest-first per customer.
+    for (const list of futureByCust.values()) {
+      list.sort((a, b) => (a.txnDate || '').localeCompare(b.txnDate || ''));
+    }
+    // Leftovers oldest-tx-first.
+    leftoverPerTx.sort((a, b) => (a.txDate || '').localeCompare(b.txDate || ''));
+    for (const lo of leftoverPerTx) {
+      const custKey = lo.customerKey || lo.customerName;
+      const list = futureByCust.get(custKey);
+      if (!list || !list.length) continue;
+      let amt = lo.leftover;
+      let invIdx = 0;
+      while (amt > 0 && invIdx < list.length) {
+        const inv = list[invIdx];
+        if (inv.remainingBalance <= 0) { invIdx++; continue; }
+        const pay = Math.min(amt, inv.remainingBalance);
+        forwardPaid.push({
+          customerName: lo.customerName,
+          invoiceNo: inv.docNumber,
+          amount: pay,
+          memo: lo.transactionId,
+          memoWithSuffix: lo.memoWithSuffix || appendSavSuffix(lo.transactionId, channel),
+          channel,
+          customerId: custKey,
+          qbId: inv.id,                // Frappe Sales Invoice name
+          sheet_row_number: lo.sheet_row_number,
+          forwardPaid: true,
+        });
+        inv.remainingBalance -= pay;
+        amt -= pay;
+        if (inv.remainingBalance <= 1) { inv.remainingBalance = 0; invIdx++; }
+      }
+      lo.leftover = amt;             // residual after phase-2
+    }
+  }
+  // Merge forward-paid into the paid set so allocations include them.
+  paid.push(...forwardPaid);
+
+  // Phase-1 leftover that didn't get absorbed by Phase-2 lands as
+  // hanging credit (synthetic "unused" row per residual leftover tx).
   for (const lo of leftoverPerTx) {
+    if (lo.leftover <= 0) continue;
     unused.push({
       customerName: lo.customerName,
       invoiceNo: 'UNUSED',
