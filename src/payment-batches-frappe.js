@@ -26,11 +26,19 @@
 
 import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
-import { getOpenInvoices, ingestPayment } from './frappe-client.js';
+import { getOpenInvoices, ingestPayment, reversePayment } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
 import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
+
+// Visible marker appended to every txn_id sent to Frappe so analysts can
+// distinguish BRAIN-pushed entries from manual uploads / pre-switch Wakandi
+// migration imports just by scanning the reference in the Frappe ledger.
+// Format: bank_ref "101AGD126175F3GI" → txn_id "101AGD126175F3GIV".
+// Internal BRAIN tables (consumed_transactions, payment_uploads.bank_ref)
+// keep the un-suffixed ref — the V suffix is purely a Frappe-side marker.
+const FRAPPE_TXN_MARKER = 'V';
 
 // SAV sheets have a NINTH data column at index 8 (column I) holding the
 // wakandi_member_id — direct Frappe lookup key. So the marker columns are
@@ -655,7 +663,7 @@ export async function runSavFrappeUpload({
         customer: g.customer,
         amount: g.amount,
         date: txnDate,
-        txn_id: g.txn_id,
+        txn_id: g.txn_id + FRAPPE_TXN_MARKER,
         mode_of_payment: MODE_OF_PAYMENT,
         allocations: g.allocations,
       });
@@ -698,7 +706,7 @@ export async function runSavFrappeUpload({
         customer: u.customerName,
         amount: Number(u.transactionAmount || u.amount),
         date: txnDate,
-        txn_id: u.memoWithSuffix,
+        txn_id: u.memoWithSuffix + FRAPPE_TXN_MARKER,
         mode_of_payment: MODE_OF_PAYMENT,
         allocations: [],
       });
@@ -804,6 +812,19 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     }, 30_000);
 
     try {
+      // CRITICAL: prevent any SAV fire from claiming bank_refs that are
+      // currently being recalled. The recall endpoint sets this gate while
+      // it works; we fail fast if it's set rather than racing the recall.
+      const gate = await db().query(
+        `SELECT value FROM app_settings WHERE key='savcom_recall_in_progress'`);
+      if (gate.rows[0]?.value === '1') {
+        clearInterval(heartbeat);
+        await releaseLock();
+        return res.status(503).json({
+          error: 'SAVCOM recall is currently in progress — retry once it lifts the gate',
+        });
+      }
+
       // Default window — "from latest consumed ref's sheet-time" — matches
       // the QB path's fallback so heisenberg + tick fires behave identically.
       let sinceIso = req.body?.since_iso;
@@ -835,6 +856,198 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       clearInterval(heartbeat);
       await releaseLock();
       console.error('[auto-upload-frappe]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // POST /api/payment-batches/savcom-recall
+  //
+  // One-shot destructive operation. Recalls every SAV-channel Payment
+  // Entry BRAIN created from the 24-29.06 catchup + heisenberg + today's
+  // fires, in preparation for a clean re-fire with the new AS_OF + Phase-2
+  // + V-suffix code. Steps (in order):
+  //   1. Gate other SAV fires via app_settings savcom_recall_in_progress=1
+  //   2. Pull live snapshot — every finalized SAV batch with any
+  //      pushed_to_frappe + status=posted upload row. NO hard-coded
+  //      batch list; the live query is the source of truth.
+  //   3. Reverse each unique posted-status bank_ref via Frappe
+  //      reverse_payment. Duplicate-status rows (Wakandi migration import)
+  //      are LEFT ALONE.
+  //   4. Clear J/K/L sheet markers on every row whose column-H bank_ref
+  //      matches one of the recalled refs (both PASSED_SAV_NMB and
+  //      PASSED_SAV tabs).
+  //   5. UPDATE batches to status='rolled_back', mark uploads voided.
+  //   6. DELETE consumed_transactions for ALL refs touched (so re-fire
+  //      replays them cleanly).
+  //   7. Lift the savcom_recall_in_progress gate.
+  // Body: { confirm: 'YES-RECALL-535', dry_run?: bool }
+  // ───────────────────────────────────────────────────────────────────────
+  app.post('/api/payment-batches/savcom-recall', requireSecretOrJwt, async (req, res) => {
+    const dryRun = req.body?.dry_run === true;
+    const confirm = String(req.body?.confirm || '');
+    if (!dryRun && confirm !== 'YES-RECALL-535') {
+      return res.status(400).json({
+        error: 'destructive op — pass { confirm: "YES-RECALL-535" } or { dry_run: true }',
+      });
+    }
+
+    // 1. Set gate (blocks parallel SAV fires for the duration).
+    if (!dryRun) {
+      await db().query(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES ('savcom_recall_in_progress', '1', now())
+         ON CONFLICT (key) DO UPDATE SET value='1', updated_at=now()`);
+    }
+
+    const lift = async () => {
+      if (dryRun) return;
+      await db().query(
+        `UPDATE app_settings SET value='0', updated_at=now()
+          WHERE key='savcom_recall_in_progress'`).catch(() => {});
+    };
+
+    try {
+      // 2. Live scope query — 22 batches, 535 posted refs, 656 total refs.
+      const scope = await db().query(`
+        SELECT pb.id AS batch_id, pb.channel, pb.created_by,
+               COUNT(DISTINCT pu.bank_ref) FILTER (WHERE pu.qb_response->>'status'='posted') AS posted,
+               COUNT(DISTINCT pu.bank_ref) FILTER (WHERE pu.qb_response->>'status'='duplicate') AS dup,
+               COUNT(DISTINCT pu.bank_ref) AS total
+          FROM payment_batches pb
+          LEFT JOIN payment_uploads pu ON pu.batch_id = pb.id AND pu.status='pushed_to_frappe'
+         WHERE pb.channel IN ('sav_nmb','sav_crdb')
+           AND pb.status = 'finalized'
+         GROUP BY pb.id
+         HAVING COUNT(pu.id) > 0
+         ORDER BY pb.created_at`);
+      const batchIds = scope.rows.map((r) => r.batch_id);
+
+      // Posted refs to reverse (BRAIN-created ACC-PAY-2026-XXXXX).
+      const postedRefs = await db().query(`
+        SELECT DISTINCT pu.bank_ref,
+               (pu.qb_response->>'payment') AS payment_name,
+               pu.customer_name
+          FROM payment_uploads pu
+          JOIN payment_batches pb ON pb.id = pu.batch_id
+         WHERE pb.channel IN ('sav_nmb','sav_crdb')
+           AND pb.status = 'finalized'
+           AND pu.status = 'pushed_to_frappe'
+           AND pu.qb_response->>'status' = 'posted'
+         ORDER BY pu.bank_ref`);
+
+      // All refs (posted + duplicate) — used to clear consumed_transactions
+      // and sheet markers (the duplicate refs ALSO had markers written and
+      // ALSO got logged in consumed_transactions).
+      const allRefs = await db().query(`
+        SELECT DISTINCT bank_ref FROM payment_uploads
+         WHERE batch_id = ANY($1::uuid[])`, [batchIds]);
+
+      const summary = {
+        scope: {
+          batches: scope.rows.length,
+          posted_refs: postedRefs.rows.length,
+          duplicate_refs_skipped: scope.rows.reduce((s, r) => s + Number(r.dup), 0),
+          all_refs: allRefs.rows.length,
+        },
+        per_batch: scope.rows,
+      };
+
+      if (dryRun) {
+        await lift();
+        return res.json({ dry_run: true, ...summary });
+      }
+
+      // 3. Reverse each posted ref. The PEs were pushed BEFORE the V suffix
+      //    code shipped — Frappe stored txn_id WITHOUT V — so reverse by
+      //    the raw bank_ref (no suffix added here).
+      const reverseResults = [];
+      let reversedOK = 0, reversedAlready = 0, reversedErr = 0;
+      for (const row of postedRefs.rows) {
+        try {
+          const r = await reversePayment(row.bank_ref);
+          if (r?.status === 'already_cancelled' || r?.status === 'not_found') reversedAlready++;
+          else reversedOK++;
+          reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: true, r });
+        } catch (err) {
+          reversedErr++;
+          reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: false, error: err.message });
+        }
+      }
+      summary.reverse = { ok: reversedOK, already: reversedAlready, error: reversedErr };
+      summary.reverse_errors = reverseResults.filter((r) => !r.ok).slice(0, 20);
+
+      // 4. Sheet J/K/L cleanup. For each SAV channel, read its sheet,
+      //    match column H (raw transactionId) against the suffix-stripped
+      //    bank_refs from THIS channel's batches, clear J/K/L on matches.
+      const sheetSummary = {};
+      const allRefsSet = new Set(allRefs.rows.map((r) => r.bank_ref));
+      for (const channel of SAV_FRAPPE_CHANNELS) {
+        const cfg = SAV_CHANNEL_SHEETS[channel];
+        const suffix = { sav_nmb: 'NS', sav_crdb: 'CS' }[channel];
+        // Strip channel suffix to get raw transactionIds we care about.
+        const rawRefs = new Set();
+        for (const r of allRefs.rows) {
+          if (r.bank_ref?.endsWith(suffix)) rawRefs.add(r.bank_ref.slice(0, -suffix.length));
+        }
+        if (rawRefs.size === 0) { sheetSummary[channel] = { rows_cleared: 0, raw_refs: 0 }; continue; }
+        // Read sheet, find rows where col H (index 7) matches any raw ref.
+        const sd = await readSheet(cfg.sheetId, `${cfg.tab}!A1:M200000`);
+        const sheet = sd.values || sd.data || [];
+        const matchedRows = [];
+        for (let i = 0; i < sheet.length; i++) {
+          const txnId = String(sheet[i][7] || '').trim();
+          if (txnId && rawRefs.has(txnId)) matchedRows.push(i + 1);
+        }
+        // Clear J/K/L on matched rows. writeSheetCells expects per-cell
+        // updates; emit empty-string for each (clear semantics — Sheets
+        // values.clear() works on ranges but writeSheetCells is per-cell).
+        const updates = [];
+        for (const row of matchedRows) {
+          updates.push({ range: `${cfg.tab}!${cfg.fetchedAtLetter}${row}`, value: '' });
+          updates.push({ range: `${cfg.tab}!${cfg.pushedLetter}${row}`, value: '' });
+          updates.push({ range: `${cfg.tab}!${cfg.endTickLetter}${row}`, value: '' });
+        }
+        if (updates.length > 0) {
+          try {
+            const r = await writeSheetCells(cfg.sheetId, updates);
+            sheetSummary[channel] = { rows_cleared: matchedRows.length, cells: r.updatedCells, raw_refs: rawRefs.size };
+          } catch (e) {
+            sheetSummary[channel] = { rows_cleared: 0, error: e.message, raw_refs: rawRefs.size };
+          }
+        } else {
+          sheetSummary[channel] = { rows_cleared: 0, raw_refs: rawRefs.size };
+        }
+      }
+      summary.sheets = sheetSummary;
+
+      // 5+6. Mark batches rolled_back, mark uploads voided, clear consumed.
+      await db().query(`
+        UPDATE payment_uploads
+           SET status = 'voided',
+               failure_reason = 'savcom-recall — Frappe reverse_payment applied'
+         WHERE batch_id = ANY($1::uuid[])
+           AND status = 'pushed_to_frappe'`, [batchIds]);
+      await db().query(`
+        UPDATE payment_batches
+           SET status = 'rolled_back',
+               failure_reason = COALESCE(failure_reason || ' | ', '') || 'savcom-recall ' || now()::text
+         WHERE id = ANY($1::uuid[])`, [batchIds]);
+      const del = await db().query(`
+        DELETE FROM consumed_transactions
+         WHERE batch_id = ANY($1::uuid[])`, [batchIds]);
+      summary.db = {
+        uploads_voided: postedRefs.rows.length,
+        batches_rolled_back: batchIds.length,
+        consumed_deleted: del.rowCount,
+      };
+
+      // 7. Lift gate.
+      await lift();
+      res.json(summary);
+    } catch (err) {
+      await lift();
+      console.error('[savcom-recall]', err);
       res.status(500).json({ error: err.message });
     }
   });
