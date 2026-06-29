@@ -164,14 +164,39 @@ async function sendNextSms(phone, text) {
 
 // ─── customer SMS body ─────────────────────────────────────────────────────
 
-function buildCustomerSmsBody({ name, total_arrears, overdue_invoices, oldest_due_date }) {
-  // Frank's rule: "SAVCOM" word in the message so customers know what
-  // loan it refers to. Kiswahili wording mirrors the existing m6pm
-  // overdue SMS style.
-  const amt = Number(total_arrears) || 0;
-  const amtStr = amt.toLocaleString('en-US');
-  const firstName = String(name || '').trim().split(/\s+/)[0] || 'Mteja';
-  return `SAVCOM: Habari ${firstName}, una deni la TZS ${amtStr} (${overdue_invoices || 0} invoice). Tafadhali lipa haraka. Asante.`;
+// Canonical Elegansky overdue SMS template, mirrored verbatim from
+// elegansky-m6pm/app.py DEFAULT_SMS_TEMPLATE (Frank 2026-06-29: SAVCOM
+// fire must use the standard wording — no "SAVCOM" prefix, no
+// reformatting). 1 SMS segment when name + amount fit, ~TZS 20 per send.
+const ELEGANSKY_OVERDUE_TEMPLATE =
+  'Habari {name}, hatujaona rejesho lako la TZS {amount} la jana tarehe {day}. ' +
+  'Tafadhali wasiliana nasi kwa namba 0626490490.';
+
+function formatAmountWithCommas(n) {
+  const a = Math.round(Number(n) || 0);
+  return a.toLocaleString('en-US');
+}
+
+function titleCase(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\b([a-z])/g, (m) => m.toUpperCase());
+}
+
+function buildCustomerSmsBody({ name, total_arrears }) {
+  // Match m6pm's _render_sms exactly:
+  //   {name}   → customer name, Title Case
+  //   {amount} → unpaid amount with thousands separators
+  //   {day}    → yesterday in EAT, dd/mm/yyyy
+  const yesterdayEat = new Date(Date.now() + 3 * 3600_000 - 24 * 3600_000);
+  const dd = String(yesterdayEat.getUTCDate()).padStart(2, '0');
+  const mm = String(yesterdayEat.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = yesterdayEat.getUTCFullYear();
+  return ELEGANSKY_OVERDUE_TEMPLATE
+    .replace('{name}', titleCase(name) || 'Mteja')
+    .replace('{amount}', formatAmountWithCommas(total_arrears))
+    .replace('{day}', `${dd}/${mm}/${yyyy}`);
 }
 
 // ─── full ritual ───────────────────────────────────────────────────────────
@@ -242,8 +267,6 @@ export async function runSavcomMorningRitual({
     const body = buildCustomerSmsBody({
       name: c.display_name || c.customer,
       total_arrears: c.total_arrears,
-      overdue_invoices: c.overdue_invoices,
-      oldest_due_date: c.oldest_due_date,
     });
     if (dryRun) {
       sent.push({
