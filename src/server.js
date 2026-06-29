@@ -1618,17 +1618,17 @@ app.post('/api/nmb-pull/request', async (req, res) => {
     const now = new Date().toISOString();
     await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_requested_at', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
       [now],
     );
     // Clear completed flag so polling sees the new request as pending.
     await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_completed_at', '')
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
     );
     await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_result_json', '')
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
     );
     res.json({ ok: true, requested_at: now });
   } catch (err) {
@@ -1676,22 +1676,24 @@ app.post('/api/nmb-pull/complete', async (req, res) => {
     const result = req.body || {};
     await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_completed_at', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
       [now],
     );
     await pool.query(
       `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_result_json', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
       [JSON.stringify(result)],
     );
-    // Track the most recent SUCCESSFUL POC cycle separately so the
-    // statement-pull worker can tell "sheet has fresh rows from a recent
-    // good cycle" from "POC is wedged with stale data". On-demand failures
-    // overwrite completed_at + result, but last_ok_completed_at survives.
+    // Fix #6 (Frank 2026-06-29): also update updated_at so monitoring
+    // queries against app_settings.updated_at reflect the actual last-write
+    // time. Without this clause, app_settings rows kept their original
+    // INSERT time forever even though VALUE updated every cycle — making
+    // last_ok_completed_at LOOK frozen at June 26 when it was actually
+    // current (today's value was correct, only the column timestamp lied).
     if (result && result.ok === true) {
       await pool.query(
         `INSERT INTO app_settings (key, value) VALUES ('nmb_pull_last_ok_completed_at', $1)
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
         [now],
       );
     }
