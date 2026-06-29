@@ -751,29 +751,63 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     const armingTick = (recent.rows[0].created_by || '').match(/auto-upload:([^:]+)/)?.[1] || '?';
     console.log(`[m6pm/autofire] mode=${mode} armed by ${armingTick} — starting report fire (eatHour=${eatHour})`);
     try {
-      // excludeToday: officers' reports should match QB's "Overdue" status
-      // filter (today's daily invoices not yet overdue). Payment app keeps
-      // <= so today's invoices still get applied — that path doesn't go
-      // through fetchAllArrears.
-      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
-      const buf = buildArrearsXls(arrears, null);
-      await postArrearsToM6pm(buf, mode);
-      // Persist morning arrears JSON so the kili1615 evening comparison can
-      // diff against the actual start-of-day baseline. Only saved on the
-      // morning fire path. Stored as app_settings value (Postgres TEXT can
-      // hold the ~3-5 MB JSON without trouble). Never miss a catchup brother.
-      if (mode === 'morning') {
+      // Fix #1 (Frank 2026-06-29): cache fallback as default. /arrears is a
+      // single-point-of-failure for the whole morning chain — if it 500s,
+      // the autofire used to fail and officers got no link. Now we try live
+      // first, fall back to the most recent morning_arrears cache on any
+      // failure (timeout, 500, parse error). Admin SMS notes the fallback.
+      let arrears = null;
+      let arrearsSource = 'live';
+      let arrearsAsOf = today;
+      try {
+        arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      } catch (liveErr) {
+        console.warn(`[m6pm/autofire] /arrears live failed (${liveErr.message}) — falling back to cache`);
+        try {
+          const cache = await pool.query(
+            `SELECT key, value, updated_at FROM app_settings
+              WHERE key LIKE 'morning_arrears:%'
+              ORDER BY updated_at DESC LIMIT 1`,
+          );
+          if (!cache.rows.length) {
+            throw new Error(`/arrears down AND no morning_arrears cache exists — cannot continue`);
+          }
+          arrears = JSON.parse(cache.rows[0].value);
+          arrearsSource = `cache(${cache.rows[0].key})`;
+          arrearsAsOf = String(cache.rows[0].key).split(':')[1] || today;
+          console.warn(`[m6pm/autofire] fell back to ${arrearsSource} (${arrears.length} rows, as_of=${arrearsAsOf})`);
+          // Single admin SMS so master sees we degraded BEFORE the link goes out
+          try {
+            await sendNextSms(
+              MASTER_ADMIN_PHONE,
+              `BRAIN ${mode} ${today}: /arrears down, fell back to cache ${arrearsAsOf} (${arrears.length} rows). Link still firing.`,
+            );
+          } catch (_) { /* ignore SMS hiccup */ }
+        } catch (cacheErr) {
+          console.error(`[m6pm/autofire] cache fallback failed: ${cacheErr.message}`);
+          throw cacheErr; // re-throw original failure semantics so outer catch rolls the gate
+        }
+      }
+
+      // Freebie fix: save morning_arrears BEFORE any m6pm calls so even if
+      // postArrearsToM6pm later fails, today's snapshot exists for manual
+      // rescue (?source=cache on /trigger). Previously saved AFTER post — a
+      // postArrearsToM6pm failure left us with no fallback for the day.
+      if (mode === 'morning' && arrearsSource === 'live') {
         try {
           await pool.query(
             `INSERT INTO app_settings (key, value) VALUES ($1, $2)
                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
             [`morning_arrears:${today}`, JSON.stringify(arrears)],
           );
-          console.log(`[m6pm/autofire] morning arrears JSON saved (${arrears.length} rows) for evening comparison`);
+          console.log(`[m6pm/autofire] morning arrears JSON saved EARLY (${arrears.length} rows) — survives downstream failures`);
         } catch (e) {
           console.error('[m6pm/autofire] failed to save morning_arrears:', e.message);
         }
       }
+
+      const buf = buildArrearsXls(arrears, null);
+      await postArrearsToM6pm(buf, mode);
       let syncResult = null;
       let overdueSmsResult = null;
       if (mode === 'morning') {
