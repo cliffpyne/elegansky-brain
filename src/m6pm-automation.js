@@ -539,6 +539,66 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     }
   });
 
+  /**
+   * POST /api/admin/m6pm/resend-tick-result
+   * Body: { tick: 'kili1615', ymd?: 'YYYY-MM-DD' }
+   * Computes today's per-channel paid totals for the named tick and
+   * broadcasts the success SMS to the full admin list, BYPASSING the
+   * watcher's already-notified gate. Use when a false "no outcome"
+   * alarm fired earlier and the real success SMS never went out.
+   */
+  app.post('/api/admin/m6pm/resend-tick-result', requireSecretOrJwt, async (req, res) => {
+    try {
+      const tick = String(req.body?.tick || '').trim();
+      if (!tick) return res.status(400).json({ error: 'tick required' });
+      const ymd = String(req.body?.ymd || todayYmdEat());
+      const stats = await pool.query(
+        `SELECT channel,
+                COALESCE(SUM(paid_count), 0)::int   AS paid_count,
+                COALESCE(SUM(paid_total), 0)::numeric AS paid_total,
+                COALESCE(SUM(unused_count), 0)::int AS unused_count
+           FROM payment_batches
+          WHERE created_by LIKE $1
+            AND status = 'finalized'
+            AND (created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $2::date
+          GROUP BY channel
+          ORDER BY channel`,
+        [`auto-upload:${tick}%`, ymd],
+      );
+      if (stats.rows.length === 0) {
+        return res.status(404).json({ error: `no finalized batches for ${tick} on ${ymd}` });
+      }
+      const parts = stats.rows.map((r) => {
+        const ch = r.channel === 'nmbnew' ? 'NMB'
+                 : r.channel === 'bank' ? 'Bnk'
+                 : r.channel === 'iphone_bank' ? 'Iph'
+                 : r.channel;
+        const tzs = Number(r.paid_total) || 0;
+        const tzsStr = tzs >= 1_000_000 ? `${(tzs / 1_000_000).toFixed(2)}M`
+                     : tzs >= 1_000 ? `${(tzs / 1_000).toFixed(0)}k`
+                     : String(tzs);
+        return `${ch} ${r.paid_count}p/${tzsStr}`;
+      });
+      const text = `BRAIN ${tick} ✓ ${parts.join(' ')} (resent)`;
+      const sent = [];
+      for (const phone of broadcastPhones()) {
+        const r = await sendNextSms(phone, text);
+        sent.push({ phone, ok: r.ok !== false });
+      }
+      // Also update notifKey so future watcher iterations don't re-fire.
+      const notifKey = `m6pm_tick_notif:${ymd}:${tick}`;
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, 'ok_resend')
+           ON CONFLICT (key) DO UPDATE SET value='ok_resend', updated_at=now()`,
+        [notifKey],
+      );
+      res.json({ tick, ymd, text, sent, stats: stats.rows });
+    } catch (err) {
+      console.error('[m6pm/resend-tick-result]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/admin/m6pm/morning-gate-reset', requireSecretOrJwt, async (_req, res) => {
     await pool.query(
       `DELETE FROM app_settings WHERE key = 'm6pm_morning_done_ymd'`,
@@ -637,7 +697,12 @@ function broadcastPhones() {
   if (!raw) return DEFAULT_BROADCAST_PHONES;
   return raw.split(',').map((p) => p.trim()).filter(Boolean);
 }
-const FAILURE_GRACE_MIN = 20; // wait 20 min after scheduled tick before declaring failure
+// Wait at least this long after scheduled tick before declaring "no worker
+// outcome". Bumped 20→35 on 2026-06-30 because kili1615 takes ~27 min
+// end-to-end (NMB scrape + CRDB scrape + Frappe per-customer calls + CDC
+// poller catch-up) and was false-alarming + suppressing the real success
+// SMS that should have followed at +27min. 35 gives 8 min headroom.
+const FAILURE_GRACE_MIN = 35;
 const HEARTBEAT_PRE_TICK_MIN = 15; // pre-tick phone-online check
 // Heartbeat staleness threshold. Default 10 min — brain-ping APK reports at
 // ~3-6 min cadence (battery-friendly), so 5 min generated false-positive
@@ -1226,6 +1291,29 @@ async function detectStaleSubsystems(pool) {
  * Legacy worker (pre-2026-06-28) doesn't POST outcomes — watcher then
  * falls back to the row-based behavior (compatible mode).
  */
+/**
+ * Real "is an upload actively running RIGHT NOW?" probe. Returns true if
+ * auto_upload_locks has any row whose locked_at heartbeat is fresh
+ * (within the last 2 min — heartbeat cadence is 30s, 90s is the stale
+ * reclaim threshold for the upload lock itself).
+ *
+ * Watcher uses this BEFORE firing "no worker outcome" past +grace, so
+ * a still-running upload doesn't get a false-alarm SMS — we'd rather
+ * wait an extra few minutes than tell admins a working upload failed.
+ */
+async function isUploadInFlight(pool) {
+  try {
+    const r = await pool.query(
+      `SELECT channel, locked_at FROM auto_upload_locks
+        WHERE locked_at > now() - interval '2 minutes'
+        ORDER BY locked_at DESC LIMIT 1`,
+    );
+    return r.rows[0] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function readWorkerOutcome(pool, today, tick) {
   try {
     const r = await pool.query(
@@ -1316,9 +1404,18 @@ async function tickResultNotifierWatcher({ pool }) {
         resultLabel = 'err';
       } else {
         // No worker outcome reported. Within grace → wait for next 60s
-        // tick (worker may still be running). Past grace → "no outcome"
-        // SMS — the only truly silent failure the watcher can detect.
+        // tick (worker may still be running). Past grace → check if an
+        // upload is ACTIVELY in flight (fresh auto_upload_locks heartbeat).
+        // If yes, KEEP WAITING — false alarms from a slow tick used to
+        // suppress the real success SMS that followed at +27min. Only
+        // fire "no outcome" if past grace AND nothing actively running.
         if (minutesPastTick < FAILURE_GRACE_MIN) {
+          await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
+          continue;
+        }
+        const inFlight = await isUploadInFlight(pool);
+        if (inFlight) {
+          console.log(`[m6pm/tick-notif] ${tick} past +${FAILURE_GRACE_MIN}min but ${inFlight.channel} still actively running (locked_at=${inFlight.locked_at}) — extending wait`);
           await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
           continue;
         }
