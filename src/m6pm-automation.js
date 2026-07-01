@@ -599,6 +599,35 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     }
   });
 
+  /**
+   * POST /api/admin/app-settings/set
+   * Body: { key, value, confirm: 'YES-OVERRIDE' }
+   * One-off setter for operational overrides (block a ritual, pre-claim a
+   * gate, mark a tick, etc). Requires confirm token to prevent accidental
+   * gate flips. Returns previous value for audit.
+   */
+  app.post('/api/admin/app-settings/set', requireSecretOrJwt, async (req, res) => {
+    try {
+      const key = String(req.body?.key || '').trim();
+      const value = String(req.body?.value || '').trim();
+      const confirm = String(req.body?.confirm || '');
+      if (!key) return res.status(400).json({ error: 'key required' });
+      if (confirm !== 'YES-OVERRIDE') {
+        return res.status(400).json({ error: 'confirm must be "YES-OVERRIDE"' });
+      }
+      const prev = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [key]);
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`,
+        [key, value],
+      );
+      res.json({ key, new_value: value, previous_value: prev.rows[0]?.value ?? null });
+    } catch (err) {
+      console.error('[app-settings/set]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/admin/m6pm/morning-gate-reset', requireSecretOrJwt, async (_req, res) => {
     await pool.query(
       `DELETE FROM app_settings WHERE key = 'm6pm_morning_done_ymd'`,
