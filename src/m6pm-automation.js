@@ -413,16 +413,21 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       // Chain sync-mobile + send-overdue-sms when fire_all=1 (operator
       // override for recovery; sync-mobile wipes officer in-progress so
       // ONLY fire when you mean it).
+      const skipSms = req.query.skip_overdue_sms === '1' || req.query.skip_overdue_sms === 'true';
       if (mode === 'morning' && fireAll) {
         try {
           result.sync_mobile = await postSyncMobile(buf);
         } catch (e) {
           result.sync_mobile = { error: String(e.message || e).slice(0, 400) };
         }
-        try {
-          result.send_overdue_sms = await postSendOverdueSms(buf, { dryRun: false });
-        } catch (e) {
-          result.send_overdue_sms = { error: String(e.message || e).slice(0, 400) };
+        if (skipSms) {
+          result.send_overdue_sms = '(SKIPPED — skip_overdue_sms=1)';
+        } else {
+          try {
+            result.send_overdue_sms = await postSendOverdueSms(buf, { dryRun: false });
+          } catch (e) {
+            result.send_overdue_sms = { error: String(e.message || e).slice(0, 400) };
+          }
         }
       } else if (mode === 'morning') {
         result.sync_mobile = '(SKIPPED — pass ?fire_all=1 to chain sync-mobile + send-overdue-sms)';
