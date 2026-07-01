@@ -633,6 +633,85 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     }
   });
 
+  /**
+   * POST /api/admin/m6pm/fire-evening-comparison
+   * Force-fires the kili1615 evening comparison (morning baseline vs live
+   * evening arrears) even when kili1615's own tick failed and no batch was
+   * labeled 'auto-upload:kili1615*'. Used when a heisenberg catchup filled
+   * in the missing kili1615 data. Bypasses the batch-existence check the
+   * autofire watcher uses; still requires morning_arrears:<ymd> baseline.
+   * Body: { reset_gate?: bool } — set to true to reset the m6pm_evening_fired
+   * gate before firing (useful for re-fires).
+   */
+  app.post('/api/admin/m6pm/fire-evening-comparison', requireSecretOrJwt, async (req, res) => {
+    try {
+      const today = todayYmdEat();
+      const gateKey = `m6pm_evening_fired:${today}`;
+      if (req.body?.reset_gate === true) {
+        await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
+      }
+      // Check morning baseline exists
+      const morn = await pool.query(
+        `SELECT value FROM app_settings WHERE key = $1`,
+        [`morning_arrears:${today}`],
+      );
+      if (!morn.rows.length) {
+        return res.status(400).json({
+          error: `no morning baseline for ${today} — seed via /api/admin/m6pm/seed-morning-arrears`,
+        });
+      }
+      const morningArrears = JSON.parse(morn.rows[0].value);
+      const morningXls = buildArrearsXls(morningArrears, null);
+
+      const brainSelfBase = `${req.protocol}://${req.get('host')}`;
+      const eveningArrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      const eveningXls = buildArrearsXls(eveningArrears, null);
+
+      const m6pmResp = await postComparisonToM6pm(morningXls, eveningXls, 'evening');
+
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, 'done')
+           ON CONFLICT (key) DO UPDATE SET value='done', updated_at=now()`,
+        [gateKey],
+      );
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('m6pm_last_report_fire_at', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [new Date().toISOString()],
+      );
+
+      const link = signedReportUrl({ path: 'page', date: today, name: '*', mode: 'evening' });
+      const morningTotal = morningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const eveningTotal = eveningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const collected = morningTotal - eveningTotal;
+      const fmt = (n) => Math.round(n).toLocaleString('en-US');
+      const text = link
+        ? `BRAIN Evening comparison (${today}) ready.\nMorning: ${fmt(morningTotal)} TZS\nEvening: ${fmt(eveningTotal)} TZS\nCollected: ${fmt(collected)} TZS\n${link}`
+        : null;
+      const smsSent = [];
+      if (text) {
+        for (const phone of broadcastPhones()) {
+          const r = await sendNextSms(phone, text);
+          smsSent.push({ phone, ok: r.ok !== false });
+        }
+      }
+      res.json({
+        ymd: today,
+        morning_count: morningArrears.length,
+        evening_count: eveningArrears.length,
+        morning_total_tzs: morningTotal,
+        evening_total_tzs: eveningTotal,
+        collected_tzs: collected,
+        link,
+        m6pm_reports: m6pmResp,
+        sms_sent: smsSent,
+      });
+    } catch (err) {
+      console.error('[fire-evening-comparison]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/admin/m6pm/morning-gate-reset', requireSecretOrJwt, async (_req, res) => {
     await pool.query(
       `DELETE FROM app_settings WHERE key = 'm6pm_morning_done_ymd'`,
