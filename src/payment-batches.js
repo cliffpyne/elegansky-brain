@@ -258,6 +258,7 @@ export function mountPaymentBatchesApi(app, deps) {
         channel, sinceIso, untilIso, asOf, tickName,
         txnDate: txnDateOverride,
         qbPreflightDedup: dryRun ? null : qbPreflightDedup,
+        forceSkipMaxKRow: req.body?.force_skip_max_k_row === true,
       });
       if (result.skipped) {
         await releaseLock();
@@ -5385,7 +5386,7 @@ async function captureInvoiceSnapshot(asOf, arrears) {
   return ins.rows[0].id;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate, forceSkipMaxKRow }) {
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
@@ -5425,11 +5426,17 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // (legacy operator notes, accidental text) is ignored so it can't
   // wedge the entire sheet.
   let maxKRow = 0;
-  for (let i = 1; i < sheet.length; i++) {
-    const colK = String(sheet[i][10] || '').trim().toLowerCase();
-    // Ignore "(dry_run)" markers — those are provisional from a dry-run
-    // preview, not real boundaries. They get cleared by the Erase button.
-    if (colK.startsWith('end of ') && !colK.includes('(dry_run)')) maxKRow = i + 1; // 1-based row number
+  // Frank 2026-07-01: force_skip_max_k_row lets recall replays fire specific
+  // windows whose rows sit below a newer end-of-tick K marker written by a
+  // fresh batch. Only used by explicit operator recall path; per-row I/J/L
+  // checks below still apply so unrelated rows aren't touched.
+  if (!forceSkipMaxKRow) {
+    for (let i = 1; i < sheet.length; i++) {
+      const colK = String(sheet[i][10] || '').trim().toLowerCase();
+      // Ignore "(dry_run)" markers — those are provisional from a dry-run
+      // preview, not real boundaries. They get cleared by the Erase button.
+      if (colK.startsWith('end of ') && !colK.includes('(dry_run)')) maxKRow = i + 1; // 1-based row number
+    }
   }
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedBadFormat = 0, skippedAlreadyPushed = 0;
