@@ -123,6 +123,74 @@ export async function clearMarkerRowRange(spreadsheetId, tabName, fromRow, toRow
   return { clearedRange: res.data.clearedRange || range };
 }
 
+/**
+ * Delete rows from a sheet by 1-based row numbers. Sorts descending so
+ * each delete doesn't shift later indices. Chunks at 200 requests per
+ * batchUpdate. Also clears I/J/K on any rowsToClear (1-based) after
+ * deletions apply — used by dedup to reset markers on the row we kept.
+ */
+export async function deleteSheetRowsAndClearMarkers(
+  spreadsheetId, tabName, rowsToDelete, rowsToClearMarkers = [],
+) {
+  const sheets = await sheetsClient();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId, fields: 'sheets.properties',
+  });
+  const tab = (meta.data.sheets || []).find(
+    (s) => s.properties?.title === tabName,
+  );
+  if (!tab) throw new Error(`tab '${tabName}' not found in ${spreadsheetId}`);
+  const sheetId = tab.properties.sheetId;
+
+  // Deletes must go newest-row-first so surviving row numbers stay valid.
+  const sortedDeletes = [...new Set(rowsToDelete)].sort((a, b) => b - a);
+  let deleted = 0;
+  const CHUNK = 200;
+  for (let i = 0; i < sortedDeletes.length; i += CHUNK) {
+    const chunk = sortedDeletes.slice(i, i + CHUNK);
+    const requests = chunk.map((row) => ({
+      deleteDimension: {
+        range: {
+          sheetId,
+          dimension: 'ROWS',
+          startIndex: row - 1,     // 0-based inclusive
+          endIndex: row,           // 0-based exclusive
+        },
+      },
+    }));
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId, requestBody: { requests },
+    });
+    deleted += chunk.length;
+  }
+
+  // Clear I/J/K on kept rows AFTER delete (row numbers may have shifted;
+  // caller passes the ORIGINAL rowsToClearMarkers indices and must remap
+  // if needed — for dedup, we always clear the FIRST occurrence which is
+  // above all deleted-dupes, so its row index doesn't shift).
+  let markerCells = 0;
+  if (rowsToClearMarkers.length > 0) {
+    // Adjust: for each keep-row, count how many deleted rows are ABOVE it
+    // and subtract. (Deletes above shift the row up.)
+    const adjustedRows = rowsToClearMarkers.map((keepRow) => {
+      const shift = sortedDeletes.filter((d) => d < keepRow).length;
+      return keepRow - shift;
+    });
+    // Use values.clear per range in a batch — I:K (3 columns) per row.
+    const ranges = adjustedRows.map((r) => `${tabName}!I${r}:K${r}`);
+    // batchClear can handle up to 100 ranges per call safely.
+    for (let i = 0; i < ranges.length; i += 100) {
+      const chunk = ranges.slice(i, i + 100);
+      const r = await sheets.spreadsheets.values.batchClear({
+        spreadsheetId, requestBody: { ranges: chunk },
+      });
+      markerCells += (r.data.clearedRanges || []).length * 3;
+    }
+  }
+
+  return { rowsDeleted: deleted, markerCellsCleared: markerCells };
+}
+
 export async function clearSheetColumn(spreadsheetId, tabName, columnLetter) {
   const sheets = await sheetsClient();
   const range = `${tabName}!${columnLetter}:${columnLetter}`;

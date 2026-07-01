@@ -26,7 +26,7 @@
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { db } from './db/pool.js';
-import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers, markSheetRowsAsQbDuplicate } from './sheets.js';
+import { readSheet, writeSheetCells, paintRowEndMarker, protectMarkerColumns, clearSheetColumn, clearMarkerRowRange, eraseDryRunMarkers, markSheetRowsAsQbDuplicate, deleteSheetRowsAndClearMarkers } from './sheets.js';
 import { qbQuery, qbReport, qbPatchPaymentTxnDate } from './qb-client.js';
 import { processInvoicePaymentsWithForwardPay } from './payment-algorithm-v2.js';
 
@@ -3556,6 +3556,78 @@ export function mountPaymentBatchesApi(app, deps) {
       res.json({ q, since, hits: rows.rows.length, rows: rows.rows });
     } catch (err) {
       console.error('[find-customer-payments]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /api/admin/sheet-dedup
+   * Body: { channel, since_iso?, until_iso?, dry_run? }
+   * Scans the channel's passed sheet for duplicate bank_refs (column H).
+   * For each ref that appears N>1 times, keeps the FIRST row, marks the
+   * other N-1 for deletion, AND clears I/J/K on the kept row so a re-fire
+   * can process it fresh. Optionally restricts to rows whose sheet_ts is
+   * in [since_iso, until_iso).
+   *   - dry_run=true: preview only (default false so operator can execute)
+   */
+  app.post('/api/admin/sheet-dedup', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) {
+        return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      }
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = req.body?.since_iso ? new Date(String(req.body.since_iso)) : null;
+      const untilIso = req.body?.until_iso ? new Date(String(req.body.until_iso)) : null;
+      const dryRun = req.body?.dry_run === true;
+
+      const sd = await readSheet(cfg.sheetId, `${cfg.tab}!A1:M200000`);
+      const sheet = sd.values || sd.data || [];
+      const seen = new Map();               // ref → first row number kept
+      const rowsToDelete = [];
+      const rowsToClearMarkers = new Set();
+      let scanned = 0;
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (sinceIso && ts && ts < sinceIso) continue;
+        if (untilIso && ts && ts >= untilIso) continue;
+        const rawRef = String(sheet[i][7] || '').trim();
+        if (!rawRef) continue;
+        scanned++;
+        const rowNum = i + 1; // 1-based
+        if (!seen.has(rawRef)) {
+          seen.set(rawRef, rowNum);
+        } else {
+          // duplicate — delete this row + ensure first row's markers are cleared
+          rowsToDelete.push(rowNum);
+          rowsToClearMarkers.add(seen.get(rawRef));
+        }
+      }
+
+      const summary = {
+        channel,
+        window: sinceIso && untilIso ? {
+          since_iso: sinceIso.toISOString(),
+          until_iso: untilIso.toISOString(),
+        } : null,
+        scanned_rows_with_refs: scanned,
+        unique_refs: seen.size,
+        duplicate_rows_to_delete: rowsToDelete.length,
+        first_rows_to_clear_markers: rowsToClearMarkers.size,
+      };
+
+      if (dryRun || rowsToDelete.length === 0) {
+        return res.json({ dry_run: dryRun, ...summary });
+      }
+
+      const del = await deleteSheetRowsAndClearMarkers(
+        cfg.sheetId, cfg.tab, rowsToDelete, [...rowsToClearMarkers],
+      );
+      res.json({ dry_run: false, ...summary, result: del });
+    } catch (err) {
+      console.error('[sheet-dedup]', err);
       res.status(500).json({ error: err.message });
     }
   });
