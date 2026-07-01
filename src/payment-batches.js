@@ -3530,6 +3530,36 @@ export function mountPaymentBatchesApi(app, deps) {
   // GET /api/admin/batch-breakdown?batch_id=<uuid-or-short>
   // Returns paid/unused/failed totals + lists each unused with its assigned
   // customer + amount so the operator can audit the IP algorithm's picks.
+  /**
+   * GET /api/admin/find-customer-payments?q=<name-fragment>&since=<iso>
+   * Returns every payment_uploads row where customer_name ILIKE %q% since
+   * the given date. Includes bank_ref, invoice_no, amount, status, batch id,
+   * batch created_at. Use to trace a specific customer's payments end-to-end.
+   */
+  app.get('/api/admin/find-customer-payments', requireSecretOrJwt, async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim();
+      const since = String(req.query.since || '2026-06-29T00:00:00Z');
+      if (!q) return res.status(400).json({ error: 'q required' });
+      const rows = await db().query(
+        `SELECT pu.bank_ref, pu.customer_name, pu.customer_id, pu.invoice_no,
+                pu.amount, pu.status, pu.kind, pu.qb_id, pu.batch_id,
+                pb.channel, pb.created_by, pb.created_at
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.customer_name ILIKE $1
+            AND pb.created_at >= $2
+          ORDER BY pb.created_at DESC, pu.customer_name
+          LIMIT 200`,
+        [`%${q}%`, since],
+      );
+      res.json({ q, since, hits: rows.rows.length, rows: rows.rows });
+    } catch (err) {
+      console.error('[find-customer-payments]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get('/api/admin/batch-breakdown', requireSecretOrJwt, async (req, res) => {
     try {
       const id = String(req.query.batch_id || '');
