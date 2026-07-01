@@ -3632,6 +3632,51 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  /**
+   * POST /api/admin/clear-window-markers
+   * Body: { channel, since_iso, until_iso, dry_run? }
+   * Clears I/J/K on every row in the channel's PASSED sheet whose sheet_ts
+   * falls in [since_iso, until_iso). Use to reset a range so a re-fire can
+   * process it as fresh — needed after a void because the "end of <tick>"
+   * K markers still gate the next fire's maxKRow check.
+   */
+  app.post('/api/admin/clear-window-markers', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) {
+        return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      }
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = req.body?.since_iso ? new Date(String(req.body.since_iso)) : null;
+      const untilIso = req.body?.until_iso ? new Date(String(req.body.until_iso)) : null;
+      if (!sinceIso || !untilIso || isNaN(+sinceIso) || isNaN(+untilIso)) {
+        return res.status(400).json({ error: 'since_iso + until_iso required' });
+      }
+      const dryRun = req.body?.dry_run === true;
+      const sd = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
+      const sheet = sd.values || sd.data || [];
+      const rowsToClear = [];
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts) continue;
+        if (ts < sinceIso || ts >= untilIso) continue;
+        rowsToClear.push(i + 1);
+      }
+      if (dryRun || rowsToClear.length === 0) {
+        return res.json({ dry_run: dryRun, channel, rows_to_clear: rowsToClear.length });
+      }
+      const result = await deleteSheetRowsAndClearMarkers(
+        cfg.sheetId, cfg.tab, [], rowsToClear,
+      );
+      res.json({ dry_run: false, channel, rows_cleared: rowsToClear.length, ...result });
+    } catch (err) {
+      console.error('[clear-window-markers]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get('/api/admin/batch-breakdown', requireSecretOrJwt, async (req, res) => {
     try {
       const id = String(req.query.batch_id || '');
