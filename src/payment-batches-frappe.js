@@ -1736,6 +1736,80 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // POST /api/admin/savcom/sms-log-seed
+  // Frank 2026-07-02: seed savcom_sms_log with fake PENDING rows for
+  // customer names that we KNOW received their SMS from the first blast
+  // (before per-recipient logging landed). Match by first-12-alphanumeric
+  // prefix — Frank's paste from NextSMS dashboard uses truncated names.
+  //
+  // Body: { names: ["IDRISA HAMISI", "SAID MOHAMED", ...], confirm: "YES-SEED" }
+  //
+  // Once seeded, sms-blast with retry_failed_only=true will skip these
+  // and only send to customers whose names DIDN'T match — i.e. the ones
+  // who missed their SMS due to the NextSMS balance running out.
+  app.post('/api/admin/savcom/sms-log-seed', requireSecretOrJwt, async (req, res) => {
+    try {
+      const names = Array.isArray(req.body?.names) ? req.body.names : [];
+      if (names.length === 0) return res.status(400).json({ error: 'names[] required' });
+      if (req.body?.confirm !== 'YES-SEED') return res.status(400).json({ error: "confirm='YES-SEED' required" });
+      await db().query(`
+        CREATE TABLE IF NOT EXISTS savcom_sms_log (
+          id BIGSERIAL PRIMARY KEY, batch_ref TEXT, customer TEXT, plate TEXT,
+          wakandi_id TEXT, phone TEXT, status TEXT, nextsms_message_id TEXT,
+          nextsms_response JSONB, message_body TEXT, sent_at TIMESTAMPTZ DEFAULT now());
+        CREATE INDEX IF NOT EXISTS savcom_sms_log_customer_sent_idx
+          ON savcom_sms_log (customer, sent_at DESC);
+      `);
+      const { getCache } = await import('./savcom-resolver.js');
+      const cache = await getCache();
+      const targets = cache.all || [];
+      const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, 12);
+      // Build resolver-name-prefix map
+      const byPrefix = new Map();
+      for (const c of targets) {
+        const key = norm(c.display_name || c.customer);
+        if (key) byPrefix.set(key, c);
+      }
+      // Match each pasted name → resolver customer
+      const matched = [];
+      const unmatched = [];
+      for (const name of names) {
+        const key = norm(name);
+        const c = byPrefix.get(key);
+        if (c) matched.push(c);
+        else unmatched.push(name);
+      }
+      // Dedupe matched
+      const seen = new Set();
+      const uniqueMatched = [];
+      for (const c of matched) {
+        if (seen.has(c.customer)) continue;
+        seen.add(c.customer); uniqueMatched.push(c);
+      }
+      // Insert PENDING rows
+      let inserted = 0;
+      const seedBatch = `seed-${Date.now()}`;
+      for (const c of uniqueMatched) {
+        await db().query(
+          `INSERT INTO savcom_sms_log (batch_ref, customer, plate, wakandi_id, status)
+           VALUES ($1, $2, $3, $4, 'PENDING')`,
+          [seedBatch, c.customer, c.plate || null, c.wakandi_member_id || null]);
+        inserted++;
+      }
+      res.json({
+        names_received: names.length,
+        matched_unique: uniqueMatched.length,
+        unmatched_count: unmatched.length,
+        unmatched_sample: unmatched.slice(0, 10),
+        inserted,
+        seed_batch: seedBatch,
+      });
+    } catch (err) {
+      console.error('[savcom-sms-log-seed]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/savcom/reverse-refs
   // One-shot: for each bank_ref in body, call Frappe reverse_payment with
   // the V suffix appended (matching what ingestPayment actually stored).
