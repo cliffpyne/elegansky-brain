@@ -988,6 +988,13 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
   // ───────────────────────────────────────────────────────────────────────
   app.post('/api/payment-batches/savcom-recall', requireSecretOrJwt, async (req, res) => {
     const dryRun = req.body?.dry_run === true;
+    // Frank 2026-07-01 (post book-rebuild): the Frappe dev already wiped
+    // all our old ACC-PAY-* payments as part of the SAVCOM book rebuild.
+    // Calling reverse_payment on ~915 refs would waste 7-10 min on API
+    // calls that all return not_found. skip_reverse=true does JUST the
+    // BRAIN-side DB cleanup (release consumed_transactions + mark batches
+    // rolled_back + clear sheet markers) without the wasted reverse loop.
+    const skipReverse = req.body?.skip_reverse === true;
     const confirm = String(req.body?.confirm || '');
     if (!dryRun && confirm !== 'YES-RECALL-535') {
       return res.status(400).json({
@@ -1064,21 +1071,31 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       // 3. Reverse each posted ref. The PEs were pushed BEFORE the V suffix
       //    code shipped — Frappe stored txn_id WITHOUT V — so reverse by
       //    the raw bank_ref (no suffix added here).
-      const reverseResults = [];
-      let reversedOK = 0, reversedAlready = 0, reversedErr = 0;
-      for (const row of postedRefs.rows) {
-        try {
-          const r = await reversePayment(row.bank_ref);
-          if (r?.status === 'already_cancelled' || r?.status === 'not_found') reversedAlready++;
-          else reversedOK++;
-          reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: true, r });
-        } catch (err) {
-          reversedErr++;
-          reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: false, error: err.message });
+      //
+      // skip_reverse=true bypasses the Frappe API loop entirely. Use case:
+      // Frappe dev has already wiped the payments server-side (e.g. book
+      // rebuild) and calling reverse_payment on ~915 refs would waste
+      // 7-10 min on API calls that all return not_found. This flag runs
+      // the DB cleanup + sheet marker clear WITHOUT the wasted API loop.
+      if (skipReverse) {
+        summary.reverse = { skipped: true, reason: 'skip_reverse=true — Frappe dev already handled server-side' };
+      } else {
+        const reverseResults = [];
+        let reversedOK = 0, reversedAlready = 0, reversedErr = 0;
+        for (const row of postedRefs.rows) {
+          try {
+            const r = await reversePayment(row.bank_ref);
+            if (r?.status === 'already_cancelled' || r?.status === 'not_found') reversedAlready++;
+            else reversedOK++;
+            reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: true, r });
+          } catch (err) {
+            reversedErr++;
+            reverseResults.push({ bank_ref: row.bank_ref, payment: row.payment_name, ok: false, error: err.message });
+          }
         }
+        summary.reverse = { ok: reversedOK, already: reversedAlready, error: reversedErr };
+        summary.reverse_errors = reverseResults.filter((r) => !r.ok).slice(0, 20);
       }
-      summary.reverse = { ok: reversedOK, already: reversedAlready, error: reversedErr };
-      summary.reverse_errors = reverseResults.filter((r) => !r.ok).slice(0, 20);
 
       // 4. Sheet J/K/L cleanup. For each SAV channel, read its sheet,
       //    match column H (raw transactionId) against the suffix-stripped
