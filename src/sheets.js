@@ -390,7 +390,12 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
   if (!spreadsheetId || !tabName || !rowNumber || !tickName) {
     return { painted: false, reason: 'missing arg' };
   }
-  const { dryRun = false } = options;
+  // paintEndColumnIndex: paint background from col A up to (but excluding)
+  //   this index. Default 11 = paint A-K. SAV sheets have their end-of-tick
+  //   text in col L (index 11), so they pass 12 to include L in the paint.
+  // textColumnIndex: where to write the "end of <tick>" text. Default 10 = K.
+  //   SAV sheets pass 11 = L.
+  const { dryRun = false, paintEndColumnIndex = 11, textColumnIndex = 10 } = options;
   // Dry-run renders yellow row + " (DRY_RUN)" text suffix, so the operator
   // can tell at a glance which markers are provisional. Real runs stay
   // purple. The "(DRY_RUN)" suffix is ALSO how prepareAutoUpload's skip
@@ -417,7 +422,7 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
     spreadsheetId,
     requestBody: {
       requests: [
-        // Paint columns A..K (indices 0..11 exclusive)
+        // Paint columns A..paintEndColumnIndex (exclusive).
         {
           repeatCell: {
             range: {
@@ -425,7 +430,7 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
               startRowIndex: row0,
               endRowIndex: row0 + 1,
               startColumnIndex: 0,
-              endColumnIndex: 11,
+              endColumnIndex: paintEndColumnIndex,
             },
             cell: {
               userEnteredFormat: {
@@ -435,15 +440,15 @@ export async function paintRowEndMarker(spreadsheetId, tabName, rowNumber, tickN
             fields: 'userEnteredFormat.backgroundColor',
           },
         },
-        // Write "end of {tick}" (or " (DRY_RUN)" variant) to Column K
+        // Write "end of {tick}" text to configured column (K for QB, L for SAV).
         {
           updateCells: {
             range: {
               sheetId,
               startRowIndex: row0,
               endRowIndex: row0 + 1,
-              startColumnIndex: 10,
-              endColumnIndex: 11,
+              startColumnIndex: textColumnIndex,
+              endColumnIndex: textColumnIndex + 1,
             },
             rows: [{ values: [{ userEnteredValue: { stringValue: kText } }] }],
             fields: 'userEnteredValue',

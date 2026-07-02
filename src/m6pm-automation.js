@@ -1885,6 +1885,13 @@ async function fireSavChannel(channel, tickName, brainSelfBase, dateOverride) {
 }
 
 async function savcomPostTickWatcher({ pool, brainSelfBase }) {
+  // Frank 2026-07-02: global kill switch. When savcom_auto_disabled='1',
+  // NEITHER the morning ritual NOR any post-tick auto-fire runs. Manual
+  // fires via /api/payment-batches/auto-upload-frappe still work (they
+  // check a different gate). Flip back to '0' to re-arm auto.
+  const autoDisabled = await pool.query(
+    `SELECT value FROM app_settings WHERE key='savcom_auto_disabled'`);
+  if (autoDisabled.rows[0]?.value === '1') return;
   const today = todayYmdEat();
   const eatNow = new Date(Date.now() + 3 * 3600_000);
   const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();
@@ -1944,6 +1951,11 @@ async function savcomPostTickWatcher({ pool, brainSelfBase }) {
  * something's wrong and the operator should fire manually).
  */
 async function savcomMorningAutoFireWatcher({ pool, brainSelfBase }) {
+  // Frank 2026-07-02: honor the same global kill switch as the post-tick
+  // watcher. When savcom_auto_disabled='1', no morning ritual auto-fire.
+  const autoDisabled = await pool.query(
+    `SELECT value FROM app_settings WHERE key='savcom_auto_disabled'`);
+  if (autoDisabled.rows[0]?.value === '1') return;
   const today = todayYmdEat();
   const eatNow = new Date(Date.now() + 3 * 3600_000);
   const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();

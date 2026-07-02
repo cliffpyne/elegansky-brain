@@ -783,20 +783,20 @@ export async function runSavFrappeUpload({
       console.error('[sav-frappe] sheet marker write failed (non-fatal):', e.message);
     }
     // End-of-tick marker on the last sheet row processed. paintRowEndMarker
-    // writes to column K by default — for SAV we override the column letter
-    // via a 5th positional arg if supported, otherwise we write the L cell
-    // directly and skip the row-coloring helper.
+    // now accepts paintEndColumnIndex + textColumnIndex overrides so SAV can
+    // paint A..L purple + write "end of <tick>" to col L (index 11) — matching
+    // the visible marker line QB path produces on col K.
     try {
-      const lastRow = Math.max(...fetchRows);
-      // Direct cell write to column L — keeps the data shape simple even
-      // without the helper's row-paint side effect. The dashboard's
-      // "consume" check uses prefix match on "end of " which works in any column.
-      await writeSheetCells(cfg.sheetId, [{
-        range: `${cfg.tab}!${cfg.endTickLetter}${lastRow}`,
-        value: `end of ${tickName || 'heisenberg'}${dryTag}`,
-      }]);
+      if (fetchRows.size > 0) {
+        const lastRow = Math.max(...fetchRows);
+        await paintRowEndMarker(cfg.sheetId, cfg.tab, lastRow, tickName || 'heisenberg', {
+          dryRun,
+          paintEndColumnIndex: 12,   // paint A..L (0..11 inclusive)
+          textColumnIndex: 11,       // write "end of <tick>" to L
+        });
+      }
     } catch (e) {
-      console.error('[sav-frappe] end-of-tick marker write failed (non-fatal):', e.message);
+      console.error('[sav-frappe] end-of-tick marker paint failed (non-fatal):', e.message);
     }
   }
 
