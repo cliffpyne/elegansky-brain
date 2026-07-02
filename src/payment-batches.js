@@ -2419,6 +2419,23 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // POST /api/admin/write-sheet-cell
+  // Body: { sheet_id, cell_a1 (e.g. "pikipiki records2!D252"), value }
+  // Diagnostic passthrough — writes a single cell.
+  app.post('/api/admin/write-sheet-cell', requireSecretOrJwt, async (req, res) => {
+    try {
+      const sheetId = String(req.body?.sheet_id || '');
+      const cellA1 = String(req.body?.cell_a1 || '');
+      const value = req.body?.value;
+      if (!sheetId || !cellA1) return res.status(400).json({ error: 'sheet_id + cell_a1 required' });
+      const r = await writeSheetCells(sheetId, [{ range: cellA1, value: String(value ?? '') }]);
+      res.json({ ok: true, cell: cellA1, value, updated_cells: r.updatedCells });
+    } catch (err) {
+      console.error('[write-sheet-cell]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/admin/read-sheet-raw?sheet_id=<>&tab=<>&range=<>
   // Diagnostic passthrough to Google Sheets — used to peek at any tab
   // BRAIN doesn't have a config entry for (e.g. Frank's phone book).
