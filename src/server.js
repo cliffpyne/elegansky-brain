@@ -1706,6 +1706,66 @@ app.post('/api/nmb-pull/complete', async (req, res) => {
   }
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// NMB session cookies — Frank's paste-from-browser path to bypass OTP burns.
+// Frank logs into NMB manually via his browser once (usually daily), copies
+// the site's cookies as JSON, POSTs them here. The NMB puller reads them on
+// startup and injects into Playwright, skipping the login+OTP flow entirely.
+// After a successful login (either via cookies or fresh OTP), the puller
+// POSTs its current cookies back so the next restart uses the freshest set.
+// Storage: single row in app_settings under 'nmb_cookies_latest' — value is
+// JSON { cookies: [...Playwright cookie objects], saved_at: iso, source: 'browser'|'puller' }.
+// ───────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/nmb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : null;
+    if (!cookies || cookies.length === 0) {
+      return res.status(400).json({ error: 'body must be { cookies: [...] } with at least one cookie' });
+    }
+    const source = String(req.body?.source || 'browser');
+    const payload = JSON.stringify({
+      cookies,
+      saved_at: new Date().toISOString(),
+      source,
+      count: cookies.length,
+    });
+    const pool = (await import('./db/pool.js')).db();
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('nmb_cookies_latest', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [payload],
+    );
+    res.json({ ok: true, cookies_saved: cookies.length, source });
+  } catch (err) {
+    console.error('[POST /api/admin/nmb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/internal/nmb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const r = await pool.query(`SELECT value, updated_at FROM app_settings WHERE key='nmb_cookies_latest'`);
+    if (!r.rows.length) return res.status(404).json({ error: 'no cookies stored yet' });
+    let payload;
+    try { payload = JSON.parse(r.rows[0].value); }
+    catch (e) { return res.status(500).json({ error: 'stored cookies unparseable: ' + e.message }); }
+    res.json({
+      cookies: payload.cookies || [],
+      saved_at: payload.saved_at,
+      source: payload.source,
+      db_updated_at: r.rows[0].updated_at,
+    });
+  } catch (err) {
+    console.error('[GET /api/internal/nmb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Phone-side heartbeat — the OTP-relay phone APK POSTs this every ~60s
 // with {phone, battery_pct}. m6pm-automation's phoneHeartbeatWatcher reads
 // the table 15 min before every scheduled tick and SMSes the master admin
