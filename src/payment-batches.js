@@ -3722,6 +3722,18 @@ export function mountPaymentBatchesApi(app, deps) {
           })),
         },
         failed: failed.length ? failed.map((r) => ({ bank_ref: r.bank_ref, kind: r.kind, customer_name: r.customer_name, amount: Number(r.amount || 0) })) : [],
+        // Frank 2026-07-02: bit-by-bit reconciliation view. One row per
+        // payment_uploads paid line; grouped by bank_ref, this lets the
+        // operator see for each bank txn every invoice it paid + amount.
+        paid_rows: paid.map((r) => ({
+          bank_ref: r.bank_ref,
+          customer_name: r.customer_name,
+          customer_id: r.customer_id,
+          invoice_no: r.invoice_no,
+          qb_id: r.qb_id,
+          amount: Number(r.amount || 0),
+          status: r.status,
+        })),
       });
     } catch (err) {
       console.error('[batch-breakdown] failed:', err);
