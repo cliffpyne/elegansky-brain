@@ -2419,6 +2419,25 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   });
 
+  // GET /api/admin/read-sheet-raw?sheet_id=<>&tab=<>&range=<>
+  // Diagnostic passthrough to Google Sheets — used to peek at any tab
+  // BRAIN doesn't have a config entry for (e.g. Frank's phone book).
+  // Returns { values: [[...],[...],...] }.
+  app.get('/api/admin/read-sheet-raw', requireSecretOrJwt, async (req, res) => {
+    try {
+      const sheetId = String(req.query.sheet_id || '');
+      const tab = String(req.query.tab || '');
+      const range = String(req.query.range || 'A1:Z10000');
+      if (!sheetId || !tab) return res.status(400).json({ error: 'sheet_id + tab required' });
+      const data = await readSheet(sheetId, `${tab}!${range}`);
+      const values = data.values || data.data || [];
+      res.json({ sheet_id: sheetId, tab, range, row_count: values.length, values });
+    } catch (err) {
+      console.error('[read-sheet-raw]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/find-refs-in-sheet
   // Body: { channel, refs: [...] }
   // For each ref, returns: sheet row, sheet_ts, amount, customer_name,
