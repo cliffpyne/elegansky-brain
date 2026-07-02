@@ -69,6 +69,45 @@ const SAV_CHANNEL_SHEETS = {
 
 export const SAV_FRAPPE_CHANNELS = Object.keys(SAV_CHANNEL_SHEETS);
 
+/**
+ * Frank 2026-07-01 (post book-rebuild): these 18 SAVCOM customers exist
+ * in QuickBooks but haven't been added to Frappe yet by the ERP dev.
+ * BRAIN must NOT push payments for them — Frappe would return "customer
+ * not found" and the ref would land in consumed_transactions, blocking
+ * the eventual retry once they're added.
+ *
+ * Skip strategy: match on plate (SAVCOM CUSTOMER AT QUICKBOOK 2.xlsx +
+ * BRAYSON ALLY HASSAN). During the resolver step, if a txn's plate is
+ * in this set, force it into the unresolved bucket → PU written as
+ * needs_saasant → sheet col J stays empty → consumed_transactions
+ * doesn't get the ref → next re-fire (after dev adds them) picks them
+ * up cleanly.
+ *
+ * When Frappe dev adds each customer, remove their plate from this set
+ * and re-deploy. Alternatively, blank the whole set once the full 18
+ * are added.
+ */
+export const NOT_YET_IN_FRAPPE_PLATES = new Set([
+  'MC783FME', // BRAYSON ALLY HASSAN (Frank typed)
+  'MC691FML', // SALUM ABDUL SALIM
+  'MC847FLT', // HUSSEIN BASHIRU ISSA
+  'MC754FLT', // MWANAHAWA TWALIBU SAIDI
+  'MC706FML', // HABIBA OTHUMAN NYAZA
+  'MC836FME', // TABIA STAUBI SHOMARI
+  'MC587FLW', // SHAIBU SAID LIJOCHA
+  'MC832FME', // HAMZA ABDALLAH ADAMU
+  'MC549FLW', // MWANAHAMISI ATHUMANI MOHAMED
+  'MC545FLW', // ABDALLAH RASHIDI ABDALLAH
+  'MC291FLM', // HASSANI MUSSA MAKAU
+  'MC663FML', // MWINYIHAJI KHAMISS KHALFANI
+  'MC863FME', // SALEHE HAMISI MOTO
+  'MC859FME', // SHARIF OMAR SHARIF
+  'MC679FML', // ZAINABU HAMISI KADEGE
+  'MC676FML', // SELEMANI RAMADHANI ABDALLAH
+  'MC670FML', // ABDULAZIZI ALLY CARTER
+  'MC725FMJ', // MANZI HALFAN HAMISI
+]);
+
 function appendSavSuffix(ref, channel) {
   // Mirror the QB-side suffix convention so consumed_transactions stays
   // collision-free between paths. Use 'NS' / 'CS' so SAV refs don't
@@ -535,8 +574,31 @@ export async function runSavFrappeUpload({
 
   // 3. Resolve each txn's customer via savcom-resolver (covers all 292).
   let resolvedCount = 0;
+  let notYetInFrappeCount = 0;
   const unresolved = [];
   for (const t of txnsClean) {
+    // Skip-list check (Frank 2026-07-01): 18 QB-side SAVCOM customers
+    // exist in QuickBooks but haven't been added to Frappe yet by the
+    // ERP dev. Route them straight to needs_saasant so the payment stays
+    // in the sheet WITHOUT sheet col J marker and WITHOUT a
+    // consumed_transactions insert — when Frappe dev adds each customer,
+    // remove their plate from NOT_YET_IN_FRAPPE_PLATES + re-fire the
+    // relevant window and BRAIN picks them up cleanly.
+    const plateUpper = (t.plate || '').toUpperCase().trim();
+    if (plateUpper && NOT_YET_IN_FRAPPE_PLATES.has(plateUpper)) {
+      // Mark this txn so downstream steps (bankRefs building, sheet
+      // marker write) can exclude it. The rest of the fire proceeds
+      // normally on the OTHER rows in the window.
+      t._skipNotInFrappe = true;
+      unresolved.push({
+        sheet_row: t.sheet_row_number,
+        ref: t.transactionId,
+        name: t.customerName || plateUpper,
+        reason: 'not_yet_in_frappe',
+      });
+      notYetInFrappeCount++;
+      continue;
+    }
     // Feed the resolver the strongest signals first: plate (col F)
     // for QB-resident customers, wakandi_member_id (col I) for Wakandi.
     // These are direct primary keys in the 292-customer book — no
@@ -589,7 +651,11 @@ export async function runSavFrappeUpload({
 
   // 7. Batch row + lock refs (same table as QB path; channel column
   //    distinguishes them so reporting can filter).
+  // Skip-listed txns (NOT_YET_IN_FRAPPE_PLATES) are excluded from
+  // bankRefs so their refs don't land in consumed_transactions —
+  // this preserves their retry-eligibility once Frappe adds them.
   const bankRefs = [...new Set(txnsClean
+    .filter((t) => !t._skipNotInFrappe)
     .map((t) => appendSavSuffix(t.transactionId, channel))
     .filter(Boolean))];
   const idem = `auto-${channel}-${Date.now()}-` + Math.random().toString(36).slice(2, 8);
@@ -679,7 +745,13 @@ export async function runSavFrappeUpload({
   //      L = "end of <tick>"            (was K on QB tabs)
   const fetchedAt = new Date().toISOString();
   const fetchRows = new Set();
-  for (const t of txnsClean) if (t.sheet_row_number) fetchRows.add(t.sheet_row_number);
+  // Skip-listed txns (NOT_YET_IN_FRAPPE_PLATES) don't get sheet J/K
+  // markers written — they stay marker-less so a future re-fire (once
+  // Frappe adds them) can pick them up cleanly without a clear step.
+  for (const t of txnsClean) {
+    if (t._skipNotInFrappe) continue;
+    if (t.sheet_row_number) fetchRows.add(t.sheet_row_number);
+  }
   if (fetchRows.size > 0 && cfg.sheetId && cfg.tab) {
     const updates = [];
     const dryTag = dryRun ? ' (DRY_RUN)' : '';
