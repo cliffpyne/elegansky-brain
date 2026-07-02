@@ -646,8 +646,14 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
   app.post('/api/admin/m6pm/fire-evening-comparison', requireSecretOrJwt, async (req, res) => {
     try {
       const today = todayYmdEat();
+      // Frank 2026-07-02: accept custom mode so an ad-hoc emergency
+      // comparison can fire under a distinct slot (e.g. 'heisenberg')
+      // without consuming the evening slot — the auto-evening at 20:00
+      // EAT still gets to fire cleanly for the boss's regular report.
+      const mode = String(req.body?.mode || 'evening');
+      const isEvening = mode === 'evening';
       const gateKey = `m6pm_evening_fired:${today}`;
-      if (req.body?.reset_gate === true) {
+      if (isEvening && req.body?.reset_gate === true) {
         await pool.query(`DELETE FROM app_settings WHERE key=$1`, [gateKey]);
       }
       // Check morning baseline exists
@@ -667,36 +673,47 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const eveningArrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
       const eveningXls = buildArrearsXls(eveningArrears, null);
 
-      const m6pmResp = await postComparisonToM6pm(morningXls, eveningXls, 'evening');
+      const m6pmResp = await postComparisonToM6pm(morningXls, eveningXls, mode);
 
-      await pool.query(
-        `INSERT INTO app_settings (key, value) VALUES ($1, 'done')
-           ON CONFLICT (key) DO UPDATE SET value='done', updated_at=now()`,
-        [gateKey],
-      );
+      // Only mark the evening gate when mode is actually 'evening' — an
+      // ad-hoc heisenberg comparison must NOT block the real evening fire.
+      if (isEvening) {
+        await pool.query(
+          `INSERT INTO app_settings (key, value) VALUES ($1, 'done')
+             ON CONFLICT (key) DO UPDATE SET value='done', updated_at=now()`,
+          [gateKey],
+        );
+      }
       await pool.query(
         `INSERT INTO app_settings (key, value) VALUES ('m6pm_last_report_fire_at', $1)
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
         [new Date().toISOString()],
       );
 
-      const link = signedReportUrl({ path: 'page', date: today, name: '*', mode: 'evening' });
+      const link = signedReportUrl({ path: 'page', date: today, name: '*', mode });
       const morningTotal = morningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
       const eveningTotal = eveningArrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
       const collected = morningTotal - eveningTotal;
       const fmt = (n) => Math.round(n).toLocaleString('en-US');
+      const modeLabel = mode.charAt(0).toUpperCase() + mode.slice(1);
       const text = link
-        ? `BRAIN Evening comparison (${today}) ready.\nMorning: ${fmt(morningTotal)} TZS\nEvening: ${fmt(eveningTotal)} TZS\nCollected: ${fmt(collected)} TZS\n${link}`
+        ? `BRAIN ${modeLabel} comparison (${today}) ready.\nMorning: ${fmt(morningTotal)} TZS\n${modeLabel}: ${fmt(eveningTotal)} TZS\nCollected: ${fmt(collected)} TZS\n${link}`
         : null;
       const smsSent = [];
       if (text) {
-        for (const phone of broadcastPhones()) {
+        // For non-evening ad-hoc fires, only SMS the master admin (Frank)
+        // so we don't spam the whole broadcast list mid-day.
+        const recipients = isEvening
+          ? broadcastPhones()
+          : [process.env.MASTER_ADMIN_PHONE || '255752900450'];
+        for (const phone of recipients) {
           const r = await sendNextSms(phone, text);
           smsSent.push({ phone, ok: r.ok !== false });
         }
       }
       res.json({
         ymd: today,
+        mode,
         morning_count: morningArrears.length,
         evening_count: eveningArrears.length,
         morning_total_tzs: morningTotal,
