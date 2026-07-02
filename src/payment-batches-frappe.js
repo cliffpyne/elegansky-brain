@@ -26,7 +26,7 @@
 
 import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
-import { getOpenInvoices, ingestPayment, reversePayment, getPaymentEntry, getSalesInvoice } from './frappe-client.js';
+import { getOpenInvoices, ingestPayment, reversePayment, getPaymentEntry, getSalesInvoice, getLoanSummary } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
 import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
 
@@ -1440,6 +1440,199 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       });
     } catch (err) {
       console.error('[savcom-reconcile-batch]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // POST /api/admin/savcom/sms-blast
+  //
+  // Send a Swahili loan-summary SMS to every SAVCOM customer (all 251+
+  // Wakandi + any QB customers already in the resolver's book that Frank
+  // wants to notify). Uses Frappe dev's get_loan_summary endpoint for
+  // live pre-computed figures + Frank's pikipiki records2 sheet for
+  // phone numbers (savcom-resolver's phone field is empty per its own
+  // comment).
+  //
+  // Body:
+  //   dry_run: true  → return preview only, no SMS sent
+  //   test_only_to: "255752900450"  → only send the messages to this
+  //                                    single phone (each message body
+  //                                    still contains the target customer's
+  //                                    numbers), useful for a boss preview.
+  //   customer_filter: [<plate|wakandi_id|name>, ...]  → only process
+  //                                    these customers (dry-run for
+  //                                    ELISANTE, for example).
+  //   include_qb: false → default false; QB customers may not have phone.
+  //
+  // Message template (Frank 2026-07-02, confirmed):
+  //   Ndugu <name>,
+  //   muhtasari wa mkopo wa Pikipiki Elegansky Finance:
+  //   Mkataba:  TZS <contract>
+  //   Umelipa:  TZS <paid>
+  //   Salio:    TZS <outstanding>
+  //   Limbikizo:TZS <arrears>
+  //   Leo:      TZS <today>
+  //   Jumla:    TZS <due_now>
+  //   Tarehe ya kuanza malipo:       DD-MM-YYYY
+  //   Tarehe ya Awali ya Kumaliza:   DD-MM-YYYY
+  //   [Tarehe Mpya ya Kumaliza:     DD-MM-YYYY KUTOKANA NA KUSOGEZWA MBELE MAREJESHO YA SIKU <N>]
+  //   Kwa maelezo zaidi piga: 0696711258
+  //
+  // Last line only appears when days_moved_forward > 0.
+  app.post('/api/admin/savcom/sms-blast', requireSecretOrJwt, async (req, res) => {
+    try {
+      const dryRun = req.body?.dry_run === true;
+      const testOnlyTo = req.body?.test_only_to ? String(req.body.test_only_to).trim() : null;
+      const customerFilter = Array.isArray(req.body?.customer_filter) ? req.body.customer_filter : null;
+
+      // 1. Load phone sheet (Frank's pikipiki records2 tab). Column B=plate,
+      //    C=name, D=phone, E=wakandi_id.
+      const PHONE_SHEET_ID = '1XFwPITQgZmzZ8lbg8MKD9S4rwHyk2cDOKrcxO7SAjHA';
+      const PHONE_TAB = 'pikipiki records2';
+      const phoneData = await readSheet(PHONE_SHEET_ID, `${PHONE_TAB}!A2:E5000`);
+      const phoneRows = phoneData.values || phoneData.data || [];
+      const phoneByPlate = new Map();
+      const phoneByWakandi = new Map();
+      const phoneByNormName = new Map();
+      const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
+      for (const row of phoneRows) {
+        const padded = [...row, '', '', '', '', ''];
+        const plate = String(padded[1] || '').trim().toUpperCase();
+        const name = String(padded[2] || '').trim();
+        const phone = String(padded[3] || '').trim();
+        const wid = String(padded[4] || '').trim();
+        if (!phone) continue;
+        if (plate) phoneByPlate.set(plate, phone);
+        if (wid) phoneByWakandi.set(wid, phone);
+        if (name) phoneByNormName.set(norm(name), phone);
+      }
+
+      // 2. Get the resolver's customer book (all 251+ SAVCOM customers).
+      //    The resolver caches all customers in a `.all` array reachable
+      //    via getCache — exported as getCache({force}) → cache object.
+      const { getCache } = await import('./savcom-resolver.js');
+      const cache = await getCache();
+      let targets = cache.all || [];
+      if (customerFilter) {
+        const filterSet = new Set(customerFilter.map((s) => String(s).toUpperCase().trim()));
+        targets = targets.filter((c) => {
+          return filterSet.has(String(c.plate || '').toUpperCase())
+              || filterSet.has(String(c.wakandi_member_id || ''))
+              || filterSet.has(String(c.customer || '').toUpperCase())
+              || filterSet.has(String(c.display_name || '').toUpperCase());
+        });
+      }
+
+      // Local helpers
+      const fmtN = (n) => Number(n || 0).toLocaleString('en-US');
+      const fmtDate = (iso) => {
+        if (!iso) return '';
+        const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return m ? `${m[3]}-${m[2]}-${m[1]}` : String(iso);
+      };
+      const buildBody = (c, s) => {
+        const lines = [
+          `Ndugu ${c.display_name || c.customer},`,
+          'muhtasari wa mkopo wa Pikipiki Elegansky Finance:',
+          `Mkataba:  TZS ${fmtN(s.contract_total)}`,
+          `Umelipa:  TZS ${fmtN(s.total_paid)}`,
+          `Salio:    TZS ${fmtN(s.outstanding_total)}`,
+          `Limbikizo:TZS ${fmtN(s.arrears)}`,
+          `Leo:      TZS ${fmtN(s.today_due)}`,
+          `Jumla:    TZS ${fmtN(s.total_due_now)}`,
+          `Tarehe ya kuanza malipo:       ${fmtDate(s.loan_start_date)}`,
+          `Tarehe ya Awali ya Kumaliza:   ${fmtDate(s.original_end_date)}`,
+        ];
+        const daysMoved = Number(s.days_moved_forward || 0);
+        if (daysMoved > 0) {
+          lines.push(`Tarehe Mpya ya Kumaliza:       ${fmtDate(s.current_end_date)} KUTOKANA NA KUSOGEZWA MBELE MAREJESHO YA SIKU ${daysMoved}`);
+        }
+        lines.push('Kwa maelezo zaidi piga: 0696711258');
+        return lines.join('\n');
+      };
+
+      // 3. Iterate targets, fetch loan_summary, format body, resolve phone.
+      const preview = [];
+      const messages = [];
+      const errors = [];
+      for (const c of targets) {
+        const plate = (c.plate || '').toUpperCase().trim();
+        const wid = (c.wakandi_member_id || '').trim();
+        const nnorm = norm(c.display_name || c.customer);
+        const phone = phoneByPlate.get(plate) || phoneByWakandi.get(wid) || phoneByNormName.get(nnorm) || null;
+        if (!phone) { errors.push({ customer: c.customer, reason: 'no_phone_found' }); continue; }
+
+        let summary;
+        try {
+          summary = await getLoanSummary(c.customer);
+        } catch (err) {
+          errors.push({ customer: c.customer, reason: 'loan_summary_failed', error: err.message });
+          continue;
+        }
+        const body = buildBody(c, summary);
+        preview.push({ customer: c.customer, plate, wakandi_id: wid, phone, chars: body.length, body_preview: body });
+        messages.push({ to: testOnlyTo || phone, text: body });
+      }
+
+      if (dryRun) {
+        return res.json({
+          dry_run: true,
+          total_targets: targets.length,
+          messages_ready: messages.length,
+          errors_count: errors.length,
+          preview: preview.slice(0, 5),
+          errors_sample: errors.slice(0, 10),
+        });
+      }
+
+      // 4. Real send via NextSMS multi endpoint.
+      const { sendNextSmsBulkExported } = await import('./savcom-morning.js').catch(() => ({}));
+      // savcom-morning doesn't export sendNextSmsBulk publicly; call the
+      // NextSMS API directly here (single loop, up to 100 per POST).
+      const user = process.env.NEXTSMS_USERNAME;
+      const pass = process.env.NEXTSMS_PASSWORD;
+      const sender = process.env.NEXTSMS_SENDER_ID || 'NEXTSMS';
+      if (!user || !pass) return res.status(500).json({ error: 'no NEXTSMS credentials in env' });
+      const auth = Buffer.from(`${user}:${pass}`).toString('base64');
+      let sentOk = 0, sentErr = 0;
+      const rawResponses = [];
+      const CHUNK = 100;
+      for (let i = 0; i < messages.length; i += CHUNK) {
+        const chunk = messages.slice(i, i + CHUNK);
+        try {
+          const r = await fetch('https://messaging-service.co.tz/api/sms/v1/text/multi', {
+            method: 'POST',
+            headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ messages: chunk.map((m) => ({ from: sender, to: String(m.to), text: String(m.text) })) }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          const j = await r.json().catch(() => ({}));
+          const msgs = j?.messages || [];
+          for (const msg of msgs) {
+            const gn = msg?.status?.groupName || '';
+            if (gn === 'PENDING' || gn === 'DELIVERED' || gn === 'PENDING_ENROUTE') sentOk++;
+            else sentErr++;
+          }
+          if (msgs.length < chunk.length) sentErr += (chunk.length - msgs.length);
+          rawResponses.push(j);
+        } catch (e) {
+          sentErr += chunk.length;
+          rawResponses.push({ error: String(e.message || e).slice(0, 200) });
+        }
+      }
+      res.json({
+        dry_run: false,
+        total_targets: targets.length,
+        messages_sent: messages.length,
+        sms_ok: sentOk,
+        sms_error: sentErr,
+        errors_count: errors.length,
+        errors_sample: errors.slice(0, 10),
+        preview_sample: preview.slice(0, 3),
+      });
+    } catch (err) {
+      console.error('[savcom-sms-blast]', err);
       res.status(500).json({ error: err.message });
     }
   });

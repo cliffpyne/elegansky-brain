@@ -147,6 +147,25 @@ export async function ingestPayment({
 }
 
 /**
+ * Get per-customer loan summary — Frappe dev 2026-07-02 endpoint that
+ * pre-computes every figure Frank's SMS blast needs.
+ *
+ * Returns:
+ *   {
+ *     contract_total, total_paid, outstanding_total,
+ *     arrears, today_due, total_due_now,
+ *     loan_start_date, original_end_date, current_end_date,
+ *     days_moved_forward, installments, first_invoice_date
+ *   }
+ */
+export async function getLoanSummary(customer) {
+  if (!customer) throw new Error('getLoanSummary: customer required');
+  const r = await callFrappe('GET',
+    `/api/method/elegansky.api.get_loan_summary${buildQueryString({ customer: String(customer) })}`);
+  return r.message || r;
+}
+
+/**
  * Cancel + delete a payment we previously pushed. Idempotent.
  */
 export async function reversePayment(txnId) {
