@@ -1250,6 +1250,110 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
   // ('MANUALLY HELD — pending asOf/Phase-2 fix') to block kibo1900 + kibo2100
   // from auto-firing during the recall+re-fire. Run AFTER verification.
   // ───────────────────────────────────────────────────────────────────────
+  // GET /api/admin/savcom/reconcile-batch?batch_id=<uuid or short>
+  // Per-customer, per-payment, per-invoice reconciliation of a SAV Frappe
+  // batch — used by Frank 2026-07-02 to verify the new due_date-ASC
+  // allocator applied the pay-today-first rule correctly.
+  //
+  // For each customer in the batch:
+  //   - Sum their bank txn(s) into total_paid
+  //   - For each invoice they paid, look up its due_date via getOpenInvoices
+  //   - Return the allocation ordered by payment_uploads.id (insertion order,
+  //     which equals allocation order in allocateByDueDateAsc)
+  //   - Tag each invoice: TODAY | PAST | FUTURE relative to bank txn's real EAT date
+  app.get('/api/admin/savcom/reconcile-batch', requireSecretOrJwt, async (req, res) => {
+    try {
+      const id = String(req.query.batch_id || '');
+      if (!id) return res.status(400).json({ error: 'batch_id required' });
+      let fullId = id;
+      if (id.length < 36) {
+        const rr = await db().query(`SELECT id FROM payment_batches WHERE id::text LIKE $1 LIMIT 1`, [id + '%']);
+        if (!rr.rows.length) return res.status(404).json({ error: 'batch not found' });
+        fullId = rr.rows[0].id;
+      }
+      const batch = await db().query(
+        `SELECT id, channel, status, txn_date, paid_count, unused_count, paid_total, unused_total, created_by, created_at
+           FROM payment_batches WHERE id=$1`, [fullId]);
+      if (!batch.rows.length) return res.status(404).json({ error: 'batch not found' });
+      const paidRows = await db().query(
+        `SELECT id, bank_ref, customer_name, customer_id, invoice_no, qb_id, amount, status
+           FROM payment_uploads WHERE batch_id=$1 AND kind='payment' AND invoice_no IS NOT NULL
+           ORDER BY id ASC`, [fullId]);
+      // Also pull consumed_transactions to get sheet timestamp per bank_ref
+      // (needed to compute the txn's real EAT date for today-tag).
+      const cts = await db().query(
+        `SELECT bank_ref, sheet_ts FROM consumed_transactions WHERE batch_id=$1`, [fullId]);
+      const tsByRef = new Map(cts.rows.map((r) => [r.bank_ref, r.sheet_ts]));
+
+      // Group by customer.
+      const byCust = new Map();
+      for (const r of paidRows.rows) {
+        const cust = r.customer_name || '?';
+        if (!byCust.has(cust)) byCust.set(cust, { customer: cust, customer_id: r.customer_id, txns: new Map(), invoice_order: [] });
+        const e = byCust.get(cust);
+        if (!e.txns.has(r.bank_ref)) {
+          const ts = tsByRef.get(r.bank_ref);
+          const realEat = ts ? toEatYmd(new Date(ts).getTime()) : null;
+          e.txns.set(r.bank_ref, { bank_ref: r.bank_ref, real_eat_date: realEat, total_paid: 0 });
+        }
+        const t = e.txns.get(r.bank_ref);
+        t.total_paid += Number(r.amount || 0);
+        e.invoice_order.push({
+          bank_ref: r.bank_ref,
+          invoice_no: r.invoice_no,
+          amount: Number(r.amount || 0),
+        });
+      }
+
+      // Fetch each customer's open invoices from Frappe to look up due_date.
+      // Parallel — 27 customers × ~500ms = ~14 sec worst case.
+      const perCust = [];
+      await Promise.all([...byCust.entries()].map(async ([cust, e]) => {
+        let dueMap = new Map();
+        try {
+          const r = await getOpenInvoices(cust);
+          for (const inv of (r.invoices || [])) {
+            dueMap.set(inv.name, { due_date: inv.due_date, posting_date: inv.posting_date, is_moved_forward: !!inv.is_moved_forward, outstanding: Number(inv.outstanding_amount) || 0 });
+          }
+        } catch (err) {
+          e.frappe_error = err.message;
+        }
+        // Attach due_date + tag to each allocation
+        for (const alloc of e.invoice_order) {
+          const meta = dueMap.get(alloc.invoice_no);
+          alloc.due_date = meta?.due_date || null;
+          alloc.is_moved_forward = meta?.is_moved_forward || false;
+          alloc.outstanding_at_pull = meta?.outstanding || null;
+          // Tag TODAY/PAST/FUTURE relative to this bank_ref's real EAT date.
+          const txn = e.txns.get(alloc.bank_ref);
+          const real = txn?.real_eat_date;
+          if (!real || !alloc.due_date) alloc.tag = '?';
+          else if (alloc.due_date === real) alloc.tag = 'TODAY';
+          else if (alloc.due_date < real) alloc.tag = 'PAST';
+          else alloc.tag = 'FUTURE';
+        }
+        perCust.push({
+          customer: e.customer,
+          customer_id: e.customer_id,
+          txns: [...e.txns.values()],
+          total_paid: e.invoice_order.reduce((s, a) => s + a.amount, 0),
+          allocations: e.invoice_order,
+          frappe_error: e.frappe_error,
+        });
+      }));
+
+      perCust.sort((a, b) => a.customer.localeCompare(b.customer));
+      res.json({
+        batch: batch.rows[0],
+        customer_count: perCust.length,
+        customers: perCust,
+      });
+    } catch (err) {
+      console.error('[savcom-reconcile-batch]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/admin/savcom/lift-recall-gates', requireSecretOrJwt, async (req, res) => {
     try {
       const r = await db().query(`
