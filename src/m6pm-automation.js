@@ -840,7 +840,19 @@ function broadcastPhones() {
 // end-to-end (NMB scrape + CRDB scrape + Frappe per-customer calls + CDC
 // poller catch-up) and was false-alarming + suppressing the real success
 // SMS that should have followed at +27min. 35 gives 8 min headroom.
-const FAILURE_GRACE_MIN = 35;
+// Frank 2026-07-02: raised 35→90 min. The tick-notif watcher used to
+// treat "no outcome by +35min" as a failure and blast admins with
+// "no worker outcome" SMS. But the QB worker itself has a 10-min retry
+// loop and NMB scrapes sometimes take 30+ min under network delay —
+// so the 35-min timer was firing FALSE alarms for slow-but-fine ticks.
+//
+// Contract now: rely on the worker's EXPLICIT outcome.status='fail'
+// signal for real failures (fires instantly, message is authoritative).
+// The timer alarm here is a very-late BACKSTOP only — kicks in only
+// when the worker goes completely silent (probable crash / stuck
+// process, needs human eyes). Wording softened accordingly so admins
+// know it's an uncertainty flag, not a confirmed failure.
+const FAILURE_GRACE_MIN = 90;
 const HEARTBEAT_PRE_TICK_MIN = 15; // pre-tick phone-online check
 // Heartbeat staleness threshold. Default 10 min — brain-ping APK reports at
 // ~3-6 min cadence (battery-friendly), so 5 min generated false-positive
@@ -1541,27 +1553,27 @@ async function tickResultNotifierWatcher({ pool }) {
         text = `BRAIN ${tick} ✗ worker: ${reason}`;
         resultLabel = 'err';
       } else {
-        // No worker outcome reported. Within grace → wait for next 60s
-        // tick (worker may still be running). Past grace → check if an
-        // upload is ACTIVELY in flight (fresh auto_upload_locks heartbeat).
-        // If yes, KEEP WAITING — false alarms from a slow tick used to
-        // suppress the real success SMS that followed at +27min. Only
-        // fire "no outcome" if past grace AND nothing actively running.
-        if (minutesPastTick < FAILURE_GRACE_MIN) {
-          await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
-          continue;
-        }
-        const inFlight = await isUploadInFlight(pool);
-        if (inFlight) {
-          console.log(`[m6pm/tick-notif] ${tick} past +${FAILURE_GRACE_MIN}min but ${inFlight.channel} still actively running (locked_at=${inFlight.locked_at}) — extending wait`);
-          await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
-          continue;
-        }
-        const hints = await detectStaleSubsystems(pool);
-        text = hints.length
-          ? `BRAIN ${tick} ✗ no worker outcome by +${FAILURE_GRACE_MIN}min — ${hints.join(' + ')} stale`
-          : `BRAIN ${tick} ✗ no worker outcome by +${FAILURE_GRACE_MIN}min — all subsystems look healthy, investigate worker logs`;
-        resultLabel = 'err_no_outcome';
+        // Frank 2026-07-02: NO timer-based "no outcome" SMS. Ever.
+        //
+        // Contract: this watcher fires SMS ONLY on the worker's EXPLICIT
+        // outcome.status = 'ok' | 'fail' signals. Both arrive via the
+        // agent-session outcome recording, and both are authoritative.
+        // Real worker failures fire the '✗ worker: reason' SMS in the
+        // outcome.status='fail' branch above — instant, accurate, no
+        // ambiguity.
+        //
+        // If the worker goes completely silent (crash, hang, network
+        // partition), that's caught by a DIFFERENT alerting path
+        // — the worker-liveness heartbeat watcher — which alerts based
+        // on actual process state, not a clock. Firing a "no outcome by
+        // +Xmin" SMS from this watcher just created false alarms when
+        // ticks legitimately ran long (slow NMB scrape, network delay).
+        //
+        // So: no outcome yet → keep waiting silently. If a real fail
+        // eventually arrives, we'll send its SMS then. If it never
+        // arrives, worker-liveness catches it.
+        await pool.query(`DELETE FROM app_settings WHERE key=$1`, [notifKey]);
+        continue;
       }
     } else {
       const parts = stats.rows.map((r) => {
