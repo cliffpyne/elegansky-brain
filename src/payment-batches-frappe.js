@@ -1485,6 +1485,47 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       const dryRun = req.body?.dry_run === true;
       const testOnlyTo = req.body?.test_only_to ? String(req.body.test_only_to).trim() : null;
       const customerFilter = Array.isArray(req.body?.customer_filter) ? req.body.customer_filter : null;
+      // Frank 2026-07-02: skip customers whose most-recent sms_blast_log
+      // row shows a successful NextSMS status. Used to resume a blast
+      // that ran out of NextSMS balance mid-flight — top up + fire with
+      // retry_failed_only=true and only the 92 that failed get re-sent.
+      const retryFailedOnly = req.body?.retry_failed_only === true;
+
+      // Ensure log table exists (idempotent, cheap).
+      await db().query(`
+        CREATE TABLE IF NOT EXISTS savcom_sms_log (
+          id BIGSERIAL PRIMARY KEY,
+          batch_ref TEXT,
+          customer TEXT,
+          plate TEXT,
+          wakandi_id TEXT,
+          phone TEXT,
+          status TEXT,
+          nextsms_message_id TEXT,
+          nextsms_response JSONB,
+          message_body TEXT,
+          sent_at TIMESTAMPTZ DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS savcom_sms_log_customer_sent_idx
+          ON savcom_sms_log (customer, sent_at DESC);
+      `);
+
+      // If retry_failed_only, load recently-succeeded customers so we can skip them.
+      let succeededCustomers = new Set();
+      if (retryFailedOnly) {
+        const r = await db().query(`
+          SELECT DISTINCT ON (customer) customer, status
+            FROM savcom_sms_log
+           WHERE sent_at > now() - interval '24 hours'
+           ORDER BY customer, sent_at DESC`);
+        for (const row of r.rows) {
+          const s = row.status || '';
+          if (['PENDING','DELIVERED','PENDING_ENROUTE'].includes(s)) {
+            succeededCustomers.add(row.customer);
+          }
+        }
+      }
+      const batchRef = `blast-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
 
       // 1. Load phone sheet (Frank's pikipiki records2 tab). Column B=plate,
       //    C=name, D=phone, E=wakandi_id.
@@ -1555,8 +1596,11 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       // 3. Iterate targets, fetch loan_summary, format body, resolve phone.
       const preview = [];
       const messages = [];
+      const messageCustomers = [];  // parallel to messages — tracks per-message customer info for log
       const errors = [];
+      let skippedRecent = 0;
       for (const c of targets) {
+        if (retryFailedOnly && succeededCustomers.has(c.customer)) { skippedRecent++; continue; }
         const plate = (c.plate || '').toUpperCase().trim();
         const wid = (c.wakandi_member_id || '').trim();
         const nnorm = norm(c.display_name || c.customer);
@@ -1573,6 +1617,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         const body = buildBody(c, summary);
         preview.push({ customer: c.customer, plate, wakandi_id: wid, phone, chars: body.length, body_preview: body });
         messages.push({ to: testOnlyTo || phone, text: body });
+        messageCustomers.push({ customer: c.customer, plate, wakandi_id: wid, phone, body });
       }
 
       if (dryRun) {
@@ -1600,6 +1645,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       const CHUNK = 100;
       for (let i = 0; i < messages.length; i += CHUNK) {
         const chunk = messages.slice(i, i + CHUNK);
+        const chunkCust = messageCustomers.slice(i, i + CHUNK);
         try {
           const r = await fetch('https://messaging-service.co.tz/api/sms/v1/text/multi', {
             method: 'POST',
@@ -1609,27 +1655,80 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
           });
           const j = await r.json().catch(() => ({}));
           const msgs = j?.messages || [];
-          for (const msg of msgs) {
-            const gn = msg?.status?.groupName || '';
+          // Persist each per-recipient status so retry_failed_only can filter.
+          const logRows = [];
+          for (let mi = 0; mi < chunk.length; mi++) {
+            const msg = msgs[mi];
+            const cust = chunkCust[mi];
+            const gn = msg?.status?.groupName || 'UNKNOWN';
             if (gn === 'PENDING' || gn === 'DELIVERED' || gn === 'PENDING_ENROUTE') sentOk++;
             else sentErr++;
+            logRows.push([batchRef, cust.customer, cust.plate, cust.wakandi_id, cust.phone,
+              gn, msg?.messageId || null, JSON.stringify(msg?.status || null), cust.body]);
           }
-          if (msgs.length < chunk.length) sentErr += (chunk.length - msgs.length);
+          if (logRows.length > 0) {
+            const placeholders = logRows.map((_, ri) => {
+              const base = ri * 9;
+              return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5},$${base+6},$${base+7},$${base+8}::jsonb,$${base+9})`;
+            }).join(',');
+            const flat = logRows.flat();
+            await db().query(
+              `INSERT INTO savcom_sms_log
+                 (batch_ref, customer, plate, wakandi_id, phone, status, nextsms_message_id, nextsms_response, message_body)
+               VALUES ${placeholders}`, flat);
+          }
           rawResponses.push(j);
         } catch (e) {
           sentErr += chunk.length;
           rawResponses.push({ error: String(e.message || e).slice(0, 200) });
+          // Log the chunk as HTTP_FAILURE so retry picks them up.
+          const logRows = chunkCust.map((cust) => [batchRef, cust.customer, cust.plate, cust.wakandi_id, cust.phone,
+            'HTTP_FAILURE', null, JSON.stringify({error: String(e.message || e).slice(0, 200)}), cust.body]);
+          if (logRows.length > 0) {
+            const placeholders = logRows.map((_, ri) => {
+              const base = ri * 9;
+              return `($${base+1},$${base+2},$${base+3},$${base+4},$${base+5},$${base+6},$${base+7},$${base+8}::jsonb,$${base+9})`;
+            }).join(',');
+            await db().query(
+              `INSERT INTO savcom_sms_log
+                 (batch_ref, customer, plate, wakandi_id, phone, status, nextsms_message_id, nextsms_response, message_body)
+               VALUES ${placeholders}`, logRows.flat());
+          }
+        }
+      }
+      // Distribution of NextSMS statuses across all responses (debugging aid).
+      const statusCounts = {};
+      const failedRecipients = [];
+      for (let idx = 0; idx < rawResponses.length; idx++) {
+        const j = rawResponses[idx];
+        const msgs = j?.messages || [];
+        for (let mi = 0; mi < msgs.length; mi++) {
+          const m = msgs[mi];
+          const gn = m?.status?.groupName || m?.status?.name || 'UNKNOWN';
+          statusCounts[gn] = (statusCounts[gn] || 0) + 1;
+          if (!['PENDING','DELIVERED','PENDING_ENROUTE'].includes(gn)) {
+            failedRecipients.push({
+              to: m?.to,
+              status: m?.status,
+              messageId: m?.messageId,
+            });
+          }
         }
       }
       res.json({
         dry_run: false,
+        batch_ref: batchRef,
+        retry_failed_only: retryFailedOnly,
         total_targets: targets.length,
+        skipped_recent_success: skippedRecent,
         messages_sent: messages.length,
         sms_ok: sentOk,
         sms_error: sentErr,
         errors_count: errors.length,
         errors_sample: errors.slice(0, 10),
         preview_sample: preview.slice(0, 3),
+        nextsms_status_distribution: statusCounts,
+        failed_recipients_sample: failedRecipients.slice(0, 15),
       });
     } catch (err) {
       console.error('[savcom-sms-blast]', err);
