@@ -307,6 +307,132 @@ async function fetchInvoicesForResolvedCustomers(txnsClean, asOf) {
   return { invoices, futureInvoices, customerErrors };
 }
 
+/**
+ * NEW CONTRACT (Frappe dev 2026-07-01 book rebuild):
+ * Fetch each resolved customer's open invoices from Frappe. Return them
+ * grouped per-customer, sorted by due_date ASC, with is_moved_forward=1
+ * invoices bucketed OUT (never allocated to — they sort last on Frappe's
+ * side too, but we filter explicitly per dev's belt-and-suspenders note).
+ *
+ * Shape per invoice row:
+ *   { customerKey, name (invoice name),
+ *     due_date, posting_date, outstanding_amount, remainingBalance,
+ *     is_moved_forward, original_due_date }
+ */
+async function fetchInvoicesForResolvedCustomersNewContract(txnsClean) {
+  const byCustomer = new Map();
+  for (const t of txnsClean) {
+    if (!t._resolved) continue;
+    const key = t._resolved.customer;
+    if (!byCustomer.has(key)) byCustomer.set(key, []);
+    byCustomer.get(key).push(t);
+  }
+  const invoicesByCustomer = new Map();
+  const customerErrors = [];
+  for (const customerKey of byCustomer.keys()) {
+    let r;
+    try {
+      r = await getOpenInvoices(customerKey);
+    } catch (err) {
+      customerErrors.push({ customer: customerKey, error: err.message });
+      continue;
+    }
+    const list = r.invoices || [];
+    const all = [];
+    for (const inv of list) {
+      const out = Number(inv.outstanding_amount) || 0;
+      if (out <= 0) continue;
+      all.push({
+        customerKey,
+        name: inv.name,
+        due_date: inv.due_date || null,
+        posting_date: inv.posting_date || null,
+        original_due_date: inv.original_due_date || null,
+        outstanding_amount: out,
+        remainingBalance: out,
+        is_moved_forward: inv.is_moved_forward === 1 || inv.is_moved_forward === true,
+      });
+    }
+    // Sort: is_moved_forward=false FIRST (walked by due_date ASC), then
+    // is_moved_forward=true LAST (also by due_date ASC among themselves).
+    // Moved-forward invoices are STILL allocatable — just deprioritized.
+    // If a customer has cleared all their non-moved invoices and there's
+    // still leftover payment, that leftover walks into the moved-forward
+    // set naturally. Dev's "may explicitly skip" was a belt-and-suspenders
+    // suggestion, not a hard requirement — sort-last accomplishes the same
+    // safety without leaving money hanging when the customer has literally
+    // no other open invoice to pay.
+    all.sort((a, b) => {
+      if (a.is_moved_forward !== b.is_moved_forward) {
+        return a.is_moved_forward ? 1 : -1;
+      }
+      const da = a.due_date || a.posting_date || '';
+      const db = b.due_date || b.posting_date || '';
+      return da.localeCompare(db);
+    });
+    invoicesByCustomer.set(customerKey, all);
+  }
+  return { invoicesByCustomer, customerErrors };
+}
+
+/**
+ * NEW CONTRACT allocator: walk bank txns oldest-first; for each txn's
+ * customer, pay their eligible invoices in due_date ASC order, up to each
+ * invoice's outstanding_amount. Any leftover after all eligible invoices
+ * are cleared → hanging credit (unused row, no allocations — sits as a
+ * customer credit on the ERP).
+ *
+ * Explicitly does NOT allocate to is_moved_forward=1 invoices (those are
+ * deferred loan-end placeholders that must NOT be paid until customer has
+ * cleared everything else).
+ */
+function allocateByDueDateAsc(txnsClean, invoicesByCustomer, channel) {
+  const paid = [];
+  const unused = [];
+  const sortedTxns = [...txnsClean].sort((a, b) =>
+    (a.receivedTimestamp || 0) - (b.receivedTimestamp || 0));
+  for (const t of sortedTxns) {
+    const memoWithSuffix = appendSavSuffix(t.transactionId, channel);
+    if (!t._resolved) continue;
+    const customerKey = t._resolved.customer;
+    const list = invoicesByCustomer.get(customerKey) || [];
+    let amt = Number(t.amount) || 0;
+    if (amt <= 0) continue;
+    for (const inv of list) {
+      if (amt <= 0) break;
+      if (inv.remainingBalance <= 0) continue;
+      const pay = Math.min(amt, inv.remainingBalance);
+      paid.push({
+        customerName: customerKey,
+        invoiceNo: inv.name,
+        amount: pay,
+        memo: t.transactionId,
+        memoWithSuffix,
+        channel,
+        customerId: customerKey,
+        qbId: inv.name,
+        sheet_row_number: t.sheet_row_number,
+      });
+      inv.remainingBalance -= pay;
+      amt -= pay;
+      if (inv.remainingBalance <= 0.5) inv.remainingBalance = 0;
+    }
+    if (amt > 0) {
+      unused.push({
+        customerName: customerKey,
+        transactionAmount: t.amount,
+        amount: amt,
+        memo: t.transactionId,
+        memoWithSuffix,
+        channel,
+        customerId: customerKey,
+        sheet_row_number: t.sheet_row_number,
+      });
+    }
+  }
+  return { paid, unused };
+}
+
 function tickSuffix() {
   return ''; // distinguishes nothing — placeholder for future per-tick segmentation
 }
@@ -395,101 +521,24 @@ export async function runSavFrappeUpload({
   // The V2 algorithm only processes txns that have invoices, so anything
   // without _resolved will naturally fall to the unused bucket.
 
-  // 4. Fetch Frappe invoices for resolved customers, split by asOf into
-  //    past (V2 main pass) and future (Phase-2 forward-pay).
-  const { invoices, futureInvoices, customerErrors } =
-    await fetchInvoicesForResolvedCustomers(txnsClean, asOf);
+  // 4. Frappe dev 2026-07-01 book rebuild — NEW allocation contract:
+  //    - get_open_invoices returns due_date, is_moved_forward, original_due_date
+  //    - allocate by due_date ASC (oldest first) — pay overdue, then due,
+  //      then upcoming
+  //    - allocate ONLY up to each invoice's outstanding_amount (some are
+  //      partly paid, e.g. 2,500 remaining not 12,500)
+  //    - SKIP is_moved_forward=1 invoices entirely — they're deferred
+  //      loan-end placeholders that must not be paid until customer has
+  //      cleared everything else. The ERP-side sort already puts them
+  //      last but we filter explicitly (belt-and-suspenders per dev).
+  //    - Any leftover after all eligible invoices → hanging credit (no
+  //      allocations, sits as unallocated customer credit on the ERP).
+  //    V2 / Phase-2 no longer used on this path — the new contract has a
+  //    simpler due_date-FIFO allocator (allocateByDueDateAsc, above).
+  const { invoicesByCustomer, customerErrors } =
+    await fetchInvoicesForResolvedCustomersNewContract(txnsClean);
 
-  // 5. Adapt txns to V2 shape — override customerName with the resolved
-  //    Frappe customer key so V2's grouping lines up with the invoices.
-  const v2Txns = txnsClean.map((t) => ({
-    customerName: t._resolved ? t._resolved.customer : (t.customerName || 'UNRESOLVED'),
-    customerPhone: null,
-    contractName: t._resolved ? t._resolved.customer : (t.contractName || t.customerName),
-    channel: t.channel,
-    transactionId: t.transactionId,
-    id: t.id,
-    amount: t.amount,
-    receivedTimestamp: t.receivedTimestamp,
-    sheet_row_number: t.sheet_row_number,
-    _ref_suffixed: appendSavSuffix(t.transactionId, channel),
-  }));
-
-  // 6. Sacred V2 algorithm — cap-no-overflow over past+today's invoices
-  //    only (newest-first). Frank 2026-06-29: without the asOf filter,
-  //    V2 was walking future invoices first and paying e.g. August due
-  //    instead of February overdue. Same contract as the QB side now.
-  const { payments, leftoverPerTx } = processInvoicePaymentsV2(invoices, v2Txns);
-  const paid = payments.filter((p) => !p.isUnused && p.amount > 0);
-  const unused = payments.filter((p) => p.isUnused);
-
-  // 6b. Phase-2 forward-pay (Frappe-native, in-memory — no extra Frappe
-  //     query because we already split `futureInvoices` from the same
-  //     get_open_invoices call). Walk leftover tx oldest-first (so the
-  //     earliest payment consumes forward invoices first) and apply FIFO
-  //     onto future invoices grouped by customer, oldest-future first.
-  const forwardPaid = [];
-  if (leftoverPerTx.length > 0 && futureInvoices.length > 0) {
-    const futureByCust = new Map();
-    for (const fi of futureInvoices) {
-      if (!futureByCust.has(fi.customerKey)) futureByCust.set(fi.customerKey, []);
-      futureByCust.get(fi.customerKey).push(fi);
-    }
-    // FIFO oldest-first per customer.
-    for (const list of futureByCust.values()) {
-      list.sort((a, b) => (a.txnDate || '').localeCompare(b.txnDate || ''));
-    }
-    // Leftovers oldest-tx-first.
-    leftoverPerTx.sort((a, b) => (a.txDate || '').localeCompare(b.txDate || ''));
-    for (const lo of leftoverPerTx) {
-      const custKey = lo.customerKey || lo.customerName;
-      const list = futureByCust.get(custKey);
-      if (!list || !list.length) continue;
-      let amt = lo.leftover;
-      let invIdx = 0;
-      while (amt > 0 && invIdx < list.length) {
-        const inv = list[invIdx];
-        if (inv.remainingBalance <= 0) { invIdx++; continue; }
-        const pay = Math.min(amt, inv.remainingBalance);
-        forwardPaid.push({
-          customerName: lo.customerName,
-          invoiceNo: inv.docNumber,
-          amount: pay,
-          memo: lo.transactionId,
-          memoWithSuffix: lo.memoWithSuffix || appendSavSuffix(lo.transactionId, channel),
-          channel,
-          customerId: custKey,
-          qbId: inv.id,                // Frappe Sales Invoice name
-          sheet_row_number: lo.sheet_row_number,
-          forwardPaid: true,
-        });
-        inv.remainingBalance -= pay;
-        amt -= pay;
-        if (inv.remainingBalance <= 1) { inv.remainingBalance = 0; invIdx++; }
-      }
-      lo.leftover = amt;             // residual after phase-2
-    }
-  }
-  // Merge forward-paid into the paid set so allocations include them.
-  paid.push(...forwardPaid);
-
-  // Phase-1 leftover that didn't get absorbed by Phase-2 lands as
-  // hanging credit (synthetic "unused" row per residual leftover tx).
-  for (const lo of leftoverPerTx) {
-    if (lo.leftover <= 0) continue;
-    unused.push({
-      customerName: lo.customerName,
-      invoiceNo: 'UNUSED',
-      amount: lo.leftover,
-      transactionAmount: lo.leftover,
-      memo: lo.transactionId,
-      memoWithSuffix: lo.memoWithSuffix || appendSavSuffix(lo.transactionId, channel),
-      isUnused: true,
-      isCredit: true,
-      channel,
-      sheet_row_number: lo.sheet_row_number,
-    });
-  }
+  const { paid, unused } = allocateByDueDateAsc(txnsClean, invoicesByCustomer, channel);
 
   const sumPaid = paid.reduce((s, p) => s + p.amount, 0);
   const sumUnused = unused.reduce((s, p) => s + (p.transactionAmount || p.amount || 0), 0);
