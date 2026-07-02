@@ -1090,7 +1090,14 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     };
 
     try {
-      // 2. Live scope query — 22 batches, 535 posted refs, 656 total refs.
+      // Optional targeted-recall filter (Frank 2026-07-02): pass batch_ids
+      // to limit the recall to specific batches instead of ALL finalized
+      // SAV batches. Used to reverse a single bad fire without touching
+      // batches the operator approved.
+      const filterIds = Array.isArray(req.body?.batch_ids) ? req.body.batch_ids.filter(Boolean) : null;
+
+      // 2. Live scope query — 22 batches, 535 posted refs, 656 total refs
+      //    (or the subset from filterIds when provided).
       const scope = await db().query(`
         SELECT pb.id AS batch_id, pb.channel, pb.created_by,
                COUNT(DISTINCT pu.bank_ref) FILTER (WHERE pu.qb_response->>'status'='posted') AS posted,
@@ -1100,9 +1107,10 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
           LEFT JOIN payment_uploads pu ON pu.batch_id = pb.id AND pu.status='pushed_to_frappe'
          WHERE pb.channel IN ('sav_nmb','sav_crdb')
            AND pb.status = 'finalized'
+           AND ($1::uuid[] IS NULL OR pb.id = ANY($1::uuid[]))
          GROUP BY pb.id
          HAVING COUNT(pu.id) > 0
-         ORDER BY pb.created_at`);
+         ORDER BY pb.created_at`, [filterIds]);
       const batchIds = scope.rows.map((r) => r.batch_id);
 
       // Posted refs to reverse (BRAIN-created ACC-PAY-2026-XXXXX).
