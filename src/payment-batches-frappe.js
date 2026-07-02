@@ -1306,14 +1306,29 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       }
 
       // Fetch each customer's open invoices from Frappe to look up due_date.
-      // Parallel — 27 customers × ~500ms = ~14 sec worst case.
+      // Also — the batch's txn_date is our best fallback if a specific txn's
+      // real_eat_date isn't available (dry-runs clear consumed_transactions,
+      // so sheet_ts lookups return empty). In that case use txn_date as the
+      // "today" boundary — it matches how the operator thinks about the fire.
+      const batchTxnDate = batch.rows[0].txn_date
+        ? new Date(batch.rows[0].txn_date).toISOString().slice(0, 10)
+        : null;
       const perCust = [];
       await Promise.all([...byCust.entries()].map(async ([cust, e]) => {
         let dueMap = new Map();
+        let allOpenInvoices = [];  // full statement of customer's open invoices
         try {
           const r = await getOpenInvoices(cust);
           for (const inv of (r.invoices || [])) {
-            dueMap.set(inv.name, { due_date: inv.due_date, posting_date: inv.posting_date, is_moved_forward: !!inv.is_moved_forward, outstanding: Number(inv.outstanding_amount) || 0 });
+            const rec = {
+              invoice_no: inv.name,
+              due_date: inv.due_date,
+              posting_date: inv.posting_date,
+              is_moved_forward: !!inv.is_moved_forward,
+              outstanding: Number(inv.outstanding_amount) || 0,
+            };
+            dueMap.set(inv.name, rec);
+            allOpenInvoices.push(rec);
           }
         } catch (err) {
           e.frappe_error = err.message;
@@ -1324,20 +1339,70 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
           alloc.due_date = meta?.due_date || null;
           alloc.is_moved_forward = meta?.is_moved_forward || false;
           alloc.outstanding_at_pull = meta?.outstanding || null;
-          // Tag TODAY/PAST/FUTURE relative to this bank_ref's real EAT date.
+          // Tag TODAY/PAST/FUTURE relative to this bank_ref's real EAT date,
+          // falling back to the batch's txn_date if sheet_ts wasn't preserved.
           const txn = e.txns.get(alloc.bank_ref);
-          const real = txn?.real_eat_date;
-          if (!real || !alloc.due_date) alloc.tag = '?';
-          else if (alloc.due_date === real) alloc.tag = 'TODAY';
-          else if (alloc.due_date < real) alloc.tag = 'PAST';
+          const boundary = txn?.real_eat_date || batchTxnDate;
+          if (!boundary || !alloc.due_date) alloc.tag = '?';
+          else if (alloc.due_date === boundary) alloc.tag = 'TODAY';
+          else if (alloc.due_date < boundary) alloc.tag = 'PAST';
           else alloc.tag = 'FUTURE';
         }
+        // Bucket + sort within each bucket by due_date ASC. This mirrors
+        // the allocator's walk order (TODAY → PAST asc → FUTURE asc) so
+        // Frank can verify the rule was applied even if DB row order lost
+        // the insertion sequence (payment_uploads.id is UUID, not sequential).
+        const today = e.invoice_order.filter((a) => a.tag === 'TODAY');
+        const past = e.invoice_order.filter((a) => a.tag === 'PAST')
+          .sort((a, b) => (a.due_date || '').localeCompare(b.due_date || ''));
+        const future = e.invoice_order.filter((a) => a.tag === 'FUTURE')
+          .sort((a, b) => (a.due_date || '').localeCompare(b.due_date || ''));
+        const unknown = e.invoice_order.filter((a) => a.tag === '?');
+        // Build Frank's requested view: FULL invoice statement per customer
+        // as-of the fire, sorted from AS_OF/txnDate going backward through
+        // arrears (due_date DESC). Each row marked with paid_this_batch if
+        // the current fire allocated any amount to it.
+        const paidByInvNo = new Map();
+        for (const a of e.invoice_order) {
+          paidByInvNo.set(a.invoice_no, (paidByInvNo.get(a.invoice_no) || 0) + a.amount);
+        }
+        const boundaryForStmt = batchTxnDate;
+        const statement = allOpenInvoices
+          .map((inv) => ({
+            due_date: inv.due_date,
+            posting_date: inv.posting_date,
+            invoice_no: inv.invoice_no,
+            outstanding_before: inv.outstanding,
+            paid_this_batch: paidByInvNo.get(inv.invoice_no) || 0,
+            outstanding_after: inv.outstanding - (paidByInvNo.get(inv.invoice_no) || 0),
+            is_moved_forward: inv.is_moved_forward,
+            tag: !boundaryForStmt || !inv.due_date ? '?'
+              : (inv.due_date === boundaryForStmt ? 'TODAY'
+                : (inv.due_date < boundaryForStmt ? 'PAST' : 'FUTURE')),
+          }))
+          // Sort: AS_OF at top, then going backward (due_date DESC)
+          .sort((a, b) => (b.due_date || '').localeCompare(a.due_date || ''));
+
         perCust.push({
           customer: e.customer,
           customer_id: e.customer_id,
           txns: [...e.txns.values()],
           total_paid: e.invoice_order.reduce((s, a) => s + a.amount, 0),
-          allocations: e.invoice_order,
+          bucket_totals: {
+            today: today.reduce((s, a) => s + a.amount, 0),
+            past:  past.reduce((s, a) => s + a.amount, 0),
+            future: future.reduce((s, a) => s + a.amount, 0),
+          },
+          allocations_by_bucket: { today, past, future, unknown },
+          // Frank's requested full-statement view — one row per open invoice
+          // (whether paid or not this batch), sorted AS_OF-first-going-back.
+          statement,
+          statement_totals: {
+            invoices: statement.length,
+            outstanding_before: statement.reduce((s, r) => s + r.outstanding_before, 0),
+            paid_this_batch: statement.reduce((s, r) => s + r.paid_this_batch, 0),
+            outstanding_after: statement.reduce((s, r) => s + r.outstanding_after, 0),
+          },
           frappe_error: e.frappe_error,
         });
       }));
