@@ -353,19 +353,14 @@ async function fetchInvoicesForResolvedCustomersNewContract(txnsClean) {
         is_moved_forward: inv.is_moved_forward === 1 || inv.is_moved_forward === true,
       });
     }
-    // Sort: is_moved_forward=false FIRST (walked by due_date ASC), then
-    // is_moved_forward=true LAST (also by due_date ASC among themselves).
-    // Moved-forward invoices are STILL allocatable — just deprioritized.
-    // If a customer has cleared all their non-moved invoices and there's
-    // still leftover payment, that leftover walks into the moved-forward
-    // set naturally. Dev's "may explicitly skip" was a belt-and-suspenders
-    // suggestion, not a hard requirement — sort-last accomplishes the same
-    // safety without leaving money hanging when the customer has literally
-    // no other open invoice to pay.
+    // Sort by due_date ASC only. is_moved_forward=1 invoices have their
+    // due_date automatically set to the end of the customer's schedule
+    // (loan end) — they land at the tail naturally, no special-casing
+    // needed. Bank money walks: earliest overdue → due today → next few
+    // days → weeks out → moved-forward + penalties at the end. Dev's
+    // "belt-and-suspenders skip" suggestion isn't needed — the field is
+    // just informational, not a filter (Frank 2026-07-01).
     all.sort((a, b) => {
-      if (a.is_moved_forward !== b.is_moved_forward) {
-        return a.is_moved_forward ? 1 : -1;
-      }
       const da = a.due_date || a.posting_date || '';
       const db = b.due_date || b.posting_date || '';
       return da.localeCompare(db);
