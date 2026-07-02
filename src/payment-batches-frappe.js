@@ -371,15 +371,47 @@ async function fetchInvoicesForResolvedCustomersNewContract(txnsClean) {
 }
 
 /**
- * NEW CONTRACT allocator: walk bank txns oldest-first; for each txn's
- * customer, pay their eligible invoices in due_date ASC order, up to each
- * invoice's outstanding_amount. Any leftover after all eligible invoices
- * are cleared → hanging credit (unused row, no allocations — sits as a
- * customer credit on the ERP).
+ * Extract EAT calendar date (YYYY-MM-DD) from a UTC millisecond timestamp.
+ * Used to identify "today's invoice" (invoice.due_date == txn's real EAT
+ * arrival date), regardless of the AS_OF/TxnDate cutoff shift. Payments
+ * that arrived at 17:00 EAT on 2026-07-01 have TxnDate=2026-07-02 (per
+ * the 16:16 EAT cutoff), but the customer paid on 07-01 — so 07-01's
+ * invoice should still be the "today" priority for that payment.
+ */
+function toEatYmd(utcMs) {
+  if (!utcMs) return null;
+  const eatMs = Number(utcMs) + 3 * 3600 * 1000;
+  const d = new Date(eatMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * NEW CONTRACT allocator (Frank 2026-07-01):
+ * For each customer's bank payment, walk their open invoices in THIS order:
+ *   1. Today's invoice   — invoice whose due_date matches the txn's REAL
+ *                          EAT calendar date (NOT the TxnDate — evening
+ *                          txns after 16:16 EAT have TxnDate=tomorrow but
+ *                          the customer paid TODAY, so today's invoice
+ *                          gets priority)
+ *   2. Past invoices     — oldest first, walking forward by due_date ASC
+ *                          (oldest overdue → next-oldest → … → yesterday)
+ *   3. Future invoices   — tomorrow first, walking forward by due_date ASC
+ *                          (tomorrow → day-after → … → moved-forward at end)
  *
- * Explicitly does NOT allocate to is_moved_forward=1 invoices (those are
- * deferred loan-end placeholders that must NOT be paid until customer has
- * cleared everything else).
+ * Multiple invoices due exactly today (rare): pay them together first,
+ * then move to oldest past. Any leftover after all invoices are cleared →
+ * hanging credit (unused row, no allocations, sits as customer credit).
+ *
+ * is_moved_forward=1 invoices are NOT filtered — they carry due_dates set
+ * to the customer's loan end so they naturally land at the tail of the
+ * future bucket. Penalties, moved-forward, whatever — the sort by
+ * due_date handles them uniformly.
+ *
+ * Bank txns are walked oldest-first (by receivedTimestamp) so earlier
+ * payments consume earlier invoices before later payments compete.
  */
 function allocateByDueDateAsc(txnsClean, invoicesByCustomer, channel) {
   const paid = [];
@@ -393,7 +425,23 @@ function allocateByDueDateAsc(txnsClean, invoicesByCustomer, channel) {
     const list = invoicesByCustomer.get(customerKey) || [];
     let amt = Number(t.amount) || 0;
     if (amt <= 0) continue;
+
+    // Build walk order: today (by real EAT date) → past ASC → future ASC.
+    // `list` is already due_date ASC from the fetcher, so partitioning
+    // preserves order within past/future.
+    const realDate = toEatYmd(t.receivedTimestamp);
+    const todays = [];
+    const past = [];
+    const future = [];
     for (const inv of list) {
+      const dd = inv.due_date || inv.posting_date || '';
+      if (realDate && dd === realDate) todays.push(inv);
+      else if (realDate && dd < realDate) past.push(inv);
+      else future.push(inv);
+    }
+    const walkOrder = [...todays, ...past, ...future];
+
+    for (const inv of walkOrder) {
       if (amt <= 0) break;
       if (inv.remainingBalance <= 0) continue;
       const pay = Math.min(amt, inv.remainingBalance);
