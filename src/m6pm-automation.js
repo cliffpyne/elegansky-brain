@@ -804,7 +804,15 @@ const TICK_SCHEDULE_EAT = [
   { tick: 'loolmalas1000', hour: 10, min: 0 },
   { tick: 'lengai1230', hour: 12, min: 30 },
   { tick: 'mawenzi1400', hour: 14, min: 0 },
-  { tick: 'kili1615', hour: 16, min: 15 },
+  // Frank 2026-07-02: env-driven override for the kili1615 tick until
+  // Sunday. Set KILI_HOUR_OVERRIDE=17 KILI_MIN_OVERRIDE=0 to shift the
+  // last-tick-of-the-day cutoff to 17:00 EAT. Unset both to revert to
+  // the standard 16:15. Label stays 'kili1615' for backward compat with
+  // report watchers + comparison endpoints that match on the tick name.
+  { tick: 'kili1615',
+    hour: Number(process.env.KILI_HOUR_OVERRIDE) || 16,
+    min:  Number.isFinite(Number(process.env.KILI_MIN_OVERRIDE))
+            ? Number(process.env.KILI_MIN_OVERRIDE) : 15 },
   { tick: 'kibo1900', hour: 19, min: 0 },
   { tick: 'kibo2100', hour: 21, min: 0 },
 ];
@@ -1847,7 +1855,13 @@ const SAVCOM_POST_TICK_GRACE_MIN = Number(process.env.SAVCOM_POST_TICK_GRACE_MIN
 function asOfAndTxnDateForTick(hour, min) {
   const ymd = todayYmdEat();
   const tickMin = hour * 60 + min;
-  const CUTOFF = 16 * 60 + 16; // 16:16 EAT
+  // Same env-var override as the tick schedule — moves the AS_OF/TxnDate
+  // cutoff (default 16:16 EAT) so txns received in the extended window
+  // still get today's TxnDate. AS_OF_CUTOFF_MIN_OVERRIDE = total minutes
+  // since midnight EAT (e.g. 17*60+1 = 1021 for 17:01 cutoff).
+  const CUTOFF = Number.isFinite(Number(process.env.AS_OF_CUTOFF_MIN_OVERRIDE))
+    ? Number(process.env.AS_OF_CUTOFF_MIN_OVERRIDE)
+    : (16 * 60 + 16); // default 16:16 EAT
   if (tickMin < CUTOFF) return { asOf: ymd, txnDate: ymd };
   // tomorrow's date in EAT
   const d = new Date(ymd + 'T00:00:00Z');
