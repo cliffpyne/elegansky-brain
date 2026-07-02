@@ -164,6 +164,18 @@ function parseTsAny(s) {
       return new Date(`${m[3]}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}T00:00:00Z`);
     }
   }
+  // Format 4: YYYY-MM-DD (ISO date-only) — appears in SAV_CRDB historical
+  // rows. Without this, parseTsAny returns null, and the previous readSav
+  // code (line 229, sans-continue) INCLUDED null-ts rows in every window.
+  // Result: Feb 7 2026 rows kept getting pushed to Frappe on 06-30 fires.
+  m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    const y = +m[1], mo = +m[2], d = +m[3];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      // Interpret as EAT midnight → subtract 3h for UTC.
+      return new Date(Date.UTC(y, mo - 1, d, -3, 0, 0));
+    }
+  }
   return null;
 }
 
@@ -203,7 +215,7 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
 
   const txns = [];
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedAlreadyPushed = 0;
-  let includedBadFormat = 0;
+  let skippedBadFormat = 0;
   for (let i = 0; i < sheet.length; i++) {
     if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
     // "Fetched at" / "Frappe pushed" markers live in shifted columns
@@ -226,7 +238,12 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
     if (!dCell) { skippedNoDate++; continue; }
     const ts = parseTsAny(dCell);
     if (ts && (ts < winStart || ts >= winEnd)) { skippedOutOfWindow++; continue; }
-    if (!ts) includedBadFormat++;
+    // Bug fix (Frank 2026-07-02): null-ts rows used to be INCLUDED with
+    // receivedTimestamp=null, which meant ANY row with an unparseable date
+    // slipped through EVERY window filter and got pushed to Frappe. The
+    // Feb 7 2026 rows (ISO date-only format) hit this bug hard. Now we
+    // SKIP them and count in skipped_bad_format so it's visible.
+    if (!ts) { skippedBadFormat++; continue; }
     txns.push({
       id: sheet[i][0] || `tx-${i + 1}`,
       channel,
@@ -264,7 +281,7 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
       skipped_no_date: skippedNoDate,
       skipped_out_of_window: skippedOutOfWindow,
       skipped_already_pushed: skippedAlreadyPushed,
-      included_bad_format: includedBadFormat,
+      skipped_bad_format: skippedBadFormat,
       intra_window_dupes: intraDupes,
       max_k_row: maxKRow,
     },
@@ -1423,6 +1440,36 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       });
     } catch (err) {
       console.error('[savcom-reconcile-batch]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/admin/savcom/reverse-refs
+  // One-shot: for each bank_ref in body, call Frappe reverse_payment with
+  // the V suffix appended (matching what ingestPayment actually stored).
+  // Fixes a bug in savcom-recall where it passed unsuffixed bank_ref → Frappe
+  // returned not_found for every PE → nothing actually got reversed.
+  // Body: { bank_refs: ["19c37...CS", ...], confirm: "YES-REVERSE" }
+  app.post('/api/admin/savcom/reverse-refs', requireSecretOrJwt, async (req, res) => {
+    try {
+      const refs = Array.isArray(req.body?.bank_refs) ? req.body.bank_refs.filter(Boolean) : [];
+      if (refs.length === 0) return res.status(400).json({ error: 'bank_refs[] required' });
+      if (req.body?.confirm !== 'YES-REVERSE') return res.status(400).json({ error: "pass { confirm: 'YES-REVERSE' }" });
+      const results = [];
+      for (const ref of refs) {
+        const withV = String(ref).endsWith('V') ? String(ref) : `${ref}V`;
+        try {
+          const r = await reversePayment(withV);
+          results.push({ bank_ref: ref, txn_id_used: withV, status: r?.status || 'unknown', response: r });
+        } catch (err) {
+          results.push({ bank_ref: ref, txn_id_used: withV, status: 'error', error: err.message });
+        }
+      }
+      const ok = results.filter((r) => r.status && !['error'].includes(r.status)).length;
+      const errs = results.filter((r) => r.status === 'error').length;
+      res.json({ total: refs.length, ok, errors: errs, results });
+    } catch (err) {
+      console.error('[savcom-reverse-refs]', err);
       res.status(500).json({ error: err.message });
     }
   });
