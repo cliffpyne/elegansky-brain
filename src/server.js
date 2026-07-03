@@ -1840,6 +1840,19 @@ app.post('/api/admin/nmb-cookies', async (req, res) => {
   }
 });
 
+app.delete('/api/admin/nmb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const r = await pool.query(`DELETE FROM app_settings WHERE key='nmb_cookies_latest' RETURNING key`);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (err) {
+    console.error('[DELETE /api/admin/nmb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/internal/nmb-cookies', async (req, res) => {
   const secret = process.env.STATEMENT_REPORT_SECRET;
   if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
@@ -1886,6 +1899,19 @@ app.post('/api/admin/crdb-cookies', async (req, res) => {
     res.json({ ok: true, cookies_saved: cookies.length, source });
   } catch (err) {
     console.error('[POST /api/admin/crdb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/crdb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const r = await pool.query(`DELETE FROM app_settings WHERE key='crdb_cookies_latest' RETURNING key`);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (err) {
+    console.error('[DELETE /api/admin/crdb-cookies]', err);
     res.status(500).json({ error: err.message });
   }
 });
