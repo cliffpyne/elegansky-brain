@@ -1766,6 +1766,56 @@ app.get('/api/internal/nmb-cookies', async (req, res) => {
   }
 });
 
+app.post('/api/admin/crdb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : null;
+    if (!cookies || cookies.length === 0) {
+      return res.status(400).json({ error: 'body must be { cookies: [...] } with at least one cookie' });
+    }
+    const source = String(req.body?.source || 'worker');
+    const payload = JSON.stringify({
+      cookies,
+      saved_at: new Date().toISOString(),
+      source,
+      count: cookies.length,
+    });
+    const pool = (await import('./db/pool.js')).db();
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_cookies_latest', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [payload],
+    );
+    res.json({ ok: true, cookies_saved: cookies.length, source });
+  } catch (err) {
+    console.error('[POST /api/admin/crdb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/internal/crdb-cookies', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const r = await pool.query(`SELECT value, updated_at FROM app_settings WHERE key='crdb_cookies_latest'`);
+    if (!r.rows.length) return res.status(404).json({ error: 'no cookies stored yet' });
+    let payload;
+    try { payload = JSON.parse(r.rows[0].value); }
+    catch (e) { return res.status(500).json({ error: 'stored cookies unparseable: ' + e.message }); }
+    res.json({
+      cookies: payload.cookies || [],
+      saved_at: payload.saved_at,
+      source: payload.source,
+      db_updated_at: r.rows[0].updated_at,
+    });
+  } catch (err) {
+    console.error('[GET /api/internal/crdb-cookies]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Phone-side heartbeat — the OTP-relay phone APK POSTs this every ~60s
 // with {phone, battery_pct}. m6pm-automation's phoneHeartbeatWatcher reads
 // the table 15 min before every scheduled tick and SMSes the master admin
