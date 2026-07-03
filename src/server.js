@@ -950,6 +950,114 @@ app.get('/arrears', async (req, res) => {
   }
 });
 
+// /arrears/customer — server-side lookup for one customer's exact debt.
+// Existing /arrears?q= only filters within a single fetched page (client-side
+// after over-fetch). This endpoint paginates through the FULL QB result set,
+// filters by customer substring, and returns per-invoice rows + aggregates.
+//
+// Frank's use case: `Give me the exact debt for KIBABUKWA MBIGA PETER`
+// without paginating 17 pages client-side.
+//
+// Query: ?q=<substring, case-insensitive, matches customer or invoice#>
+//        &asOf=YYYY-MM-DD             (default: today)
+//        &excludeToday=true|false     (default false — payment code path)
+app.get('/arrears/customer', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.status(400).json({ error: 'q= required' });
+    const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
+    const excludeToday = req.query.excludeToday === '1' || req.query.excludeToday === 'true';
+    const dueOp = excludeToday ? '<' : '<=';
+
+    const customerMap = await getCustomerPathMap();
+    const qLower = q.toLowerCase();
+
+    const enrich = (inv) => {
+      const customerId = String(inv.CustomerRef?.value ?? '');
+      const customer =
+        customerMap.get(customerId) || inv.CustomerRef?.name || '(unknown customer)';
+      const parts = customer.split(':');
+      const branch = parts[0] || '(unknown)';
+      const customerLeaf = parts[parts.length - 1] || customer;
+      return {
+        qbId: inv.Id,
+        customerId,
+        date: inv.TxnDate,
+        dueDate: inv.DueDate,
+        type: 'Invoice',
+        no: inv.DocNumber || '',
+        customer,
+        branch,
+        customerLeaf,
+        memo: inv.CustomerMemo?.value || inv.PrivateNote || '',
+        balance: Number(inv.Balance ?? 0),
+        amount: Number(inv.TotalAmt ?? 0),
+      };
+    };
+
+    // Page-walk the full QB result set. All-match search (customer or docNum
+    // substring) is done in JS because QB SQL LIKE on CustomerRef isn't
+    // reliable and DocNumber is a partial-match anyway. Cheap for a single
+    // customer lookup — one round trip per 1000 QB rows.
+    const PAGE = 1000;
+    let startPos = 1;
+    const matches = [];
+    while (startPos < 200_000) {
+      const sql =
+        `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
+        `FROM Invoice WHERE Balance > '0' AND DueDate ${dueOp} '${asOf}' ` +
+        `STARTPOSITION ${startPos} MAXRESULTS ${PAGE}`;
+      const r = await qbQuery(sql);
+      const invs = r.QueryResponse?.Invoice ?? [];
+      if (!invs.length) break;
+      for (const inv of invs) {
+        const row = enrich(inv);
+        const hay = `${row.customer} ${row.no}`.toLowerCase();
+        if (hay.includes(qLower)) matches.push(row);
+      }
+      if (invs.length < PAGE) break;
+      startPos += PAGE;
+    }
+
+    matches.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+    // Aggregate per customer (unique customer names among matches).
+    const perCustomer = new Map();
+    let totalBalance = 0;
+    for (const m of matches) {
+      const key = m.customer;
+      if (!perCustomer.has(key)) {
+        perCustomer.set(key, {
+          customer: m.customer,
+          customerLeaf: m.customerLeaf,
+          branch: m.branch,
+          invoices: 0,
+          open_balance: 0,
+          partial_invoices: 0,
+        });
+      }
+      const rec = perCustomer.get(key);
+      rec.invoices++;
+      rec.open_balance += m.balance;
+      if (m.balance !== m.amount) rec.partial_invoices++;
+      totalBalance += m.balance;
+    }
+
+    res.json({
+      asOf,
+      q,
+      excludeToday,
+      total_invoices: matches.length,
+      total_open_balance: Math.round(totalBalance * 100) / 100,
+      customers: Array.from(perCustomer.values()),
+      invoices: matches,
+    });
+  } catch (err) {
+    console.error('[GET /arrears/customer]', err);
+    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
 /**
  * /api/qb/activity — list QB Payments and CreditMemos in a time window.
  *
