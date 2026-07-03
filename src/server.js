@@ -1058,6 +1058,97 @@ app.get('/arrears/customer', async (req, res) => {
   }
 });
 
+// /arrears/by-customer — ALL customers with their totals aggregated.
+// One request returns every customer that has open arrears, with their
+// combined outstanding balance across all open invoices — no per-invoice
+// noise, no pagination on the caller's side. Sorted by open_balance desc.
+//
+// Frank's use case: `list of all the arrears customers already their
+// invoice total calculated all together` — 2,965 rows total, one round trip.
+//
+// Query:
+//   ?asOf=YYYY-MM-DD        (default today)
+//   &excludeToday=true      (default false)
+//   &branch=<exact>         (optional filter, exact lowercase branch match)
+app.get('/arrears/by-customer', async (req, res) => {
+  try {
+    const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
+    const excludeToday = req.query.excludeToday === '1' || req.query.excludeToday === 'true';
+    const dueOp = excludeToday ? '<' : '<=';
+    const branchFilter = (req.query.branch || '').toString().toLowerCase();
+
+    const customerMap = await getCustomerPathMap();
+
+    const PAGE = 1000;
+    let startPos = 1;
+    const perCustomer = new Map();
+    let grandTotal = 0;
+    let scannedInvoices = 0;
+    while (startPos < 200_000) {
+      const sql =
+        `SELECT Id, DocNumber, TxnDate, DueDate, Balance, TotalAmt, CustomerRef, CustomerMemo ` +
+        `FROM Invoice WHERE Balance > '0' AND DueDate ${dueOp} '${asOf}' ` +
+        `STARTPOSITION ${startPos} MAXRESULTS ${PAGE}`;
+      const r = await qbQuery(sql);
+      const invs = r.QueryResponse?.Invoice ?? [];
+      if (!invs.length) break;
+      for (const inv of invs) {
+        scannedInvoices++;
+        const customerId = String(inv.CustomerRef?.value ?? '');
+        const customer =
+          customerMap.get(customerId) || inv.CustomerRef?.name || '(unknown customer)';
+        const parts = customer.split(':');
+        const branch = parts[0] || '(unknown)';
+        if (branchFilter && branch.toLowerCase() !== branchFilter) continue;
+        const customerLeaf = parts[parts.length - 1] || customer;
+        const balance = Number(inv.Balance ?? 0);
+        const amount = Number(inv.TotalAmt ?? 0);
+        const partial = balance !== amount;
+        if (!perCustomer.has(customer)) {
+          perCustomer.set(customer, {
+            customerId,
+            customer,
+            customerLeaf,
+            branch,
+            invoices: 0,
+            partial_invoices: 0,
+            open_balance: 0,
+            oldest_due: null,
+            newest_due: null,
+          });
+        }
+        const rec = perCustomer.get(customer);
+        rec.invoices++;
+        rec.open_balance += balance;
+        if (partial) rec.partial_invoices++;
+        if (!rec.oldest_due || (inv.DueDate && inv.DueDate < rec.oldest_due)) rec.oldest_due = inv.DueDate;
+        if (!rec.newest_due || (inv.DueDate && inv.DueDate > rec.newest_due)) rec.newest_due = inv.DueDate;
+        grandTotal += balance;
+      }
+      if (invs.length < PAGE) break;
+      startPos += PAGE;
+    }
+
+    // Round totals + sort by open_balance descending
+    const customers = Array.from(perCustomer.values())
+      .map((c) => ({ ...c, open_balance: Math.round(c.open_balance * 100) / 100 }))
+      .sort((a, b) => b.open_balance - a.open_balance);
+
+    res.json({
+      asOf,
+      excludeToday,
+      branch: branchFilter || null,
+      total_customers: customers.length,
+      total_invoices: scannedInvoices,
+      total_open_balance: Math.round(grandTotal * 100) / 100,
+      customers,
+    });
+  } catch (err) {
+    console.error('[GET /arrears/by-customer]', err);
+    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
 /**
  * /api/qb/activity — list QB Payments and CreditMemos in a time window.
  *
