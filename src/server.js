@@ -1707,6 +1707,102 @@ app.post('/api/nmb-pull/complete', async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// CRDB pull endpoints — mirror of NMB pull. Statement-pull worker POSTs
+// /api/crdb-pull/request to signal the CRDB live-puller service; the puller
+// polls /api/crdb-pull/state and completes with /api/crdb-pull/complete.
+// Same 4-key state (requested_at / completed_at / result_json /
+// last_ok_completed_at) — separate rows so both channels can be in flight
+// independently.
+// ───────────────────────────────────────────────────────────────────────────
+
+app.post('/api/crdb-pull/request', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const now = new Date().toISOString();
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_requested_at', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_completed_at', '')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_result_json', '')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    );
+    res.json({ ok: true, requested_at: now });
+  } catch (err) {
+    console.error('[POST /api/crdb-pull/request]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/crdb-pull/state', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const rows = (await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('crdb_pull_requested_at','crdb_pull_completed_at','crdb_pull_result_json','crdb_pull_last_ok_completed_at')`,
+    )).rows;
+    const m = {};
+    for (const r of rows) m[r.key] = r.value;
+    const requested = m.crdb_pull_requested_at || '';
+    const completed = m.crdb_pull_completed_at || '';
+    const pending = !!requested && requested > completed;
+    let result = null;
+    if (m.crdb_pull_result_json) {
+      try { result = JSON.parse(m.crdb_pull_result_json); } catch { result = null; }
+    }
+    res.json({
+      requested_at: requested || null,
+      completed_at: completed || null,
+      last_ok_completed_at: m.crdb_pull_last_ok_completed_at || null,
+      pending,
+      result,
+    });
+  } catch (err) {
+    console.error('[GET /api/crdb-pull/state]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/crdb-pull/complete', async (req, res) => {
+  const secret = process.env.STATEMENT_REPORT_SECRET;
+  if (!secret || req.header('X-Report-Secret') !== secret) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const pool = (await import('./db/pool.js')).db();
+    const now = new Date().toISOString();
+    const result = req.body || {};
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_completed_at', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [now],
+    );
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_result_json', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [JSON.stringify(result)],
+    );
+    if (result && result.ok === true) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ('crdb_pull_last_ok_completed_at', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [now],
+      );
+    }
+    res.json({ ok: true, completed_at: now });
+  } catch (err) {
+    console.error('[POST /api/crdb-pull/complete]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 // NMB session cookies — Frank's paste-from-browser path to bypass OTP burns.
 // Frank logs into NMB manually via his browser once (usually daily), copies
 // the site's cookies as JSON, POSTs them here. The NMB puller reads them on
