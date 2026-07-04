@@ -68,6 +68,33 @@ export function mountPaymentBatchesApi(app, deps) {
     }
   }, 5000);
 
+  // Stale-lock reaper (Frank 2026-07-04 kibo1900 incident): the ON CONFLICT
+  // stale-reclaim in the acquire path only fires when a NEW caller tries to
+  // acquire. If nothing tries for hours, orphan locks sit in the table and
+  // the boss sees "17-min stuck lock" in monitoring while everything is
+  // actually idle. Runs every 60s + once at boot: drops any lock with
+  // locked_at > 5 min ago. Safe because live workers refresh heartbeat
+  // every 15s — anything past 5 min IS dead.
+  const reapStaleLocks = async () => {
+    try {
+      const r = await db().query(
+        `DELETE FROM auto_upload_locks
+          WHERE locked_at < now() - interval '5 minutes'
+          RETURNING channel, holder, locked_at`,
+      );
+      if (r.rows.length) {
+        for (const row of r.rows) {
+          const ageMin = Math.round((Date.now() - new Date(row.locked_at).getTime()) / 60_000);
+          console.warn(`[stale-lock-reaper] cleared ${row.channel} held by ${row.holder} (${ageMin} min stale)`);
+        }
+      }
+    } catch (err) {
+      console.error('[stale-lock-reaper] threw:', err.message);
+    }
+  };
+  setTimeout(reapStaleLocks, 10_000);
+  setInterval(reapStaleLocks, 60_000);
+
 
   // ── POST /api/arrears-snapshots ──────────────────────────────────────────
   // One snapshot per run; subsequent batches in the same run share it via id.
