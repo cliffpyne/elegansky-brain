@@ -1549,8 +1549,13 @@ async function tickResultNotifierWatcher({ pool }) {
           resultLabel = 'ok_empty';
         }
       } else if (outcome?.status === 'fail') {
-        const reason = outcome.reason ? String(outcome.reason).slice(0, 100) : 'unspecified';
-        text = `BRAIN ${tick} ✗ worker: ${reason}`;
+        // Frank 2026-07-04: drop the "worker:" prefix — the SMS should
+        // describe what's wrong on the bank site, not blame the worker.
+        // The worker/POC now categorizes failures into human-readable
+        // strings like "NMB Download button unresponsive", "CRDB returned
+        // empty file", etc. — pass those through verbatim.
+        const reason = outcome.reason ? String(outcome.reason).slice(0, 120) : 'reason unrecorded';
+        text = `BRAIN ${tick} failed — ${reason}`;
         resultLabel = 'err';
       } else {
         // Frank 2026-07-02: NO timer-based "no outcome" SMS. Ever.
@@ -1589,17 +1594,17 @@ async function tickResultNotifierWatcher({ pool }) {
           : String(tzs);
         return `${ch} ${r.paid_count}p/${tzsStr}`;
       });
-      text = `BRAIN ${tick} ✓ ${parts.join(' ')}`;
+      text = `BRAIN ${tick} passed — ${parts.join(' ')}`;
       resultLabel = 'ok';
     }
 
-    // Broadcast to the full alert list — every tick result (success or
-    // error) reaches all admins, matching m6pm's send-notification flow.
+    // Frank 2026-07-04: tick-result SMS goes to master admin ONLY (Frank),
+    // not the full broadcast list. Reasoning: tick results are noise for
+    // the wider admin team; comparison/heisenberg reports still broadcast.
     let anyFailed = false;
-    for (const phone of broadcastPhones()) {
-      const r = await sendNextSms(phone, text);
-      if (r.ok === false) anyFailed = true;
-    }
+    const masterAdminPhone = process.env.MASTER_ADMIN_PHONE || '255752900450';
+    const r = await sendNextSms(masterAdminPhone, text);
+    if (r.ok === false) anyFailed = true;
     await pool.query(
       `UPDATE app_settings SET value=$2, updated_at=now() WHERE key=$1`,
       [notifKey, resultLabel + (anyFailed ? ':sms_partial' : '')],
