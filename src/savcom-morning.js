@@ -246,18 +246,26 @@ function titleCase(s) {
     .replace(/\b([a-z])/g, (m) => m.toUpperCase());
 }
 
-function buildCustomerSmsBody({ name, total_arrears }) {
-  // Match m6pm's _render_sms exactly:
-  //   {name}   → customer name, Title Case
-  //   {amount} → unpaid amount with thousands separators
-  //   {day}    → yesterday in EAT, dd/mm/yyyy
+function buildCustomerSmsBody({ name, total_arrears, overdue_invoices }) {
+  // Frank 2026-07-04: the SMS text asks about YESTERDAY's payment
+  // specifically. Previously we plugged in `total_arrears` (the aggregate
+  // across all unpaid days) — a customer who missed 4 days got asked
+  // about 50,000 TZS even though a single invoice is ~12,500. That felt
+  // wrong to the customer and to Frank ("max invoice is 20,000, we're
+  // asking about 40,500 = clearly multi-day accumulated"). The correct
+  // amount for the SMS is the per-invoice / daily amount, which we
+  // approximate as total_arrears ÷ overdue_invoices. That gives 12,500
+  // for typical daily loans, matches what the customer expects to see.
+  const invoices = Math.max(1, Number(overdue_invoices) || 1);
+  const yesterdayAmount = Math.round((Number(total_arrears) || 0) / invoices);
+
   const yesterdayEat = new Date(Date.now() + 3 * 3600_000 - 24 * 3600_000);
   const dd = String(yesterdayEat.getUTCDate()).padStart(2, '0');
   const mm = String(yesterdayEat.getUTCMonth() + 1).padStart(2, '0');
   const yyyy = yesterdayEat.getUTCFullYear();
   return ELEGANSKY_OVERDUE_TEMPLATE
     .replace('{name}', titleCase(name) || 'Mteja')
-    .replace('{amount}', formatAmountWithCommas(total_arrears))
+    .replace('{amount}', formatAmountWithCommas(yesterdayAmount))
     .replace('{day}', `${dd}/${mm}/${yyyy}`);
 }
 
@@ -333,6 +341,7 @@ export async function runSavcomMorningRitual({
     const body = buildCustomerSmsBody({
       name: c.display_name || c.customer,
       total_arrears: c.total_arrears,
+      overdue_invoices: c.overdue_invoices,
     });
     planned.push({
       customer: c.display_name || c.customer,
