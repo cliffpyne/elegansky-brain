@@ -1058,6 +1058,128 @@ app.get('/arrears/customer', async (req, res) => {
   }
 });
 
+// /api/customer-tree — LIVE from QB, no mirror, no computed totals.
+// Frank's ERP-Frappe migration helper (2026-07-04): the Frappe engineer
+// needs to see the raw QB state for a parent customer + all their child
+// customers, with estimates + invoices + payments + credit memos exactly
+// as QB has them. Zero recalculation — just the raw docs.
+//
+// Query:
+//   ?parent=APRUNA%20THOMAS%20BODA
+//   OR: ?parent_id=<QB Customer Id>
+//
+// Response:
+//   { parent: {…customer…},
+//     children: [
+//       { customer: {…},
+//         estimates: [ …raw QB Estimates… ],
+//         invoices: [ …raw QB Invoices… ],
+//         payments: [ …raw QB Payments… ],
+//         credit_memos: [ …raw QB CreditMemos… ]
+//       },
+//       …
+//     ],
+//     asOf: "…ISO…"
+//   }
+app.get('/api/customer-tree', async (req, res) => {
+  try {
+    const parentName = (req.query.parent || '').toString().trim();
+    const parentId = (req.query.parent_id || '').toString().trim();
+    if (!parentName && !parentId) {
+      return res.status(400).json({ error: 'parent=<name> or parent_id=<QB id> required' });
+    }
+
+    // 1. Resolve parent
+    let parent;
+    if (parentId) {
+      const r = await qbQuery(`SELECT * FROM Customer WHERE Id = '${parentId.replace(/'/g, "''")}'`);
+      parent = r.QueryResponse?.Customer?.[0];
+    } else {
+      // Try FullyQualifiedName exact, then Name, then case-insensitive scan
+      const nEsc = parentName.replace(/'/g, "''");
+      const q1 = await qbQuery(
+        `SELECT * FROM Customer WHERE FullyQualifiedName = '${nEsc}' OR DisplayName = '${nEsc}'`,
+      );
+      parent = q1.QueryResponse?.Customer?.[0];
+      if (!parent) {
+        // Case-insensitive fallback — page-walk (max 5 pages)
+        const target = parentName.toUpperCase();
+        let start = 1;
+        for (let i = 0; i < 5 && !parent; i++) {
+          const q = await qbQuery(
+            `SELECT * FROM Customer WHERE Active = true STARTPOSITION ${start} MAXRESULTS 1000`,
+          );
+          const list = q.QueryResponse?.Customer || [];
+          if (!list.length) break;
+          for (const c of list) {
+            const fqn = String(c.FullyQualifiedName || '').toUpperCase();
+            const dn = String(c.DisplayName || '').toUpperCase();
+            if (fqn === target || dn === target || fqn.endsWith(':' + target) || dn === target) {
+              parent = c;
+              break;
+            }
+          }
+          if (list.length < 1000) break;
+          start += 1000;
+        }
+      }
+    }
+    if (!parent) {
+      return res.status(404).json({ error: `customer not found: ${parentName || parentId}` });
+    }
+
+    // 2. Find children (Customers with ParentRef = parent.Id)
+    // Include parent itself as first item so caller sees the full tree.
+    const childrenQ = await qbQuery(
+      `SELECT * FROM Customer WHERE ParentRef = '${parent.Id}'`,
+    );
+    const children = childrenQ.QueryResponse?.Customer || [];
+    const allCustomers = [parent, ...children];
+
+    // 3. For each customer, fetch estimates + invoices + payments + credit_memos.
+    // Fired in parallel per customer, sequential across customers to stay
+    // under QB's per-second rate limit (~500 req/min).
+    const fetchDocsFor = async (customerId) => {
+      const idEsc = String(customerId).replace(/'/g, "''");
+      const [est, inv, pay, cm] = await Promise.all([
+        qbQuery(`SELECT * FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
+        qbQuery(`SELECT * FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
+        qbQuery(`SELECT * FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
+        qbQuery(`SELECT * FROM CreditMemo WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
+      ]);
+      return {
+        estimates: est.QueryResponse?.Estimate || [],
+        invoices: inv.QueryResponse?.Invoice || [],
+        payments: pay.QueryResponse?.Payment || [],
+        credit_memos: cm.QueryResponse?.CreditMemo || [],
+      };
+    };
+
+    const results = [];
+    for (const c of allCustomers) {
+      const docs = await fetchDocsFor(c.Id);
+      results.push({
+        customer: c,
+        estimates: docs.estimates,
+        invoices: docs.invoices,
+        payments: docs.payments,
+        credit_memos: docs.credit_memos,
+      });
+    }
+
+    res.json({
+      asOf: new Date().toISOString(),
+      parent_id: parent.Id,
+      parent_name: parent.FullyQualifiedName || parent.DisplayName,
+      customer_count: allCustomers.length,
+      tree: results,
+    });
+  } catch (err) {
+    console.error('[GET /api/customer-tree]', err);
+    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
 // /arrears/by-customer — ALL customers with their totals aggregated.
 // One request returns every customer that has open arrears, with their
 // combined outstanding balance across all open invoices — no per-invoice
