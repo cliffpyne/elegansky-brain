@@ -1089,32 +1089,78 @@ app.get('/api/customer-tree', async (req, res) => {
       return res.status(400).json({ error: 'parent=<name> or parent_id=<QB id> required' });
     }
 
+    // QB rejects `SELECT *` on Customer/Invoice/Estimate/Payment/CreditMemo
+    // (500 "Invalid query"). Use explicit column lists like the rest of the
+    // codebase. Fields intentionally verbose so the Frappe engineer has
+    // everything they need to shape imports.
+    const CUSTOMER_COLS =
+      'Id, DisplayName, FullyQualifiedName, CompanyName, GivenName, FamilyName, ' +
+      'PrimaryEmailAddr, PrimaryPhone, Mobile, BillAddr, ShipAddr, Notes, ' +
+      'Balance, BalanceWithJobs, ParentRef, Level, Job, BillWithParent, ' +
+      'Active, Taxable, DefaultTaxCodeRef, CurrencyRef, MetaData';
+    const ESTIMATE_COLS =
+      'Id, DocNumber, TxnDate, ExpirationDate, TxnStatus, TotalAmt, Balance, ' +
+      'CustomerRef, BillAddr, ShipAddr, CustomerMemo, PrivateNote, Line, MetaData';
+    const INVOICE_COLS =
+      'Id, DocNumber, TxnDate, DueDate, TotalAmt, Balance, ' +
+      'CustomerRef, BillAddr, ShipAddr, CustomerMemo, PrivateNote, Line, MetaData';
+    const PAYMENT_COLS =
+      'Id, TxnDate, TotalAmt, UnappliedAmt, PaymentRefNum, ' +
+      'CustomerRef, DepositToAccountRef, PaymentMethodRef, PrivateNote, Line, MetaData';
+    const CREDITMEMO_COLS =
+      'Id, DocNumber, TxnDate, TotalAmt, RemainingCredit, ' +
+      'CustomerRef, CustomerMemo, PrivateNote, Line, MetaData';
+
     // 1. Resolve parent
     let parent;
+    const escSql = (s) => String(s).replace(/'/g, "''");
     if (parentId) {
-      const r = await qbQuery(`SELECT * FROM Customer WHERE Id = '${parentId.replace(/'/g, "''")}'`);
+      const r = await qbQuery(
+        `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Id = '${escSql(parentId)}'`,
+      );
       parent = r.QueryResponse?.Customer?.[0];
     } else {
-      // Try FullyQualifiedName exact, then Name, then case-insensitive scan
-      const nEsc = parentName.replace(/'/g, "''");
-      const q1 = await qbQuery(
-        `SELECT * FROM Customer WHERE FullyQualifiedName = '${nEsc}' OR DisplayName = '${nEsc}'`,
-      );
-      parent = q1.QueryResponse?.Customer?.[0];
+      // Try FullyQualifiedName + DisplayName in ONE query (QB supports OR).
+      // If that ever 500s, fall through to two separate queries.
+      const nEsc = escSql(parentName);
+      try {
+        const q1 = await qbQuery(
+          `SELECT ${CUSTOMER_COLS} FROM Customer ` +
+          `WHERE FullyQualifiedName = '${nEsc}' OR DisplayName = '${nEsc}' MAXRESULTS 5`,
+        );
+        parent = q1.QueryResponse?.Customer?.[0];
+      } catch { /* fall through to two-query path */ }
       if (!parent) {
-        // Case-insensitive fallback — page-walk (max 5 pages)
+        try {
+          const qA = await qbQuery(
+            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE FullyQualifiedName = '${nEsc}' MAXRESULTS 1`,
+          );
+          parent = qA.QueryResponse?.Customer?.[0];
+        } catch { /* ignore */ }
+      }
+      if (!parent) {
+        try {
+          const qB = await qbQuery(
+            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE DisplayName = '${nEsc}' MAXRESULTS 1`,
+          );
+          parent = qB.QueryResponse?.Customer?.[0];
+        } catch { /* ignore */ }
+      }
+      if (!parent) {
+        // Case-insensitive page-walk (max 5 × 1000)
         const target = parentName.toUpperCase();
         let start = 1;
         for (let i = 0; i < 5 && !parent; i++) {
           const q = await qbQuery(
-            `SELECT * FROM Customer WHERE Active = true STARTPOSITION ${start} MAXRESULTS 1000`,
+            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Active IN (true, false) ` +
+            `STARTPOSITION ${start} MAXRESULTS 1000`,
           );
           const list = q.QueryResponse?.Customer || [];
           if (!list.length) break;
           for (const c of list) {
             const fqn = String(c.FullyQualifiedName || '').toUpperCase();
             const dn = String(c.DisplayName || '').toUpperCase();
-            if (fqn === target || dn === target || fqn.endsWith(':' + target) || dn === target) {
+            if (fqn === target || dn === target || fqn.endsWith(':' + target)) {
               parent = c;
               break;
             }
@@ -1128,24 +1174,37 @@ app.get('/api/customer-tree', async (req, res) => {
       return res.status(404).json({ error: `customer not found: ${parentName || parentId}` });
     }
 
-    // 2. Find children (Customers with ParentRef = parent.Id)
-    // Include parent itself as first item so caller sees the full tree.
-    const childrenQ = await qbQuery(
-      `SELECT * FROM Customer WHERE ParentRef = '${parent.Id}'`,
-    );
-    const children = childrenQ.QueryResponse?.Customer || [];
+    // 2. Find children (Customers with ParentRef.value = parent.Id).
+    // QBO's `WHERE ParentRef = 'X'` support is inconsistent — safer to
+    // page-walk Customer with Job=true (sub-customers only) and filter
+    // client-side. For customers with 1-2k children this is 1-2 QB calls,
+    // ~1s. For massive parents can go up to 5 pages (5000 children).
+    const children = [];
+    {
+      let start = 1;
+      for (let i = 0; i < 10; i++) {
+        const q = await qbQuery(
+          `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Job = true ` +
+          `STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const list = q.QueryResponse?.Customer || [];
+        for (const c of list) {
+          if (String(c.ParentRef?.value || '') === String(parent.Id)) children.push(c);
+        }
+        if (list.length < 1000) break;
+        start += 1000;
+      }
+    }
     const allCustomers = [parent, ...children];
 
-    // 3. For each customer, fetch estimates + invoices + payments + credit_memos.
-    // Fired in parallel per customer, sequential across customers to stay
-    // under QB's per-second rate limit (~500 req/min).
+    // 3. Fetch estimates + invoices + payments + credit_memos per customer.
     const fetchDocsFor = async (customerId) => {
-      const idEsc = String(customerId).replace(/'/g, "''");
+      const idEsc = escSql(customerId);
       const [est, inv, pay, cm] = await Promise.all([
-        qbQuery(`SELECT * FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
-        qbQuery(`SELECT * FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
-        qbQuery(`SELECT * FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
-        qbQuery(`SELECT * FROM CreditMemo WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch(() => ({})),
+        qbQuery(`SELECT ${ESTIMATE_COLS} FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
+        qbQuery(`SELECT ${INVOICE_COLS} FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
+        qbQuery(`SELECT ${PAYMENT_COLS} FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
+        qbQuery(`SELECT ${CREDITMEMO_COLS} FROM CreditMemo WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
       ]);
       return {
         estimates: est.QueryResponse?.Estimate || [],
