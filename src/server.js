@@ -1089,43 +1089,44 @@ app.get('/api/customer-tree', async (req, res) => {
       return res.status(400).json({ error: 'parent=<name> or parent_id=<QB id> required' });
     }
 
-    // QB rejects `SELECT *` on Customer/Invoice/Estimate/Payment/CreditMemo
-    // (500 "Invalid query"). Use explicit column lists like the rest of the
-    // codebase. Fields intentionally verbose so the Frappe engineer has
-    // everything they need to shape imports.
-    const CUSTOMER_COLS =
-      'Id, DisplayName, FullyQualifiedName, CompanyName, GivenName, FamilyName, ' +
-      'PrimaryEmailAddr, PrimaryPhone, Mobile, BillAddr, ShipAddr, Notes, ' +
-      'Balance, BalanceWithJobs, ParentRef, Level, Job, BillWithParent, ' +
-      'Active, Taxable, DefaultTaxCodeRef, CurrencyRef, MetaData';
-    const ESTIMATE_COLS =
-      'Id, DocNumber, TxnDate, ExpirationDate, TxnStatus, TotalAmt, Balance, ' +
-      'CustomerRef, BillAddr, ShipAddr, CustomerMemo, PrivateNote, Line, MetaData';
-    const INVOICE_COLS =
-      'Id, DocNumber, TxnDate, DueDate, TotalAmt, Balance, ' +
-      'CustomerRef, BillAddr, ShipAddr, CustomerMemo, PrivateNote, Line, MetaData';
-    const PAYMENT_COLS =
-      'Id, TxnDate, TotalAmt, UnappliedAmt, PaymentRefNum, ' +
-      'CustomerRef, DepositToAccountRef, PaymentMethodRef, PrivateNote, Line, MetaData';
-    const CREDITMEMO_COLS =
-      'Id, DocNumber, TxnDate, TotalAmt, RemainingCredit, ' +
-      'CustomerRef, CustomerMemo, PrivateNote, Line, MetaData';
+    // QBO's query language rejects an explicit column list that names any
+    // NESTED/complex field (ParentRef, Line, CustomerRef, BillAddr, ShipAddr,
+    // MetaData, PaymentMethodRef, DefaultTaxCodeRef, CurrencyRef, …). Only
+    // scalar top-level columns can be named explicitly. `SELECT *` IS valid
+    // for single-entity queries and returns EVERY field — including the
+    // nested ones we need (ParentRef.value to find children, CustomerRef.value
+    // for docs). Frank 2026-07-06 after the Frappe engineer diagnosed the
+    // 75ec270 regression: switching to explicit columns brought "Invalid query"
+    // because the column list included nested fields — the original SELECT *
+    // was never wrong, the WHERE clause was.
+
+    // Extract QBO's real fault detail from an error thrown by intuit-oauth's
+    // makeApiCall — bubble it up in the response so future debugging isn't
+    // blind. The SDK stashes the raw body under authResponse.body.
+    const qbFaultOf = (err) => {
+      try {
+        const body = err?.authResponse?.body || err?.response?.body || '';
+        const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+        const detail = parsed?.Fault?.Error?.[0]?.Detail || parsed?.Fault?.Error?.[0]?.Message;
+        return detail || null;
+      } catch { return null; }
+    };
 
     // 1. Resolve parent
     let parent;
     const escSql = (s) => String(s).replace(/'/g, "''");
     if (parentId) {
       const r = await qbQuery(
-        `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Id = '${escSql(parentId)}'`,
+        `SELECT * FROM Customer WHERE Id = '${escSql(parentId)}'`,
       );
       parent = r.QueryResponse?.Customer?.[0];
     } else {
       // Try FullyQualifiedName + DisplayName in ONE query (QB supports OR).
-      // If that ever 500s, fall through to two separate queries.
+      // If that ever fails, fall through to two separate queries.
       const nEsc = escSql(parentName);
       try {
         const q1 = await qbQuery(
-          `SELECT ${CUSTOMER_COLS} FROM Customer ` +
+          `SELECT * FROM Customer ` +
           `WHERE FullyQualifiedName = '${nEsc}' OR DisplayName = '${nEsc}' MAXRESULTS 5`,
         );
         parent = q1.QueryResponse?.Customer?.[0];
@@ -1133,7 +1134,7 @@ app.get('/api/customer-tree', async (req, res) => {
       if (!parent) {
         try {
           const qA = await qbQuery(
-            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE FullyQualifiedName = '${nEsc}' MAXRESULTS 1`,
+            `SELECT * FROM Customer WHERE FullyQualifiedName = '${nEsc}' MAXRESULTS 1`,
           );
           parent = qA.QueryResponse?.Customer?.[0];
         } catch { /* ignore */ }
@@ -1141,7 +1142,7 @@ app.get('/api/customer-tree', async (req, res) => {
       if (!parent) {
         try {
           const qB = await qbQuery(
-            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE DisplayName = '${nEsc}' MAXRESULTS 1`,
+            `SELECT * FROM Customer WHERE DisplayName = '${nEsc}' MAXRESULTS 1`,
           );
           parent = qB.QueryResponse?.Customer?.[0];
         } catch { /* ignore */ }
@@ -1152,7 +1153,7 @@ app.get('/api/customer-tree', async (req, res) => {
         let start = 1;
         for (let i = 0; i < 5 && !parent; i++) {
           const q = await qbQuery(
-            `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Active IN (true, false) ` +
+            `SELECT * FROM Customer WHERE Active IN (true, false) ` +
             `STARTPOSITION ${start} MAXRESULTS 1000`,
           );
           const list = q.QueryResponse?.Customer || [];
@@ -1177,14 +1178,13 @@ app.get('/api/customer-tree', async (req, res) => {
     // 2. Find children (Customers with ParentRef.value = parent.Id).
     // QBO's `WHERE ParentRef = 'X'` support is inconsistent — safer to
     // page-walk Customer with Job=true (sub-customers only) and filter
-    // client-side. For customers with 1-2k children this is 1-2 QB calls,
-    // ~1s. For massive parents can go up to 5 pages (5000 children).
+    // client-side. For customers with 1-2k children this is 1-2 QB calls.
     const children = [];
     {
       let start = 1;
       for (let i = 0; i < 10; i++) {
         const q = await qbQuery(
-          `SELECT ${CUSTOMER_COLS} FROM Customer WHERE Job = true ` +
+          `SELECT * FROM Customer WHERE Job = true ` +
           `STARTPOSITION ${start} MAXRESULTS 1000`,
         );
         const list = q.QueryResponse?.Customer || [];
@@ -1198,19 +1198,29 @@ app.get('/api/customer-tree', async (req, res) => {
     const allCustomers = [parent, ...children];
 
     // 3. Fetch estimates + invoices + payments + credit_memos per customer.
+    // Per-doc errors surface QBO fault detail so the caller sees exactly
+    // which field/token blew up on the affected customer (rather than a
+    // generic "Invalid query" collapsing everything).
     const fetchDocsFor = async (customerId) => {
       const idEsc = escSql(customerId);
+      const wrap = async (sql) => {
+        try { return await qbQuery(sql); }
+        catch (e) {
+          return { _err: e.message, _fault: qbFaultOf(e), _sql: sql };
+        }
+      };
       const [est, inv, pay, cm] = await Promise.all([
-        qbQuery(`SELECT ${ESTIMATE_COLS} FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
-        qbQuery(`SELECT ${INVOICE_COLS} FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
-        qbQuery(`SELECT ${PAYMENT_COLS} FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
-        qbQuery(`SELECT ${CREDITMEMO_COLS} FROM CreditMemo WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`).catch((e) => ({ _err: e.message })),
+        wrap(`SELECT * FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+        wrap(`SELECT * FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+        wrap(`SELECT * FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+        wrap(`SELECT * FROM CreditMemo WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
       ]);
       return {
         estimates: est.QueryResponse?.Estimate || [],
         invoices: inv.QueryResponse?.Invoice || [],
         payments: pay.QueryResponse?.Payment || [],
         credit_memos: cm.QueryResponse?.CreditMemo || [],
+        errors: [est, inv, pay, cm].filter((x) => x._err).map((x) => ({ sql: x._sql, err: x._err, fault: x._fault })),
       };
     };
 
@@ -1223,6 +1233,7 @@ app.get('/api/customer-tree', async (req, res) => {
         invoices: docs.invoices,
         payments: docs.payments,
         credit_memos: docs.credit_memos,
+        ...(docs.errors.length ? { errors: docs.errors } : {}),
       });
     }
 
@@ -1234,8 +1245,19 @@ app.get('/api/customer-tree', async (req, res) => {
       tree: results,
     });
   } catch (err) {
-    console.error('[GET /api/customer-tree]', err);
-    res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+    const fault = (() => {
+      try {
+        const body = err?.authResponse?.body || err?.response?.body || '';
+        const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+        return parsed?.Fault?.Error?.[0]?.Detail || parsed?.Fault?.Error?.[0]?.Message || null;
+      } catch { return null; }
+    })();
+    console.error('[GET /api/customer-tree]', err.message, 'fault=', fault);
+    res.status(500).json({
+      error: err.message,
+      qb_fault_detail: fault,
+      intuit_tid: err.intuit_tid,
+    });
   }
 });
 
