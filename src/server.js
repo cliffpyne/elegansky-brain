@@ -1261,6 +1261,265 @@ app.get('/api/customer-tree', async (req, res) => {
   }
 });
 
+// /api/customer-migration-plan — per Frank 2026-07-08 for Frappe migration.
+// Returns per sub-customer everything Frappe needs to build the customer
+// record cleanly without touching the (stale) mirror DB or re-deriving
+// anything from raw QB. Rules encoded (Frank locked these in):
+//   contract_amount   = sum of Estimates.TotalAmt (NOT sum of invoices —
+//                       invoices include penalties + moved-forward + normal
+//                       and that confuses the total)
+//   daily_rate        = 12,500 TZS hardcoded (business-wide constant)
+//   loan_start_date   = min(Invoice.TxnDate)
+//   paid_up_to_date   = loan_start + (total_paid / 12,500) days (informational)
+//   real_overdue      = pull ACTUAL overdue invoices with real dates + amounts,
+//                       do NOT consolidate — Frappe copies each one as-is
+//   moved_forward     = TxnDate<=today AND DueDate>today AND balance>0
+//   penalty           = TotalAmt != 12,500 AND TotalAmt > 12,500 (e.g. 15k/20k)
+//
+// Query: ?parent_id=<QB id>  or  ?parent=<name>
+const DAILY_RATE_TZS = 12500;
+app.get('/api/customer-migration-plan', async (req, res) => {
+  try {
+    const parentName = (req.query.parent || '').toString().trim();
+    const parentId = (req.query.parent_id || '').toString().trim();
+    if (!parentName && !parentId) {
+      return res.status(400).json({ error: 'parent=<name> or parent_id=<QB id> required' });
+    }
+
+    const qbFaultOf = (err) => {
+      try {
+        const body = err?.authResponse?.body || err?.response?.body || '';
+        const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+        return parsed?.Fault?.Error?.[0]?.Detail || parsed?.Fault?.Error?.[0]?.Message || null;
+      } catch { return null; }
+    };
+    const escSql = (s) => String(s).replace(/'/g, "''");
+
+    // 1. Resolve parent — same logic as /api/customer-tree.
+    let parent;
+    if (parentId) {
+      const r = await qbQuery(`SELECT * FROM Customer WHERE Id = '${escSql(parentId)}'`);
+      parent = r.QueryResponse?.Customer?.[0];
+    } else {
+      const nEsc = escSql(parentName);
+      try {
+        const q1 = await qbQuery(
+          `SELECT * FROM Customer WHERE FullyQualifiedName = '${nEsc}' OR DisplayName = '${nEsc}' MAXRESULTS 5`,
+        );
+        parent = q1.QueryResponse?.Customer?.[0];
+      } catch { /* fall through */ }
+      if (!parent) {
+        try {
+          const q = await qbQuery(`SELECT * FROM Customer WHERE FullyQualifiedName = '${nEsc}' MAXRESULTS 1`);
+          parent = q.QueryResponse?.Customer?.[0];
+        } catch { /* ignore */ }
+      }
+      if (!parent) {
+        try {
+          const q = await qbQuery(`SELECT * FROM Customer WHERE DisplayName = '${nEsc}' MAXRESULTS 1`);
+          parent = q.QueryResponse?.Customer?.[0];
+        } catch { /* ignore */ }
+      }
+    }
+    if (!parent) {
+      return res.status(404).json({ error: `customer not found: ${parentName || parentId}` });
+    }
+
+    // 2. Children walk (Job=true, page + client-side filter by ParentRef.value).
+    const children = [];
+    {
+      let start = 1;
+      for (let i = 0; i < 10; i++) {
+        const q = await qbQuery(
+          `SELECT * FROM Customer WHERE Job = true STARTPOSITION ${start} MAXRESULTS 1000`,
+        );
+        const list = q.QueryResponse?.Customer || [];
+        for (const c of list) {
+          if (String(c.ParentRef?.value || '') === String(parent.Id)) children.push(c);
+        }
+        if (list.length < 1000) break;
+        start += 1000;
+      }
+    }
+    const allCustomers = [parent, ...children];
+
+    // 3. Per-customer migration plan.
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const todayDate = new Date(todayISO + 'T00:00:00Z');
+    const addDays = (isoDate, days) => {
+      const d = new Date(isoDate + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + Math.floor(days));
+      return d.toISOString().slice(0, 10);
+    };
+    const daysBetween = (aISO, bISO) => {
+      const a = new Date(aISO + 'T00:00:00Z').getTime();
+      const b = new Date(bISO + 'T00:00:00Z').getTime();
+      return Math.round((b - a) / 86400000);
+    };
+    const num = (v) => Number(v || 0);
+    const invShape = (inv) => ({
+      qb_id: inv.Id,
+      doc_number: inv.DocNumber || null,
+      txn_date: inv.TxnDate || null,
+      due_date: inv.DueDate || null,
+      amount: num(inv.TotalAmt),
+      balance: num(inv.Balance),
+    });
+    const estShape = (e) => ({
+      qb_id: e.Id,
+      doc_number: e.DocNumber || null,
+      txn_date: e.TxnDate || null,
+      expiration_date: e.ExpirationDate || null,
+      total_amt: num(e.TotalAmt),
+    });
+    const payShape = (p) => ({
+      qb_id: p.Id,
+      txn_date: p.TxnDate || null,
+      total_amt: num(p.TotalAmt),
+      unapplied_amt: num(p.UnappliedAmt),
+      payment_ref_num: p.PaymentRefNum || null,
+    });
+
+    const buildPlan = async (c) => {
+      const idEsc = escSql(c.Id);
+      const wrap = async (sql) => {
+        try { return await qbQuery(sql); }
+        catch (e) { return { _err: e.message, _fault: qbFaultOf(e), _sql: sql }; }
+      };
+      const [invR, payR, estR] = await Promise.all([
+        wrap(`SELECT * FROM Invoice WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+        wrap(`SELECT * FROM Payment WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+        wrap(`SELECT * FROM Estimate WHERE CustomerRef = '${idEsc}' MAXRESULTS 1000`),
+      ]);
+      const invoices = invR.QueryResponse?.Invoice || [];
+      const payments = payR.QueryResponse?.Payment || [];
+      const estimates = estR.QueryResponse?.Estimate || [];
+
+      const errors = [invR, payR, estR].filter((x) => x._err)
+        .map((x) => ({ sql: x._sql, err: x._err, fault: x._fault }));
+
+      const contract_amount = estimates.reduce((s, e) => s + num(e.TotalAmt), 0);
+      const total_paid = payments.reduce((s, p) => s + num(p.TotalAmt), 0);
+      const remaining_on_contract = Math.max(0, contract_amount - total_paid);
+
+      // Categorize invoices per Frank's rules.
+      const real_overdue = [];
+      const moved_forward = [];
+      const penalty = [];
+      let earliest_txn = null;
+      for (const inv of invoices) {
+        const shape = invShape(inv);
+        const bal = shape.balance;
+        const amt = shape.amount;
+        const txn = shape.txn_date; // 'YYYY-MM-DD'
+        const due = shape.due_date || txn;
+        if (txn && (!earliest_txn || txn < earliest_txn)) earliest_txn = txn;
+
+        // Penalty: amount != daily_rate AND > daily_rate. Categorize first —
+        // a penalty with balance>0 due-in-past is still a "penalty" for Frappe,
+        // not counted in "real_overdue" (Frank splits penalties out).
+        if (amt !== DAILY_RATE_TZS && amt > DAILY_RATE_TZS) {
+          if (bal > 0) penalty.push(shape);
+          continue;
+        }
+        // Moved forward: TxnDate<=today, DueDate>today, balance>0.
+        if (bal > 0 && txn && due && txn <= todayISO && due > todayISO) {
+          moved_forward.push(shape);
+          continue;
+        }
+        // Real overdue: TxnDate<=today, DueDate<=today, balance>0.
+        if (bal > 0 && due && due <= todayISO) {
+          real_overdue.push(shape);
+          continue;
+        }
+        // else: paid (bal==0) or fully-future invoice — no bucket needed.
+      }
+
+      const real_overdue_sum = real_overdue.reduce((s, i) => s + i.balance, 0);
+      const moved_forward_sum = moved_forward.reduce((s, i) => s + i.balance, 0);
+      const penalty_sum = penalty.reduce((s, i) => s + i.balance, 0);
+
+      const loan_start_date = earliest_txn;
+      const daysPaid = total_paid / DAILY_RATE_TZS;
+      const paid_up_to_date = loan_start_date ? addDays(loan_start_date, daysPaid) : null;
+      const planned_overdue_days = paid_up_to_date ? Math.max(0, daysBetween(paid_up_to_date, todayISO)) : null;
+      const planned_overdue_amount = planned_overdue_days != null ? planned_overdue_days * DAILY_RATE_TZS : null;
+
+      return {
+        customer_id: c.Id,
+        customer_name: c.FullyQualifiedName || c.DisplayName,
+        active: c.Active,
+        job: c.Job,
+        qb_customer_balance: num(c.Balance),
+        qb_customer_balance_with_jobs: num(c.BalanceWithJobs),
+
+        contract_amount,
+        total_paid,
+        remaining_on_contract,
+
+        daily_rate: DAILY_RATE_TZS,
+        loan_start_date,
+        paid_up_to_date,
+        today: todayISO,
+
+        // Sanity-check figures — should approximately equal real_overdue_sum
+        // when the customer is on a strict daily schedule. When they diverge
+        // significantly, moved_forward / penalty invoices are in play.
+        planned_overdue_days,
+        planned_overdue_amount,
+
+        // Frappe copies each of these AT THEIR REAL DATES:
+        real_overdue_invoices: real_overdue,
+        real_overdue_sum,
+
+        moved_forward_invoices: moved_forward,
+        moved_forward_sum,
+
+        penalty_invoices: penalty,
+        penalty_sum,
+
+        // Raw source records — Frappe can reference if needed.
+        estimates: estimates.map(estShape),
+        payments_count: payments.length,
+        payments_sample: payments.slice(0, 5).map(payShape),
+        invoices_total_count: invoices.length,
+
+        ...(errors.length ? { errors } : {}),
+      };
+    };
+
+    const migration_plans = [];
+    for (const c of allCustomers) {
+      const plan = await buildPlan(c);
+      migration_plans.push(plan);
+    }
+
+    res.json({
+      asOf: new Date().toISOString(),
+      today: todayISO,
+      parent_id: parent.Id,
+      parent_name: parent.FullyQualifiedName || parent.DisplayName,
+      customer_count: allCustomers.length,
+      daily_rate: DAILY_RATE_TZS,
+      migration_plans,
+    });
+  } catch (err) {
+    const fault = (() => {
+      try {
+        const body = err?.authResponse?.body || err?.response?.body || '';
+        const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+        return parsed?.Fault?.Error?.[0]?.Detail || parsed?.Fault?.Error?.[0]?.Message || null;
+      } catch { return null; }
+    })();
+    console.error('[GET /api/customer-migration-plan]', err.message, 'fault=', fault);
+    res.status(500).json({
+      error: err.message,
+      qb_fault_detail: fault,
+      intuit_tid: err.intuit_tid,
+    });
+  }
+});
+
 // /arrears/by-customer — ALL customers with their totals aggregated.
 // One request returns every customer that has open arrears, with their
 // combined outstanding balance across all open invoices — no per-invoice
