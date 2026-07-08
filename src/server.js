@@ -1402,37 +1402,78 @@ app.get('/api/customer-migration-plan', async (req, res) => {
       const total_paid = payments.reduce((s, p) => s + num(p.TotalAmt), 0);
       const remaining_on_contract = Math.max(0, contract_amount - total_paid);
 
-      // Categorize invoices per Frank's rules.
+      // Categorize invoices per Frank's rules (fix 2026-07-08 after Frappe
+      // engineer diagnosed the empty moved_forward bucket).
+      //
+      // "Moved forward" (kusogeza mbele) = officer deferred an unpaid
+      // installment. The TxnDate stays at the original scheduled day; the
+      // DueDate gets pushed to the end of the schedule (or beyond). So the
+      // UNIQUE signal is DueDate > TxnDate (the gap). It's the ONLY thing
+      // that changes when an invoice is moved.
+      //
+      // Normal invoices (including legit end-of-contract ones landing in
+      // 2027 when a 397-day schedule runs there) have DueDate == TxnDate.
+      // "Future date" alone doesn't identify a moved-forward invoice.
+      //
+      // Compute earliest_txn first so we can compute original_end_date
+      // (loan_start + contract_amount/daily_rate - 1 day) as a corroborating
+      // second signal: any unpaid invoice with DueDate > original_end_date
+      // has been pushed past the original contract end.
+      let earliest_txn = null;
+      for (const inv of invoices) {
+        const t = inv.TxnDate || null;
+        if (t && (!earliest_txn || t < earliest_txn)) earliest_txn = t;
+      }
+      const contract_days = contract_amount > 0
+        ? Math.floor(contract_amount / DAILY_RATE_TZS)
+        : 0;
+      const original_end_date = (earliest_txn && contract_days > 0)
+        ? (() => {
+            const d = new Date(earliest_txn + 'T00:00:00Z');
+            d.setUTCDate(d.getUTCDate() + Math.max(0, contract_days - 1));
+            return d.toISOString().slice(0, 10);
+          })()
+        : null;
+
       const real_overdue = [];
       const moved_forward = [];
       const penalty = [];
-      let earliest_txn = null;
       for (const inv of invoices) {
         const shape = invShape(inv);
         const bal = shape.balance;
         const amt = shape.amount;
-        const txn = shape.txn_date; // 'YYYY-MM-DD'
-        const due = shape.due_date || txn;
-        if (txn && (!earliest_txn || txn < earliest_txn)) earliest_txn = txn;
+        const txn = shape.txn_date; // 'YYYY-MM-DD' or null
+        const due = shape.due_date; // 'YYYY-MM-DD' or null — DO NOT fallback
 
-        // Penalty: amount != daily_rate AND > daily_rate. Categorize first —
-        // a penalty with balance>0 due-in-past is still a "penalty" for Frappe,
-        // not counted in "real_overdue" (Frank splits penalties out).
+        if (bal <= 0) continue; // paid/void — no bucket needed
+
+        // Penalty: amount != daily_rate AND > daily_rate. Categorize FIRST
+        // (Frank's rule: penalties split from overdue for record-keeping).
         if (amt !== DAILY_RATE_TZS && amt > DAILY_RATE_TZS) {
-          if (bal > 0) penalty.push(shape);
+          penalty.push(shape);
           continue;
         }
-        // Moved forward: TxnDate<=today, DueDate>today, balance>0.
-        if (bal > 0 && txn && due && txn <= todayISO && due > todayISO) {
+        // Moved forward — the UNIQUE signal per Frappe engineer:
+        //   Primary : DueDate > TxnDate  (the gap is the fingerprint)
+        //   Backup  : DueDate > original_end_date (pushed past contract end)
+        // Either signal marks it as moved-forward, even if DueDate <= today
+        // (a deferred invoice whose new date has ALSO passed stays labeled
+        // moved-forward, not overdue — Frank preserves the deferral history).
+        const isMovedForward =
+          (txn && due && due > txn) ||
+          (original_end_date && due && due > original_end_date);
+        if (isMovedForward) {
           moved_forward.push(shape);
           continue;
         }
-        // Real overdue: TxnDate<=today, DueDate<=today, balance>0.
-        if (bal > 0 && due && due <= todayISO) {
+        // Real overdue — a normal scheduled invoice whose scheduled day
+        // already passed unpaid. Requires DueDate<=today AND it wasn't
+        // moved (handled above).
+        if (due && due <= todayISO) {
           real_overdue.push(shape);
           continue;
         }
-        // else: paid (bal==0) or fully-future invoice — no bucket needed.
+        // else: unpaid future-dated invoice (normal, not yet due) — no bucket.
       }
 
       const real_overdue_sum = real_overdue.reduce((s, i) => s + i.balance, 0);
