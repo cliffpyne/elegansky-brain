@@ -3830,6 +3830,66 @@ export function mountPaymentBatchesApi(app, deps) {
   });
 
   /**
+   * GET /api/admin/apruna/roster
+   * Returns the cached APRUNA customer roster (from Frappe's
+   * savcom_customers?officer=APRUNA THOMAS BODA). Diagnostic.
+   */
+  app.get('/api/admin/apruna/roster', requireSecretOrJwt, async (_req, res) => {
+    try {
+      const { getAprunaStats } = await import('./apruna-resolver.js');
+      const stats = await getAprunaStats();
+      res.json(stats);
+    } catch (err) {
+      console.error('[apruna/roster]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /api/admin/apruna/push-batch
+   * Body: { batch_id, dry_run? }
+   * Manually fire APRUNA dual-write for a finalized batch. Used to verify
+   * end-to-end with the Frappe engineer before we hook auto-fire into
+   * runAutoUploadBackground for every batch. Safe to re-run: Frappe dedupes
+   * by txn_id (bank_ref) so second call returns { status: 'duplicate' }.
+   */
+  app.post('/api/admin/apruna/push-batch', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchId = String(req.body?.batch_id || '').trim();
+      if (!batchId) return res.status(400).json({ error: 'batch_id required' });
+      const dryRun = req.body?.dry_run === true;
+      const { pushAprunaForBatch } = await import('./apruna-frappe-push.js');
+      const result = await pushAprunaForBatch(batchId, { dryRun });
+      res.json(result);
+    } catch (err) {
+      console.error('[apruna/push-batch]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /api/admin/apruna/refresh
+   * Force-refresh the APRUNA roster cache immediately (bypasses TTL). Use
+   * after the Frappe engineer adds new APRUNA customers so BRAIN sees them
+   * without waiting for the 1-hour TTL.
+   */
+  app.post('/api/admin/apruna/refresh', requireSecretOrJwt, async (_req, res) => {
+    try {
+      const { getAprunaCache } = await import('./apruna-resolver.js');
+      const cache = await getAprunaCache({ force: true });
+      res.json({
+        ok: true,
+        total_customers: cache.total,
+        with_qb_id: cache.byQbId.size,
+        fetched_at: new Date(cache.fetchedAt).toISOString(),
+      });
+    } catch (err) {
+      console.error('[apruna/refresh]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
    * POST /api/admin/clear-window-markers
    * Body: { channel, since_iso, until_iso, dry_run? }
    * Clears I/J/K on every row in the channel's PASSED sheet whose sheet_ts
