@@ -3697,6 +3697,139 @@ export function mountPaymentBatchesApi(app, deps) {
   });
 
   /**
+   * POST /api/admin/restore-markers
+   * Body: { channel, since_iso, until_iso, dry_run? }
+   *
+   * For every sheet row in the window whose bank_ref is in
+   * consumed_transactions BUT whose I/J markers are empty, write:
+   *   I = "Fetched at: (restored) <now-iso>"
+   *   J = "<qb_id> | <payment_created_at>"  (qb_id from payment_uploads)
+   *
+   * Use after a bulk dedup + re-fire cycle wiped markers but the underlying
+   * QB Payments still exist (Frank's 07-10 sheet cleanup incident).
+   * Never writes if the row already has ANY marker in I or J — only fills
+   * gaps. Frank 2026-07-10.
+   */
+  app.post('/api/admin/restore-markers', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) {
+        return res.status(400).json({ error: 'bad channel; need one of: ' + Object.keys(CHANNEL_SHEETS).join(',') });
+      }
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIso = req.body?.since_iso ? new Date(String(req.body.since_iso)) : null;
+      const untilIso = req.body?.until_iso ? new Date(String(req.body.until_iso)) : null;
+      if (!sinceIso || !untilIso || isNaN(+sinceIso) || isNaN(+untilIso)) {
+        return res.status(400).json({ error: 'since_iso + until_iso required' });
+      }
+      const dryRun = req.body?.dry_run === true;
+
+      // 1. Read sheet in window, collect rows with a ref but empty I/J.
+      const sd = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
+      const sheet = sd.values || sd.data || [];
+      const candidates = []; // {rowNum, ref}
+      for (let i = 1; i < sheet.length; i++) {
+        const dCell = String(sheet[i][1] || '').trim();
+        if (!dCell) continue;
+        const ts = parseTsAny(dCell);
+        if (!ts || ts < sinceIso || ts >= untilIso) continue;
+        const rawRef = String(sheet[i][7] || '').trim();
+        if (!rawRef) continue;
+        const colI = String(sheet[i][8] || '').trim();
+        const colJ = String(sheet[i][9] || '').trim();
+        if (colI || colJ) continue; // already has some marker — don't touch
+        candidates.push({ rowNum: i + 1, ref: rawRef });
+      }
+
+      if (!candidates.length) {
+        return res.json({
+          dry_run: dryRun,
+          channel,
+          candidates: 0,
+          matched_in_ct: 0,
+          unmatched: 0,
+          restored: 0,
+        });
+      }
+
+      // 2. Build both bare + suffixed ref forms (channel suffix N/B).
+      const suffix = channel === 'nmbnew' ? 'N' : channel === 'bank' ? 'B' :
+                     channel === 'iphone_bank' ? 'I' : '';
+      const refPairs = candidates.map((c) => ({ bare: c.ref, suffixed: c.ref + suffix, row: c.rowNum }));
+      const allRefs = [
+        ...new Set([...refPairs.map((r) => r.bare), ...refPairs.map((r) => r.suffixed)]),
+      ];
+
+      // 3. Check which are in consumed_transactions + fetch qb_id from payment_uploads.
+      const ctRes = await db().query(
+        `SELECT bank_ref FROM consumed_transactions WHERE bank_ref = ANY($1::text[])`,
+        [allRefs],
+      );
+      const consumedRefs = new Set(ctRes.rows.map((r) => r.bank_ref));
+      const puRes = await db().query(
+        `SELECT DISTINCT ON (bank_ref) bank_ref, qb_id, created_at
+           FROM payment_uploads
+          WHERE bank_ref = ANY($1::text[]) AND status = 'finalized' AND kind = 'paid' AND qb_id IS NOT NULL
+          ORDER BY bank_ref, created_at DESC`,
+        [allRefs],
+      );
+      const qbInfoByRef = new Map();
+      for (const r of puRes.rows) {
+        qbInfoByRef.set(r.bank_ref, { qb_id: r.qb_id, created_at: r.created_at });
+      }
+
+      // 4. Build writes for matched candidates.
+      const nowIso = new Date().toISOString();
+      const writes = []; // for writeSheetCells: [{range, value}]
+      let matched = 0, unmatched = 0;
+      const sample = [];
+      for (const p of refPairs) {
+        const bareHit = consumedRefs.has(p.bare);
+        const sufHit = consumedRefs.has(p.suffixed);
+        if (!bareHit && !sufHit) { unmatched++; continue; }
+        matched++;
+        const qbInfo = qbInfoByRef.get(p.bare) || qbInfoByRef.get(p.suffixed);
+        const iVal = `Fetched at: (restored) ${nowIso}`;
+        const jVal = qbInfo
+          ? `${qbInfo.qb_id} | ${new Date(qbInfo.created_at).toISOString()}`
+          : `(restored — qb_id unknown) ${nowIso}`;
+        writes.push({ range: `${cfg.tab}!I${p.row}`, value: iVal });
+        writes.push({ range: `${cfg.tab}!J${p.row}`, value: jVal });
+        if (sample.length < 5) sample.push({ row: p.row, ref: p.bare, qb_id: qbInfo?.qb_id ?? null });
+      }
+
+      if (dryRun) {
+        return res.json({
+          dry_run: true,
+          channel,
+          candidates: candidates.length,
+          matched_in_ct: matched,
+          unmatched: unmatched,
+          restored: 0,
+          writes_planned: writes.length,
+          sample,
+        });
+      }
+
+      // 5. Execute the batch write (values.batchUpdate handles hundreds per call).
+      const result = await writeSheetCells(cfg.sheetId, writes);
+      res.json({
+        dry_run: false,
+        channel,
+        candidates: candidates.length,
+        matched_in_ct: matched,
+        unmatched: unmatched,
+        restored: matched,
+        cells_written: result.updatedCells,
+        sample,
+      });
+    } catch (err) {
+      console.error('[restore-markers]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
    * POST /api/admin/clear-window-markers
    * Body: { channel, since_iso, until_iso, dry_run? }
    * Clears I/J/K on every row in the channel's PASSED sheet whose sheet_ts
