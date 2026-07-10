@@ -1088,6 +1088,13 @@ app.get('/api/customer-tree', async (req, res) => {
     if (!parentName && !parentId) {
       return res.status(400).json({ error: 'parent=<name> or parent_id=<QB id> required' });
     }
+    // Frank 2026-07-10 (Frappe engineer's ask): docs=0 / meta_only=1 returns just
+    // the parent + children roster (Id, DisplayName, FullyQualifiedName, ParentRef)
+    // without fetching estimates/invoices/payments/credit_memos. Bigger books
+    // (APRUNA at 191+) built the full response in memory before flushing → 0-byte
+    // timeouts. Roster-only skips that entirely so the engineer can enumerate
+    // current children, then pull each via /api/customer-migration-plan.
+    const docsMode = !(req.query.docs === '0' || req.query.meta_only === '1');
 
     // QBO's query language rejects an explicit column list that names any
     // NESTED/complex field (ParentRef, Line, CustomerRef, BillAddr, ShipAddr,
@@ -1225,16 +1232,31 @@ app.get('/api/customer-tree', async (req, res) => {
     };
 
     const results = [];
-    for (const c of allCustomers) {
-      const docs = await fetchDocsFor(c.Id);
-      results.push({
-        customer: c,
-        estimates: docs.estimates,
-        invoices: docs.invoices,
-        payments: docs.payments,
-        credit_memos: docs.credit_memos,
-        ...(docs.errors.length ? { errors: docs.errors } : {}),
-      });
+    if (!docsMode) {
+      // Roster-only mode: just the customer records, no docs. Fast, no timeout.
+      for (const c of allCustomers) {
+        results.push({
+          Id: c.Id,
+          DisplayName: c.DisplayName,
+          FullyQualifiedName: c.FullyQualifiedName,
+          ParentRef: c.ParentRef || null,
+          Active: c.Active,
+          Job: c.Job,
+        });
+      }
+    } else {
+      // Full mode: fetch estimates/invoices/payments/credit_memos per customer.
+      for (const c of allCustomers) {
+        const docs = await fetchDocsFor(c.Id);
+        results.push({
+          customer: c,
+          estimates: docs.estimates,
+          invoices: docs.invoices,
+          payments: docs.payments,
+          credit_memos: docs.credit_memos,
+          ...(docs.errors.length ? { errors: docs.errors } : {}),
+        });
+      }
     }
 
     res.json({
@@ -1242,7 +1264,8 @@ app.get('/api/customer-tree', async (req, res) => {
       parent_id: parent.Id,
       parent_name: parent.FullyQualifiedName || parent.DisplayName,
       customer_count: allCustomers.length,
-      tree: results,
+      mode: docsMode ? 'full' : 'roster',
+      [docsMode ? 'tree' : 'roster']: results,
     });
   } catch (err) {
     const fault = (() => {
