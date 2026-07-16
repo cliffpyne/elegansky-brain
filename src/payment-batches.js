@@ -793,6 +793,19 @@ export function mountPaymentBatchesApi(app, deps) {
             [batchId, `admin:${req.user?.email ?? req.user?.id ?? 'unknown'} — ${reason}`, null],
           );
           await c.query(`DELETE FROM consumed_transactions WHERE batch_id=$1`, [batchId]);
+          // Frank 2026-07-16: recall must ALSO clear external_consumed_refs
+          // for this batch's refs. Previously only consumed_transactions got
+          // cleared, so refs stayed cached as "already in QB" via the earlier
+          // dup-check even though the QB Payment was just voided. Next fire
+          // then reported "all refs already consumed" and dropped ~50 real
+          // txns to 3. This delete makes recall symmetric with fire.
+          if (batch.bank_refs && batch.bank_refs.length) {
+            const extDel = await c.query(
+              `DELETE FROM external_consumed_refs WHERE bank_ref = ANY($1)`,
+              [batch.bank_refs],
+            );
+            console.log(`[recall ${batchId}] also cleared ${extDel.rowCount} external_consumed_refs entries`);
+          }
         } else {
           // Partial: mark failure but keep refs locked so refs aren't re-batched
           // while half-voided.
