@@ -5773,6 +5773,25 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
       sheet_row_number: i + 1,
     });
   }
+  // APRUNA divert (Frank 2026-07-17): route sender-blacklisted rows to Frappe
+  // BEFORE they hit the QB path. Any txn matched to the APRUNA roster (by
+  // plate/phone) is pushed to Frappe with sacred-rule allocations and its
+  // bank_ref inserted into consumed_transactions. Non-matched rows continue
+  // through the existing QB flow unchanged.
+  //
+  // Feature-flagged via APRUNA_DIVERT_ENABLED env var. Off by default. If any
+  // step throws (roster fetch, single-txn push), the offending txn falls
+  // through to the QB path — status quo, worst case it lands in FAILED and
+  // needs the backfill script.
+  try {
+    const { divertAprunaTxns } = await import('./apruna-divert.js');
+    const divert = await divertAprunaTxns(txns, { channel, sheetId: cfg.sheetId, tab: cfg.tab, tickName });
+    if (divert && Array.isArray(divert.qbTxns)) {
+      txns.length = 0; txns.push(...divert.qbTxns);
+    }
+  } catch (err) {
+    console.error(`[apruna-divert] top-level failure — falling through, all txns go to QB: ${err.message}`);
+  }
   // Intra-window dedup: same ref appearing twice in the sheet (operator moves
   // rows around when reconciling). Keep first occurrence per ref+channel.
   const seenRef = new Set();
