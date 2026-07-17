@@ -36,6 +36,15 @@ function cleanPhone9(p) {
   if (!digits) return '';
   return digits.startsWith('255') ? digits.slice(3) : digits.slice(-9);
 }
+// Normalized customer name key: uppercase, collapse whitespace, strip trailing
+// plate suffix like " MC612FXE" so "ABDALLAH SHOMARI MATAMBO MC417FXE" matches
+// a sheet row with customer_name "ABDALLAH SHOMARI MATAMBO".
+function cleanName(n) {
+  if (!n) return '';
+  let s = String(n).trim().toUpperCase().replace(/\s+/g, ' ');
+  s = s.replace(/\s+MC[A-Z0-9]{5,7}\s*$/, '');
+  return s;
+}
 
 function baseUrl() {
   const u = (process.env.FRAPPE_BASE_URL || '').trim();
@@ -69,6 +78,9 @@ function buildIndex(list) {
   const byQbId = new Map();
   const byPlate = new Map();
   const byPhone = new Map();
+  // nameCounts tracks collisions; byName only keeps unique names.
+  const nameCounts = new Map();
+  const byName = new Map();
   let missing_qb_id = 0;
   let frappe_only = 0;
   for (const c of list) {
@@ -86,8 +98,22 @@ function buildIndex(list) {
     else { missing_qb_id++; if ((entry.source || '') === 'frappe') frappe_only++; }
     if (entry.plate) byPlate.set(entry.plate, entry);
     if (entry.phone9) byPhone.set(entry.phone9, entry);
+    // Track name collisions so we don't route a bank row to the wrong customer
+    // when two people share "JOHN JOSEPH MOHAMED" (Frank's plates exist to
+    // disambiguate that exact case).
+    for (const k of [cleanName(entry.customer), cleanName(entry.display_name)]) {
+      if (!k) continue;
+      nameCounts.set(k, (nameCounts.get(k) || 0) + 1);
+      if (!byName.has(k)) byName.set(k, entry);
+    }
   }
-  return { byQbId, byPlate, byPhone, missing_qb_id, frappe_only, total: list.length };
+  // Purge any name that collides across ≥2 customers — safer to fall through
+  // to the QB path than mis-route to a namesake.
+  let name_collisions = 0;
+  for (const [k, count] of nameCounts.entries()) {
+    if (count > 1) { byName.delete(k); name_collisions++; }
+  }
+  return { byQbId, byPlate, byPhone, byName, missing_qb_id, frappe_only, name_collisions, total: list.length };
 }
 
 /**
@@ -105,8 +131,9 @@ export async function getAprunaCache({ force = false } = {}) {
       const idx = buildIndex(list);
       _cache = { fetchedAt: now, ...idx };
       console.log(`[apruna-resolver] cached ${idx.total} customers — `
-        + `byQbId=${idx.byQbId.size} byPlate=${idx.byPlate.size} byPhone=${idx.byPhone.size}`
-        + (idx.frappe_only ? ` (${idx.frappe_only} frappe-only, no qb_id)` : ''));
+        + `byQbId=${idx.byQbId.size} byPlate=${idx.byPlate.size} byPhone=${idx.byPhone.size} byName=${idx.byName.size}`
+        + (idx.frappe_only ? ` (${idx.frappe_only} frappe-only, no qb_id)` : '')
+        + (idx.name_collisions ? ` (${idx.name_collisions} name-collisions purged from byName)` : ''));
       return _cache;
     } catch (err) {
       if (_cache) {
@@ -157,17 +184,35 @@ export async function resolveAprunaByPhone(phone) {
 }
 
 /**
- * Convenience: try qb_id → plate → phone in order. Returns the first hit.
+ * Look up an APRUNA customer by customer_name. Case-insensitive, whitespace-
+ * normalized, and strips trailing plate suffix (so "ABDALLAH SHOMARI MATAMBO"
+ * matches roster entry "ABDALLAH SHOMARI MATAMBO MC417FXE"). Covers the ~207
+ * old APRUNA customers who have qb_id but no plate stored in Frappe yet.
+ */
+export async function resolveAprunaByName(name) {
+  if (!name) return null;
+  const key = cleanName(name);
+  if (!key) return null;
+  const cache = await getAprunaCache();
+  return cache.byName.get(key) || null;
+}
+
+/**
+ * Convenience: try qb_id → plate → name → phone in order. Returns first hit.
  * Callers on the fire path use this so a single check answers
  * "is this an APRUNA customer that should route to Frappe, not QB?".
  */
-export async function resolveAprunaAny({ qb_id, plate, phone } = {}) {
+export async function resolveAprunaAny({ qb_id, plate, name, phone } = {}) {
   if (qb_id) {
     const r = await resolveAprunaByQbId(qb_id);
     if (r) return r;
   }
   if (plate) {
     const r = await resolveAprunaByPlate(plate);
+    if (r) return r;
+  }
+  if (name) {
+    const r = await resolveAprunaByName(name);
     if (r) return r;
   }
   if (phone) {

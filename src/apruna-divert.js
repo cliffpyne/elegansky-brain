@@ -70,13 +70,15 @@ function extractPhoneFromMemo(memo) {
 async function matchAprunaTxn(txn) {
   // txn shape (as built in prepareAutoUpload):
   //   customerPhone -> actually plate (col F) per legacy naming
-  //   customerName  -> matched customer name from sheet col G
+  //   customerName  -> resolved customer name from sheet col G (set by scraper /
+  //                    invoice-payment-app during resolution — same string the
+  //                    QB DisplayName would be, usually matches Frappe customer
+  //                    name exactly for the ~207 old APRUNA without plate).
   //   transactionId -> bank_ref (col H)
   const plate = txn.customerPhone || null; // legacy field carries plate
-  if (plate) {
-    const r = await resolveAprunaAny({ plate });
-    if (r) return { entry: r, matchedVia: 'plate' };
-  }
+  const name = txn.customerName || txn.contractName || null;
+  const r = await resolveAprunaAny({ plate, name });
+  if (r) return { entry: r, matchedVia: plate && r.plate ? 'plate' : 'name' };
   return null;
 }
 
