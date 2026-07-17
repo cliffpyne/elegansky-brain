@@ -21,6 +21,7 @@ import { mountLoanSetupApi } from './loan-setup.js';
 import { startScheduler } from './agent/scheduler.js';
 import { mountLimboRecoveryApi, startLimboRecoveryOnBoot } from './limbo-recovery.js';
 import { mountQbMirrorApi } from './qb-mirror-api.js';
+import { mountFrappeMirrorApi } from './frappe-mirror-api.js';
 import { mountM6pmApi, startM6pmWatchers } from './m6pm-automation.js';
 import { mountErpApi } from './erp-api.js';
 import { mountFrappeWebhookApi } from './frappe-webhook.js';
@@ -686,6 +687,7 @@ mountOfficerReportsApi(app, { requireSecretOrJwt });
 mountMegaReportApi(app, { requireSecretOrJwt });
 mountLoanSetupApi(app, { qbPost, qbBatchCreateInvoices, qbBatchCreatePayments, qbBatchDelete, requireSecretOrJwt });
 mountQbMirrorApi(app, { requireSecretOrJwt });
+mountFrappeMirrorApi(app, { requireSecretOrJwt });
 mountM6pmApi(app, {
   requireSecretOrJwt,
   sharedSecret: process.env.STATEMENT_REPORT_SECRET,
@@ -796,6 +798,66 @@ app.get('/invoices', async (req, res) => {
  */
 const CUSTOMER_CACHE = { map: null, builtAt: 0 };
 const CUSTOMER_TTL_MS = 5 * 60_000;
+
+/**
+ * Pikipiki plate → { plate, name, phone, wakandi_id, source } lookup.
+ * Reads BOTH tabs of the pikipiki sheet:
+ *   - "pikipiki records"  (main boda roster, ~4600 rows)
+ *   - "pikipiki records2" (SAVCOM-scoped roster, ~270 rows)
+ * Column layout (both tabs): A=empty, B=PLATE, C=NAME, D=PHONE, E=WAKANDI_ID.
+ * 1h TTL, stale-fallback on refresh error.
+ */
+const PIKIPIKI_SHEET_ID = '1XFwPITQgZmzZ8lbg8MKD9S4rwHyk2cDOKrcxO7SAjHA';
+const PIKIPIKI_CACHE = { map: null, builtAt: 0 };
+const PIKIPIKI_TTL_MS = 60 * 60_000;
+
+function _normPikipikiPhone(s) {
+  const d = String(s || '').replace(/\D+/g, '');
+  if (!d) return null;
+  if (d.startsWith('255') && d.length === 12) return d;
+  if (d.startsWith('0') && d.length === 10) return '255' + d.slice(1);
+  if (d.length === 9) return '255' + d;
+  return d;
+}
+
+async function getPikipikiPlateMap({ force = false } = {}) {
+  if (!force && PIKIPIKI_CACHE.map && Date.now() - PIKIPIKI_CACHE.builtAt < PIKIPIKI_TTL_MS) {
+    return PIKIPIKI_CACHE.map;
+  }
+  try {
+    const map = new Map();
+    for (const tab of ['pikipiki records', 'pikipiki records2']) {
+      const r = await readSheet(PIKIPIKI_SHEET_ID, `${tab}!A1:F5000`);
+      const rows = r.values || r.data || [];
+      // Skip row 1 (header)
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const plate = String(row[1] || '').trim().toUpperCase();
+        if (!plate) continue;
+        const rec = {
+          plate,
+          name: String(row[2] || '').trim(),
+          phone: _normPikipikiPhone(row[3]),
+          wakandi_id: String(row[4] || '').trim(),
+          source: tab,
+        };
+        // First tab wins if the same plate appears in both — pikipiki records
+        // is the main roster; records2 is a SAVCOM subset.
+        if (!map.has(plate)) map.set(plate, rec);
+      }
+    }
+    PIKIPIKI_CACHE.map = map;
+    PIKIPIKI_CACHE.builtAt = Date.now();
+    console.log(`[pikipiki-plate-map] built cache: ${map.size} unique plates`);
+    return map;
+  } catch (err) {
+    if (PIKIPIKI_CACHE.map) {
+      console.warn(`[pikipiki-plate-map] refresh failed (${err.message}); serving stale`);
+      return PIKIPIKI_CACHE.map;
+    }
+    throw err;
+  }
+}
 
 async function getCustomerPathMap() {
   if (CUSTOMER_CACHE.map && Date.now() - CUSTOMER_CACHE.builtAt < CUSTOMER_TTL_MS) {
@@ -1599,9 +1661,15 @@ app.get('/api/customer-migration-plan', async (req, res) => {
 app.get('/arrears/by-customer', async (req, res) => {
   try {
     const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
-    const excludeToday = req.query.excludeToday === '1' || req.query.excludeToday === 'true';
+    // Default: real arrear only (past-due, excludes today's due invoices).
+    // Pass ?excludeToday=0 to include today's due invoices in the total.
+    const excludeToday = req.query.excludeToday !== '0' && req.query.excludeToday !== 'false';
     const dueOp = excludeToday ? '<' : '<=';
     const branchFilter = (req.query.branch || '').toString().toLowerCase();
+    // ?onlyBoda=1 filters to customers whose loan officer name contains "BODA"
+    // (case-insensitive) — excludes corporate/top-level customers like
+    // IGROUP + officers without a BODA tag (HAPPY MAGARI, MUTESI SANGABO, etc.).
+    const onlyBoda = req.query.onlyBoda === '1' || req.query.onlyBoda === 'true';
 
     const customerMap = await getCustomerPathMap();
 
@@ -1627,6 +1695,11 @@ app.get('/arrears/by-customer', async (req, res) => {
         const branch = parts[0] || '(unknown)';
         if (branchFilter && branch.toLowerCase() !== branchFilter) continue;
         const customerLeaf = parts[parts.length - 1] || customer;
+        // QB customer path is BRANCH:LOAN_OFFICER[:SUB_LOAN_OFFICER]:CUSTOMER.
+        // parts[1] is the loan officer when path has ≥3 parts (2 parts = branch:customer, no officer).
+        const loanOfficer = parts.length >= 3 ? parts[1] : null;
+        const subLoanOfficer = parts.length >= 4 ? parts[2] : null;
+        if (onlyBoda && !(loanOfficer && loanOfficer.toUpperCase().includes('BODA'))) continue;
         const balance = Number(inv.Balance ?? 0);
         const amount = Number(inv.TotalAmt ?? 0);
         const partial = balance !== amount;
@@ -1636,6 +1709,8 @@ app.get('/arrears/by-customer', async (req, res) => {
             customer,
             customerLeaf,
             branch,
+            loan_officer: loanOfficer,
+            sub_loan_officer: subLoanOfficer,
             invoices: 0,
             partial_invoices: 0,
             open_balance: 0,
@@ -1672,6 +1747,78 @@ app.get('/arrears/by-customer', async (req, res) => {
   } catch (err) {
     console.error('[GET /arrears/by-customer]', err);
     res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
+  }
+});
+
+/**
+ * /customer/by-plate — full customer profile for a motorcycle plate.
+ *
+ * Input:  ?plate=MC768FZK
+ * Output: pikipiki record (name/phone/wakandi_id) + matched QB customer
+ *         (id, full BRANCH:OFFICER[:SUB]:CUSTOMER path, loan_officer,
+ *         sub_loan_officer, branch) + optional current arrear balance.
+ *
+ * Matching: plate → pikipiki record → normalized-name → QB customerPathMap.
+ * If a customer isn't in pikipiki, or their pikipiki name doesn't match any
+ * QB customer leaf, we return the pikipiki record with qb_customer=null so
+ * the caller can still see what's known.
+ */
+app.get('/customer/by-plate', async (req, res) => {
+  try {
+    const rawPlate = String(req.query.plate || '').trim().toUpperCase();
+    if (!rawPlate) return res.status(400).json({ error: 'plate= required' });
+
+    const plateMap = await getPikipikiPlateMap();
+    const rec = plateMap.get(rawPlate);
+    if (!rec) return res.status(404).json({ error: `plate ${rawPlate} not found in pikipiki roster` });
+
+    // Reverse-lookup the QB customer by matching pikipiki name to leaf name.
+    const normName = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
+    const targetName = normName(rec.name);
+    const customerMap = await getCustomerPathMap();
+    let qbCustomer = null;
+    for (const [id, path] of customerMap) {
+      const leaf = path.split(':').pop() || path;
+      if (normName(leaf) === targetName) {
+        const parts = path.split(':');
+        qbCustomer = {
+          customer_id: id,
+          full_path: path,
+          leaf,
+          branch: parts[0] || null,
+          loan_officer: parts.length >= 3 ? parts[1] : null,
+          sub_loan_officer: parts.length >= 4 ? parts[2] : null,
+        };
+        break;
+      }
+    }
+
+    // Optional: fetch current arrear balance for this QB customer.
+    let arrear = null;
+    if (qbCustomer && (req.query.includeArrear === '1' || req.query.includeArrear === 'true')) {
+      const sql = `SELECT Balance FROM Invoice WHERE Balance > '0' AND CustomerRef = '${qbCustomer.customer_id}' AND DueDate < '${new Date().toISOString().slice(0,10)}'`;
+      const r = await qbQuery(sql);
+      const invs = r.QueryResponse?.Invoice ?? [];
+      arrear = {
+        invoices: invs.length,
+        open_balance: Math.round(invs.reduce((s, i) => s + Number(i.Balance || 0), 0) * 100) / 100,
+      };
+    }
+
+    res.json({
+      plate: rec.plate,
+      pikipiki: {
+        name: rec.name,
+        phone: rec.phone,
+        wakandi_id: rec.wakandi_id,
+        source_tab: rec.source,
+      },
+      qb_customer: qbCustomer,
+      arrear,
+    });
+  } catch (err) {
+    console.error('[GET /customer/by-plate]', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -2939,6 +3086,20 @@ app.listen(PORT, () => {
   // QB API (minutes). Set QB_MIRROR_POLLER_ENABLED=false to disable.
   if (process.env.QB_MIRROR_POLLER_ENABLED !== 'false') {
     startQbMirrorPoller();
+  }
+  // Frappe payment mirror CDC poller — same pattern for the APRUNA-diverted
+  // payments landing in Frappe. Officer/mega comparison merges qb_payments +
+  // frappe_payments for APRUNA customers. Set FRAPPE_MIRROR_POLLER_ENABLED=
+  // false to disable.
+  if (process.env.FRAPPE_MIRROR_POLLER_ENABLED !== 'false') {
+    (async () => {
+      try {
+        const { startFrappeMirrorPoller } = await import('./frappe-mirror-poller.js');
+        startFrappeMirrorPoller();
+      } catch (err) {
+        console.error('[server] failed to start frappe-mirror-poller:', err.message);
+      }
+    })();
   }
   // Phase 4 — daily_officer_snapshot refresher. Maintains pre-computed
   // per-(date, officer) aggregates so multi-day windows are instant.

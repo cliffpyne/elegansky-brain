@@ -639,3 +639,37 @@ CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_date
   ON daily_officer_snapshot (date DESC);
 CREATE INDEX IF NOT EXISTS idx_daily_officer_snapshot_officer
   ON daily_officer_snapshot (officer_id, date DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 2026-07-17 — Frappe Payment Entry mirror. Same pattern as qb_payments.
+-- APRUNA THOMAS BODA's cohort routes to Frappe now (via apruna-divert), so
+-- the officer/mega/comparison reports need to sum QB payments + Frappe
+-- payments per customer/day. cdcSync polls elegansky.api.recent_payments
+-- (or /api/resource/Payment Entry filtered by `modified`) every N minutes;
+-- the same upsert path is called from the frappe-webhook module for
+-- real-time updates.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS frappe_payments (
+  name              text          PRIMARY KEY,        -- Frappe Payment Entry name
+  party             text          NOT NULL,           -- Frappe customer name
+  posting_date      date          NOT NULL,
+  paid_amount       numeric       NOT NULL,
+  mode_of_payment   text,                             -- NMB / CRDB / iPhone / SAVCOM NMB / etc.
+  reference_no      text,                             -- bank_ref (txn_id)
+  docstatus         smallint      NOT NULL DEFAULT 1, -- 0=draft, 1=submitted, 2=cancelled
+  frappe_modified   timestamptz,                      -- Frappe's `modified` field for CDC
+  mirror_synced_at  timestamptz   NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_frappe_payments_posting_date
+  ON frappe_payments (posting_date);
+CREATE INDEX IF NOT EXISTS idx_frappe_payments_party
+  ON frappe_payments (party);
+CREATE INDEX IF NOT EXISTS idx_frappe_payments_reference_no
+  ON frappe_payments (reference_no) WHERE reference_no IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS frappe_mirror_state (
+  entity            text          PRIMARY KEY,        -- 'PaymentEntry'
+  last_cdc_at       timestamptz   NOT NULL,           -- high-water mark for CDC
+  last_backfill_at  timestamptz,
+  rows_synced       bigint        NOT NULL DEFAULT 0
+);
