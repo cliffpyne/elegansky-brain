@@ -1608,6 +1608,90 @@ export function mountOfficerReportsApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // GET /api/officer-reports/apruna-comparison?date=YYYY-MM-DD
+  // Returns APRUNA THOMAS BODA's REAL collection for the given date by
+  // summing:
+  //   qb_collection      — payment_uploads rows for APRUNA customers
+  //                        (batches whose Payments live in QB — pre-divert
+  //                        path, still used for the ~207 old APRUNA whose
+  //                        name isn't in the roster's byName yet).
+  //   frappe_collection  — frappe_payments rows whose party is an APRUNA
+  //                        roster customer (post-divert path).
+  //   combined           — qb + frappe. The number that reflects reality.
+  //
+  // Also breaks it down by (source, mode_of_payment) so you can see NMB vs
+  // CRDB vs iPhone contribution regardless of which pipeline they went
+  // through today.
+  app.get('/api/officer-reports/apruna-comparison', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.query.date || todayEatDate());
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+
+      // 1. QB side — read exactly the same way computeOfficerReport does,
+      //    filtered to APRUNA's officer_id via customer_officer_map.
+      const qbRes = await db().query(
+        `SELECT COALESCE(SUM(pu.amount), 0)::numeric AS total, COUNT(*)::int AS n,
+                COALESCE(m.officer_id, '?') AS officer_id,
+                COALESCE(m.officer_name, '?') AS officer_name
+           FROM payment_uploads pu
+           JOIN customer_officer_map m ON m.customer_id = pu.customer_id
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE COALESCE(
+                  substring(pb.created_by from '_(\\d{4}-\\d{2}-\\d{2})$')::date,
+                  (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date
+                ) = $1
+            AND pu.status = 'created'
+            AND UPPER(m.officer_name) = 'APRUNA THOMAS BODA'
+          GROUP BY m.officer_id, m.officer_name`,
+        [date],
+      );
+      const qb_row = qbRes.rows[0] || { total: 0, n: 0, officer_id: null, officer_name: null };
+
+      // 2. Frappe side — sum frappe_payments across all APRUNA roster parties
+      //    (both old cohort with qb_id and new 32 Frappe-only).
+      const { getAprunaCache } = await import('./apruna-resolver.js');
+      const roster = await getAprunaCache();
+      const parties = new Set();
+      for (const e of roster.byPlate.values())  if (e.customer) parties.add(String(e.customer));
+      for (const e of roster.byQbId.values())   if (e.customer) parties.add(String(e.customer));
+      const partyList = [...parties];
+      const frappeRes = await db().query(
+        `SELECT COALESCE(SUM(paid_amount), 0)::numeric AS total, COUNT(*)::int AS n,
+                mode_of_payment
+           FROM frappe_payments
+          WHERE party = ANY($1) AND posting_date = $2::date AND docstatus = 1
+          GROUP BY mode_of_payment`,
+        [partyList, date],
+      );
+      let frappe_total = 0, frappe_n = 0;
+      const frappe_by_mode = [];
+      for (const r of frappeRes.rows) {
+        frappe_total += Number(r.total);
+        frappe_n += Number(r.n);
+        frappe_by_mode.push({ mode_of_payment: r.mode_of_payment, total: Number(r.total), count: Number(r.n) });
+      }
+
+      const qb_total = Number(qb_row.total);
+      const qb_n = Number(qb_row.n);
+      res.json({
+        date,
+        officer: 'APRUNA THOMAS BODA',
+        officer_id: qb_row.officer_id,
+        qb_collection: qb_total,
+        qb_payment_count: qb_n,
+        frappe_collection: frappe_total,
+        frappe_payment_count: frappe_n,
+        frappe_by_mode,
+        combined: qb_total + frappe_total,
+        roster_size: partyList.length,
+        note: 'qb from payment_uploads (pre-divert path). frappe from frappe_payments (post-divert path). Combined = real total.',
+      });
+    } catch (err) {
+      console.error('[officer-reports] apruna-comparison failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/officer-reports/kijichi-today
   app.get('/api/officer-reports/kijichi-today', requireSecretOrJwt, async (req, res) => {
     try {
