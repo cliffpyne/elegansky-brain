@@ -100,9 +100,13 @@ function buildIndex(list) {
     if (entry.phone9) byPhone.set(entry.phone9, entry);
     // Track name collisions so we don't route a bank row to the wrong customer
     // when two people share "JOHN JOSEPH MOHAMED" (Frank's plates exist to
-    // disambiguate that exact case).
+    // disambiguate that exact case). Dedupe within a single customer's own
+    // name fields (customer + display_name are usually the same string).
+    const nameKeys = new Set();
     for (const k of [cleanName(entry.customer), cleanName(entry.display_name)]) {
-      if (!k) continue;
+      if (k) nameKeys.add(k);
+    }
+    for (const k of nameKeys) {
       nameCounts.set(k, (nameCounts.get(k) || 0) + 1);
       if (!byName.has(k)) byName.set(k, entry);
     }
