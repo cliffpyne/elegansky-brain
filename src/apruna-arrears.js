@@ -79,9 +79,11 @@ export async function getAprunaOverdueRows(asOf) {
     dueDate: inv.due_date,
     type: 'Invoice',
     no: inv.name,
-    // Match the QB path shape (COUNTRY:OFFICER:CUSTOMER) so branch = APRUNA THOMAS BODA
-    customer: `APRUNA THOMAS BODA:${inv.customer}`,
-    branch: 'APRUNA THOMAS BODA',
+    // Match the QB path shape exactly (BRANCH:OFFICER:CUSTOMER) so m6pm's
+    // sync_mobile can attribute rows to APRUNA. Real QB APRUNA path is
+    // "KIJICHI BRANCH:APRUNA THOMAS BODA:<customer>" — mirror it.
+    customer: `KIJICHI BRANCH:APRUNA THOMAS BODA:${inv.customer}`,
+    branch: 'KIJICHI BRANCH',
     customerLeaf: String(inv.customer || ''),
     memo: '',
     balance: Number(inv.outstanding_amount || 0),
