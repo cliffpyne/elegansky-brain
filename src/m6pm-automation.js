@@ -739,11 +739,31 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       if (!Array.isArray(morning)) return res.status(500).json({ error: 'cache value is not an array' });
       const sumBalance = (arr) => arr.reduce((s, row) => s + (Number(row.balance) || 0), 0);
       const before = { count: morning.length, total_balance: sumBalance(morning) };
-      const filtered = morning.filter((row) => String(row.dueDate || '') !== date);
+      // Dedup key: whichever identifier is present — invoice no, then qbId, then ref.
+      // Falls back to customer+amount+date if none of those exist. Keeps the FIRST
+      // occurrence, discards subsequent duplicates.
+      const seen = new Set();
+      const filtered = [];
+      const dupKeys = {};
+      let sampleFieldNames = null;
+      for (const row of morning) {
+        if (!sampleFieldNames) sampleFieldNames = Object.keys(row);
+        const key = String(
+          row.no || row.qbId || row.ref
+          || `${row.customer || ''}|${row.balance || 0}|${row.date || ''}`
+        );
+        if (seen.has(key)) {
+          dupKeys[key] = (dupKeys[key] || 1) + 1;
+          continue;
+        }
+        seen.add(key);
+        filtered.push(row);
+      }
       const after = { count: filtered.length, total_balance: sumBalance(filtered) };
       const removed = {
         count: before.count - after.count,
         total_balance: before.total_balance - after.total_balance,
+        sample_dup_keys: Object.entries(dupKeys).slice(0, 8).map(([k, n]) => ({ key: k, times: n })),
       };
       if (!dryRun) {
         await pool.query(
@@ -751,7 +771,7 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
           [key, JSON.stringify(filtered)],
         );
       }
-      res.json({ date, dry_run: dryRun, before, after, removed });
+      res.json({ date, dry_run: dryRun, before, after, removed, sample_field_names: sampleFieldNames });
     } catch (err) {
       console.error('[dedup-morning-arrears]', err);
       res.status(500).json({ error: err.message });
