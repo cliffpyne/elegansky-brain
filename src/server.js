@@ -1023,17 +1023,18 @@ app.get('/arrears', async (req, res) => {
     const r = await qbQuery(sql);
     const raw = r.QueryResponse?.Invoice ?? [];
     let rows = raw.map(enrich).filter(matchesFilters);
+    const nextStart = raw.length === fetchSize ? start + fetchSize : null;
     if (aprunaRows) {
       rows = rows.filter((row) => !isAprunaRow(row));
-      // Inject Frappe APRUNA rows on the FIRST page only (Frappe list is
-      // small — a few hundred at most — fits easily). Downstream aggregators
-      // that page through the endpoint will see them exactly once.
-      if (start === 1) {
-        for (const ar of aprunaRows) if (matchesFilters(ar)) rows.push(ar);
-      }
     }
     rows = rows.slice(0, pageSize);
-    const nextStart = raw.length === fetchSize ? start + fetchSize : null;
+    // Frank 2026-07-18: inject the full Frappe APRUNA list on the LAST page
+    // (nextStart === null) so downstream aggregators (m6pm fetchAllArrears)
+    // grab every one of them exactly once. Do NOT slice the Frappe rows —
+    // there are only a few hundred and pagination is done for this fetch.
+    if (aprunaRows && nextStart === null) {
+      for (const ar of aprunaRows) if (matchesFilters(ar)) rows.push(ar);
+    }
     res.json({
       asOf,
       page: { start, pageSize, returned: rows.length, nextStart },
