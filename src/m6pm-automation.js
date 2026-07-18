@@ -754,16 +754,15 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const evening = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
       // 2. Query today's paid payment_uploads with per-invoice detail.
       //    kind='paid' rows have invoice_no populated. Sum amount per invoice_no.
-      // Mirror today-totals's tz + column choice: filter by
-      // pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam' (matches how the
-      // rest of BRAIN attributes "today's rows"). pu.status='created' is
-      // the successful-push state (never 'finalized' — that's a
-      // payment_batches value).
+      // Actual filter (verified via sql_only debug): kind='payment' (not
+      // 'paid'), and successful push status is 'created' for QB channels
+      // + 'pushed_to_frappe' for SAVCOM Frappe channels. All contribute
+      // to today's collections against arrears.
       const puRes = await pool.query(
         `SELECT pu.invoice_no, pu.customer_id, pu.customer_name, SUM(pu.amount)::bigint AS total_paid
            FROM payment_uploads pu
-          WHERE pu.kind = 'paid'
-            AND pu.status = 'created'
+          WHERE pu.kind = 'payment'
+            AND pu.status IN ('created', 'pushed_to_frappe')
             AND pu.invoice_no IS NOT NULL AND pu.invoice_no <> ''
             AND (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1::date
           GROUP BY pu.invoice_no, pu.customer_id, pu.customer_name`,
