@@ -495,6 +495,85 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
     }
   });
 
+  // Dashboard-friendly wrapper: fetch live arrears via fetchAllArrears +
+  // seed morning_arrears:<today>. Frank 2026-07-15: dashboard button so
+  // an operator can seed the baseline mid-morning without paginating
+  // /arrears in the browser.
+  app.post('/api/admin/m6pm/save-morning-snapshot-now', requireSecretOrJwt, async (req, res) => {
+    try {
+      const brainSelfBase = `${req.protocol}://${req.get('host')}`;
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      const ymd = todayYmdEat();
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [`morning_arrears:${ymd}`, JSON.stringify(arrears)],
+      );
+      const totalBalance = arrears.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      res.json({
+        ok: true,
+        date: ymd,
+        rows: arrears.length,
+        total_balance: totalBalance,
+      });
+    } catch (err) {
+      console.error('[m6pm/save-morning-snapshot-now]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Dashboard-friendly debt-report fire: fetches LIVE arrears (current
+  // QB state), builds XLS, posts to m6pm, and broadcasts signed link
+  // SMS to admin list. Frank 2026-07-15: /trigger endpoint doesn't send
+  // link SMS by default; this closes that gap for the dashboard button.
+  app.post('/api/admin/m6pm/fire-debt-report-now', requireSecretOrJwt, async (req, res) => {
+    try {
+      const brainSelfBase = `${req.protocol}://${req.get('host')}`;
+      const today = todayYmdEat();
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      const buf = buildArrearsXls(arrears, null);
+      const m6pmResp = await postArrearsToM6pm(buf, 'morning');
+      const link = signedReportUrl({ path: 'page', date: today, name: '*', mode: 'morning' });
+      const smsSent = [];
+      if (link) {
+        const text = `BRAIN Debt report (${today}) ready: ${link}`;
+        for (const phone of broadcastPhones()) {
+          const r = await sendNextSms(phone, text);
+          smsSent.push({ phone, ok: r.ok !== false });
+        }
+      }
+      res.json({
+        ok: true,
+        date: today,
+        arrears_count: arrears.length,
+        m6pm_reports: m6pmResp,
+        link,
+        sms_sent: smsSent,
+      });
+    } catch (err) {
+      console.error('[m6pm/fire-debt-report-now]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Dashboard button: send-overdue-sms to customers based on current
+  // arrears. Fetches live arrears, posts XLS to m6pm's
+  // /api/autofire/send-overdue-sms which handles per-officer sender
+  // routing + NextSMS dispatch. Frank 2026-07-15.
+  app.post('/api/admin/m6pm/send-arrear-sms-now', requireSecretOrJwt, async (req, res) => {
+    try {
+      const dryRun = req.body?.dry_run === true;
+      const brainSelfBase = `${req.protocol}://${req.get('host')}`;
+      const arrears = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      const buf = buildArrearsXls(arrears, null);
+      const m6pmResp = await postSendOverdueSms(buf, { dryRun });
+      res.json({ ok: true, arrears_count: arrears.length, dry_run: dryRun, m6pm: m6pmResp });
+    } catch (err) {
+      console.error('[m6pm/send-arrear-sms-now]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Worker self-report: the eleganskyCrdb statement-pull worker POSTs
   // here at the end of each tick run with what it believes it did. The
   // tick-result watcher reads this BEFORE deciding to fire any SMS so a
@@ -629,6 +708,52 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       res.json({ key, new_value: value, previous_value: prev.rows[0]?.value ?? null });
     } catch (err) {
       console.error('[app-settings/set]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /api/admin/m6pm/dedup-morning-arrears
+   * Body: { date?: "YYYY-MM-DD", dry_run?: boolean }
+   *
+   * Frank 2026-07-18: when the 05:00 EAT auto-fire didn't run, we reseed
+   * morning_arrears from /arrears — but /arrears defaults to
+   * excludeToday=false while fetchAllArrears in the evening comparison uses
+   * excludeToday=true. The mismatch means morning includes today's
+   * due-date rows but evening excludes them, inflating "collected" by ~9-10M.
+   *
+   * This one-shot endpoint reads the frozen morning_arrears:${date},
+   * removes rows whose dueDate === ${date}, and writes the cleaned JSON
+   * back so morning-vs-evening compare is like-for-like.
+   */
+  app.post('/api/admin/m6pm/dedup-morning-arrears', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.body?.date || todayYmdEat());
+      const dryRun = req.body?.dry_run === true;
+      const key = `morning_arrears:${date}`;
+      const r = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [key]);
+      if (!r.rows.length) return res.status(404).json({ error: `no ${key} cache` });
+      let morning;
+      try { morning = JSON.parse(r.rows[0].value); }
+      catch (e) { return res.status(500).json({ error: `cache parse failed: ${e.message}` }); }
+      if (!Array.isArray(morning)) return res.status(500).json({ error: 'cache value is not an array' });
+      const sumBalance = (arr) => arr.reduce((s, row) => s + (Number(row.balance) || 0), 0);
+      const before = { count: morning.length, total_balance: sumBalance(morning) };
+      const filtered = morning.filter((row) => String(row.dueDate || '') !== date);
+      const after = { count: filtered.length, total_balance: sumBalance(filtered) };
+      const removed = {
+        count: before.count - after.count,
+        total_balance: before.total_balance - after.total_balance,
+      };
+      if (!dryRun) {
+        await pool.query(
+          `UPDATE app_settings SET value=$2, updated_at=now() WHERE key=$1`,
+          [key, JSON.stringify(filtered)],
+        );
+      }
+      res.json({ date, dry_run: dryRun, before, after, removed });
+    } catch (err) {
+      console.error('[dedup-morning-arrears]', err);
       res.status(500).json({ error: err.message });
     }
   });
@@ -1215,6 +1340,10 @@ async function maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, t
 }
 
 async function maybeFireHeisenbergReport({ pool, sharedSecret, brainSelfBase, today }) {
+  // Frank 2026-07-15: disabled. Only morning debt / noon debt / evening
+  // comparison reports go out. Per-heisenberg catch-up reports were spammy.
+  return;
+  // eslint-disable-next-line no-unreachable
   // Any heisenberg-tagged batch finalize in the last 5 min?
   const recent = await pool.query(
     `SELECT id FROM payment_batches
