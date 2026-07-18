@@ -742,11 +742,11 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         `SELECT pu.invoice_no, pu.customer_id, pu.customer_name, SUM(pu.amount)::bigint AS total_paid
            FROM payment_uploads pu
            JOIN payment_batches pb ON pb.id = pu.batch_id
-          WHERE pu.kind = 'paid' AND pu.status IN ('created', 'finalized')
+          WHERE pu.kind = 'paid'
+            AND pu.status = 'created'
             AND pu.invoice_no IS NOT NULL AND pu.invoice_no <> ''
-            AND pb.finalized_at >= ($1::date AT TIME ZONE 'Africa/Nairobi')
-            AND pb.finalized_at <  (($1::date + INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi')
             AND pb.status = 'finalized'
+            AND (pb.finalized_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date
           GROUP BY pu.invoice_no, pu.customer_id, pu.customer_name`,
         [date],
       );
