@@ -738,15 +738,18 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const evening = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
       // 2. Query today's paid payment_uploads with per-invoice detail.
       //    kind='paid' rows have invoice_no populated. Sum amount per invoice_no.
+      // Mirror today-totals's tz + column choice: filter by
+      // pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam' (matches how the
+      // rest of BRAIN attributes "today's rows"). pu.status='created' is
+      // the successful-push state (never 'finalized' — that's a
+      // payment_batches value).
       const puRes = await pool.query(
         `SELECT pu.invoice_no, pu.customer_id, pu.customer_name, SUM(pu.amount)::bigint AS total_paid
            FROM payment_uploads pu
-           JOIN payment_batches pb ON pb.id = pu.batch_id
           WHERE pu.kind = 'paid'
             AND pu.status = 'created'
             AND pu.invoice_no IS NOT NULL AND pu.invoice_no <> ''
-            AND pb.status = 'finalized'
-            AND (pb.finalized_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date
+            AND (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1::date
           GROUP BY pu.invoice_no, pu.customer_id, pu.customer_name`,
         [date],
       );
