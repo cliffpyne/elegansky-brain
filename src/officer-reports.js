@@ -625,6 +625,41 @@ export async function refreshOfficerArrears({ force = false } = {}) {
     p.overdue_invoice_count += 1;
   }
 
+  // Frank 2026-07-18: APRUNA THOMAS BODA's cohort routes to Frappe. QB-side
+  // arrears drift stale for him — override his row with Frappe-derived
+  // totals so the morning snapshot reflects reality. Silent replacement —
+  // no schema / report format change. Fails safe: on any error we log and
+  // keep the QB number (better than blowing up the snapshot job).
+  try {
+    const { getAprunaArrearsSummary } = await import('./apruna-arrears.js');
+    const ap = await getAprunaArrearsSummary(date);
+    let target = null;
+    for (const [, entry] of perOfficer) {
+      if (String(entry.officer_name || '').trim().toUpperCase() === 'APRUNA THOMAS BODA') { target = entry; break; }
+    }
+    if (target) {
+      console.log(`[officer-arrears] APRUNA override: qb=${target.total_arrears.toLocaleString()} (${target.overdue_invoice_count}) → frappe=${ap.total_arrears.toLocaleString()} (${ap.overdue_invoice_count})`);
+      target.total_arrears = ap.total_arrears;
+      target.overdue_invoice_count = ap.overdue_invoice_count;
+    } else if (ap.total_arrears > 0 || ap.overdue_invoice_count > 0) {
+      // APRUNA had no QB overdue rows this run — inject a fresh entry.
+      // officer_id fetched from customer_officer_map on any APRUNA customer.
+      const q = await db().query(`SELECT officer_id, officer_name FROM customer_officer_map WHERE UPPER(officer_name) = 'APRUNA THOMAS BODA' LIMIT 1`);
+      const row = q.rows[0];
+      if (row) {
+        perOfficer.set(row.officer_id, {
+          officer_id: row.officer_id,
+          officer_name: row.officer_name,
+          total_arrears: ap.total_arrears,
+          overdue_invoice_count: ap.overdue_invoice_count,
+        });
+        console.log(`[officer-arrears] APRUNA injected fresh row: frappe=${ap.total_arrears.toLocaleString()} (${ap.overdue_invoice_count})`);
+      }
+    }
+  } catch (err) {
+    console.error(`[officer-arrears] APRUNA Frappe override failed (keeping QB number): ${err.message}`);
+  }
+
   const client = await db().connect();
   try {
     await client.query('BEGIN');
