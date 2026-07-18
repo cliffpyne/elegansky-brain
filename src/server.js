@@ -954,6 +954,20 @@ app.get('/arrears', async (req, res) => {
       return true;
     };
 
+    // Frank 2026-07-18: APRUNA THOMAS BODA's cohort routes to Frappe. Filter
+    // his QB rows out and inject Frappe-derived rows so every /arrears
+    // consumer (dashboard, m6pm morning xls, sync mobile, arrear SMS) sees
+    // the right number without any format change.
+    const APRUNA_MARKER = 'APRUNA THOMAS BODA';
+    const isAprunaRow = (row) => String(row.customer || '').toUpperCase().includes(APRUNA_MARKER);
+    let aprunaRows = null;
+    try {
+      const { getAprunaOverdueRows } = await import('./apruna-arrears.js');
+      aprunaRows = await getAprunaOverdueRows(asOf);
+    } catch (err) {
+      console.error(`[/arrears] APRUNA Frappe fetch failed (falling back to QB for him): ${err.message}`);
+    }
+
     if (wantSummary) {
       // QB doesn't expose SUM(); page-walk the whole filtered set in chunks
       // of 1000 and tally on our side.
@@ -973,12 +987,21 @@ app.get('/arrears', async (req, res) => {
         for (const inv of invs) {
           const row = enrich(inv);
           if (!matchesFilters(row)) continue;
+          if (aprunaRows && isAprunaRow(row)) continue; // skip QB APRUNA, Frappe injected below
           count++;
           totalBalance += row.balance;
           branchCounts[row.branch] = (branchCounts[row.branch] || 0) + 1;
         }
         if (invs.length < PAGE) break;
         start += PAGE;
+      }
+      if (aprunaRows) {
+        for (const row of aprunaRows) {
+          if (!matchesFilters(row)) continue;
+          count++;
+          totalBalance += row.balance;
+          branchCounts[row.branch] = (branchCounts[row.branch] || 0) + 1;
+        }
       }
       return res.json({
         asOf,
@@ -999,7 +1022,17 @@ app.get('/arrears', async (req, res) => {
       `STARTPOSITION ${start} MAXRESULTS ${fetchSize}`;
     const r = await qbQuery(sql);
     const raw = r.QueryResponse?.Invoice ?? [];
-    const rows = raw.map(enrich).filter(matchesFilters).slice(0, pageSize);
+    let rows = raw.map(enrich).filter(matchesFilters);
+    if (aprunaRows) {
+      rows = rows.filter((row) => !isAprunaRow(row));
+      // Inject Frappe APRUNA rows on the FIRST page only (Frappe list is
+      // small — a few hundred at most — fits easily). Downstream aggregators
+      // that page through the endpoint will see them exactly once.
+      if (start === 1) {
+        for (const ar of aprunaRows) if (matchesFilters(ar)) rows.push(ar);
+      }
+    }
+    rows = rows.slice(0, pageSize);
     const nextStart = raw.length === fetchSize ? start + fetchSize : null;
     res.json({
       asOf,
