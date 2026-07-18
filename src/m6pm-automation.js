@@ -713,6 +713,107 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
   });
 
   /**
+   * POST /api/admin/m6pm/rebuild-morning-from-evening
+   * Body: { date?: "YYYY-MM-DD", dry_run?: boolean }
+   *
+   * Frank 2026-07-18: when the frozen morning baseline drifts (e.g. seeded
+   * pre-code-change and evening comparison uses post-change /arrears),
+   * mathematically rebuild the morning arrears from CURRENT live arrears
+   * plus today's per-invoice paid payment_uploads. The reconstructed
+   * baseline satisfies: morning_total - evening_total = today's actual
+   * collections. Per-officer breakdown stays honest because balance is
+   * added back to the actual affected invoices.
+   *
+   * Payments applied to invoices NOT currently in arrears (invoice was
+   * fully paid → dropped) are synthesized as new arrears rows with the
+   * payment amount as balance.
+   */
+  app.post('/api/admin/m6pm/rebuild-morning-from-evening', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.body?.date || todayYmdEat());
+      const dryRun = req.body?.dry_run === true;
+      const brainSelfBase = `${req.protocol}://${req.get('host')}`;
+      // 1. Fetch live evening arrears (excludeToday=true = matches
+      //    fire-evening-comparison's later pull).
+      const evening = await fetchAllArrears({ brainSelfBase, sharedSecret, excludeToday: true });
+      // 2. Query today's paid payment_uploads with per-invoice detail.
+      //    kind='paid' rows have invoice_no populated. Sum amount per invoice_no.
+      const puRes = await pool.query(
+        `SELECT pu.invoice_no, pu.customer_id, pu.customer_name, SUM(pu.amount)::bigint AS total_paid
+           FROM payment_uploads pu
+           JOIN payment_batches pb ON pb.id = pu.batch_id
+          WHERE pu.kind = 'paid' AND pu.status IN ('created', 'finalized')
+            AND pu.invoice_no IS NOT NULL AND pu.invoice_no <> ''
+            AND pb.finalized_at >= ($1::date AT TIME ZONE 'Africa/Nairobi')
+            AND pb.finalized_at <  (($1::date + INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi')
+            AND pb.status = 'finalized'
+          GROUP BY pu.invoice_no, pu.customer_id, pu.customer_name`,
+        [date],
+      );
+      // 3. Reconstruct morning: for each paid invoice, add balance back to
+      //    the matching arrears row (matched by `no`). If not found, insert
+      //    a synthesized row (invoice was fully paid → removed from evening).
+      const eveningByNo = new Map();
+      for (const row of evening) eveningByNo.set(String(row.no || ''), row);
+      const morning = evening.map((row) => ({ ...row }));
+      const morningByNo = new Map();
+      for (const row of morning) morningByNo.set(String(row.no || ''), row);
+      let addedBack = 0;
+      let synthesized = 0;
+      let totalAddBack = 0;
+      for (const p of puRes.rows) {
+        const invNo = String(p.invoice_no);
+        const paid = Number(p.total_paid) || 0;
+        totalAddBack += paid;
+        if (morningByNo.has(invNo)) {
+          morningByNo.get(invNo).balance = (Number(morningByNo.get(invNo).balance) || 0) + paid;
+          addedBack++;
+        } else {
+          // Synthesize a fresh arrears row for this fully-paid invoice.
+          morning.push({
+            qbId: null,
+            customerId: p.customer_id || null,
+            date: null,
+            dueDate: null,
+            type: 'Invoice',
+            no: invNo,
+            customer: p.customer_name || '',
+            branch: '',
+            customerLeaf: p.customer_name || '',
+            memo: '(reconstructed morning: invoice fully paid today)',
+            balance: paid,
+            amount: paid,
+            status: 'overdue',
+          });
+          synthesized++;
+        }
+      }
+      const eveningTotal = evening.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const morningTotal = morning.reduce((s, r) => s + (Number(r.balance) || 0), 0);
+      const key = `morning_arrears:${date}`;
+      if (!dryRun) {
+        await pool.query(
+          `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`,
+          [key, JSON.stringify(morning)],
+        );
+      }
+      res.json({
+        date,
+        dry_run: dryRun,
+        evening: { rows: evening.length, total_balance: eveningTotal },
+        morning_rebuilt: { rows: morning.length, total_balance: morningTotal },
+        payments_applied: { unique_invoices: puRes.rows.length, added_back: addedBack, synthesized },
+        total_added_back: totalAddBack,
+        expected_collected: morningTotal - eveningTotal,
+      });
+    } catch (err) {
+      console.error('[rebuild-morning-from-evening]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
    * POST /api/admin/m6pm/dedup-morning-arrears
    * Body: { date?: "YYYY-MM-DD", dry_run?: boolean }
    *
