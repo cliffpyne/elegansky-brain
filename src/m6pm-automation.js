@@ -735,6 +735,30 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const sqlOnly = req.body?.sql_only === true;
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
       if (sqlOnly) {
+        // Optional refs[] mode: look up specific bank_refs (probes both bare
+        // form + SAV suffixed CS/NS forms so callers can pass raw sheet refs).
+        const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String).map((s) => s.trim()).filter(Boolean) : [];
+        if (refs.length > 0) {
+          const candidates = new Set();
+          for (const r of refs) {
+            candidates.add(r);
+            candidates.add(r + 'CS'); // sav_crdb suffix
+            candidates.add(r + 'NS'); // sav_nmb suffix
+            candidates.add(r + 'B');  // bank suffix
+            candidates.add(r + 'N');  // nmbnew suffix
+            candidates.add(r + 'P');  // iphone_bank suffix
+          }
+          const q = await pool.query(
+            `SELECT pu.bank_ref, pu.status, pu.kind, pu.amount, pu.invoice_no,
+                    pu.customer_name, pu.failure_reason, pb.channel
+               FROM payment_uploads pu
+               JOIN payment_batches pb ON pb.id = pu.batch_id
+              WHERE pu.bank_ref = ANY($1::text[])
+              ORDER BY pu.created_at`,
+            [[...candidates]],
+          );
+          return res.json({ refs_probed: refs.length, hits: q.rows });
+        }
         const dist = await pool.query(
           `SELECT pu.kind, pu.status, pb.channel,
                   COUNT(*) AS c,
