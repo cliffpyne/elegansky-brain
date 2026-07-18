@@ -735,23 +735,19 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const sqlOnly = req.body?.sql_only === true;
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
       if (sqlOnly) {
-        const q = await pool.query(
-          `SELECT pu.invoice_no, pu.customer_id, pu.customer_name, pu.status, pu.kind, pu.amount,
-                  pu.created_at, pb.channel, pb.status AS pb_status
+        const dist = await pool.query(
+          `SELECT pu.kind, pu.status, pb.channel,
+                  COUNT(*) AS c,
+                  COUNT(*) FILTER (WHERE invoice_no IS NOT NULL AND invoice_no <> '') AS with_inv,
+                  SUM(pu.amount) AS total
              FROM payment_uploads pu
              JOIN payment_batches pb ON pb.id = pu.batch_id
             WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1::date
-            ORDER BY pu.created_at DESC LIMIT 20`,
+            GROUP BY pu.kind, pu.status, pb.channel
+            ORDER BY c DESC`,
           [date],
         );
-        const total = await pool.query(
-          `SELECT COUNT(*) AS c,
-                  COUNT(*) FILTER (WHERE kind='paid' AND status='created' AND invoice_no IS NOT NULL AND invoice_no <> '') AS c_filter
-             FROM payment_uploads pu
-            WHERE (pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date = $1::date`,
-          [date],
-        );
-        return res.json({ sample: q.rows, counts: total.rows[0] });
+        return res.json({ distribution: dist.rows });
       }
       // 1. Fetch live evening arrears (excludeToday=true = matches
       //    fire-evening-comparison's later pull).
