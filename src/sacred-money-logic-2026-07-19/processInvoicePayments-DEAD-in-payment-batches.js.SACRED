@@ -1,0 +1,63 @@
+function processInvoicePayments(invoices, transactions) {
+  const usedTx = new Set();
+  const invByCust = {};
+  invoices.forEach((inv) => {
+    const key = inv.customerPhone || inv.customerName.toLowerCase().trim();
+    (invByCust[key] ||= []).push(inv);
+  });
+  Object.keys(invByCust).forEach((k) => invByCust[k].sort((a, b) => {
+    const dc = new Date(b.invoiceDate) - new Date(a.invoiceDate);
+    return dc !== 0 ? dc : b.invoiceNumber.localeCompare(a.invoiceNumber);
+  }));
+  const txByCust = {};
+  const seen = new Set();
+  transactions.forEach((t) => {
+    if (!t.amount) return;
+    const uid = `${t.transactionId || t.id}_${t.receivedTimestamp}_${t.amount}`;
+    if (seen.has(uid)) return;
+    const keys = [t.customerPhone, t.contractName?.toLowerCase().trim(), t.customerName?.toLowerCase().trim()].filter(Boolean);
+    const k = keys.find((key) => invByCust[key]);
+    if (k) { (txByCust[k] ||= []).push(t); seen.add(uid); }
+  });
+  // OLDEST-first transaction order — verbatim from invoice-payment-app.
+  // (Briefly flipped to newest-first 2026-06-14 in commit a5007b9 when a
+  // 1/359 divergence looked like a sort issue; turned out to be the
+  // QB_DUPLICATE Column L marker correctly filtering out an already-
+  // pushed ref. Reverted — sacred algorithm restored to original.)
+  Object.keys(txByCust).forEach((k) => txByCust[k].sort((a, b) => (a.receivedTimestamp || 0) - (b.receivedTimestamp || 0)));
+  const out = [];
+  Object.keys(invByCust).forEach((ck) => {
+    const ci = invByCust[ck]; const ct = txByCust[ck] || [];
+    if (ct.length === 0) return;
+    const ib = ci.map((inv) => ({ inv, remainingBalance: inv.amount, fullyPaid: false }));
+    let idx = 0;
+    ct.forEach((tx) => {
+      let amt = tx.amount; let used = false; const txp = [];
+      while (amt > 0 && idx < ib.length) {
+        const cur = ib[idx];
+        if (cur.fullyPaid) { idx++; continue; }
+        const pay = Math.min(amt, cur.remainingBalance);
+        const rec = {
+          customerName: cur.inv.customerName, invoiceNo: cur.inv.invoiceNumber,
+          amount: pay, memo: tx.transactionId, memoWithSuffix: appendSuf(tx.transactionId, tx.channel),
+          channel: tx.channel, customerId: cur.inv.customerId, qbId: cur.inv.qbId,
+          sheet_row_number: tx.sheet_row_number,
+        };
+        out.push(rec); txp.push(rec);
+        cur.remainingBalance -= pay; amt -= pay; used = true;
+        if (cur.remainingBalance <= 1) { cur.fullyPaid = true; cur.remainingBalance = 0; idx++; }
+      }
+      if (used) usedTx.add(tx.transactionId || tx.id);
+      if (amt > 0 && txp.length > 0) txp[0].amount += amt;
+    });
+  });
+  const unused = transactions.filter((t) => !usedTx.has(t.transactionId || t.id));
+  unused.forEach((t) => out.push({
+    customerName: t.customerName || t.contractName || 'UNKNOWN',
+    invoiceNo: 'UNUSED', amount: t.amount, transactionAmount: t.amount,
+    memo: t.transactionId, memoWithSuffix: appendSuf(t.transactionId, t.channel),
+    isUnused: true, channel: t.channel,
+    sheet_row_number: t.sheet_row_number,
+  }));
+  return out;
+}
