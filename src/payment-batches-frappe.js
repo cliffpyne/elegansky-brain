@@ -1778,9 +1778,19 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       `);
 
       const PHONE_SHEET_ID = '1XFwPITQgZmzZ8lbg8MKD9S4rwHyk2cDOKrcxO7SAjHA';
-      const PHONE_TAB = 'pikipiki records2';
-      const phoneData = await readSheet(PHONE_SHEET_ID, `${PHONE_TAB}!A2:E5000`);
-      const phoneRows = phoneData.values || phoneData.data || [];
+      const PHONE_TABS = ['pikipiki records', 'pikipiki records2'];
+      const perTabCounts = {};
+      const phoneRows = [];
+      for (const tab of PHONE_TABS) {
+        try {
+          const d = await readSheet(PHONE_SHEET_ID, `${tab}!A2:E5000`);
+          const rows = d.values || d.data || [];
+          perTabCounts[tab] = rows.length;
+          phoneRows.push(...rows);
+        } catch (e) {
+          perTabCounts[tab] = `ERR: ${String(e.message || e).slice(0, 80)}`;
+        }
+      }
 
       const seen = new Set();
       const targets = [];
@@ -1811,6 +1821,7 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       if (dryRun) {
         return res.json({
           dry_run: true,
+          per_tab_rows: perTabCounts,
           sheet_rows_scanned: phoneRows.length,
           unique_phones: targets.length,
           would_send_to: messages.length,
