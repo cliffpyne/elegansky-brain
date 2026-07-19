@@ -5557,10 +5557,17 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
     const isFirstD = (di === 0);
     const isLastD = (di === dates.length - 1);
 
-    // Sub-window A: business-day-D portion → [start, 16:15:59 EAT D]
-    // For the first date, start = marker time + 1ms (exclude the marker row itself).
-    // For later dates, start = 00:00:00 EAT D.
-    const aLoInc = isFirstD ? markerMs + 1 : eatYmdHmsToUtcMs(D, 0, 0, 0);
+    // Sub-window A: business-day-D portion → [00:00 EAT D, 16:16 EAT D)
+    // Fix B (Frank 2026-07-20): first-day lower bound WAS markerMs + 1 which
+    // opened a dead zone for rows that arrived at POC AFTER the fire wrote K
+    // but with timestamps BEFORE K's own timestamp — 5 orphans on 2026-07-19
+    // (rows 37512-37516 in the 6m 39s gap between mawenzi1400 and kili1615:
+    // business). Widened to start-of-day EAT for both isFirstD and later days.
+    // consumed_transactions + external_consumed_refs + QB-preflight-dedupe
+    // still block genuine dupes downstream. TxnDate invariant preserved:
+    // window still stops at 16:16 EAT so every row in sub-window A has
+    // derived TxnDate = D (< 16:15 = kili rule keeps physical day).
+    const aLoInc = eatYmdHmsToUtcMs(D, 0, 0, 0);
     const aHiExc = Math.min(
       eatYmdHmsToUtcMs(D, 16, 16, 0),   // 16:16:00 EAT D (exclusive)
       isLastD ? nowUtcMs + 1 : Number.MAX_SAFE_INTEGER, // never plan beyond now
@@ -5581,7 +5588,10 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
     }
 
     // Sub-window B: business-day-(D+1) tail of D → [16:16:00 EAT D, 00:00:00 EAT D+1)
-    const bLoInc = Math.max(eatYmdHmsToUtcMs(D, 16, 16, 0), isFirstD ? markerMs + 1 : 0);
+    // Fix B applied to sub-window B too: drop markerMs+1 lower bound (was
+    // dead-zoning rows appended below K with ts in 16:16-K-time). Rows in
+    // this window have derived TxnDate = D+1 (>= 16:15 = kili rule rolls day).
+    const bLoInc = eatYmdHmsToUtcMs(D, 16, 16, 0);
     const bHiExc = Math.min(
       eatYmdHmsToUtcMs(eatDateAfter(D), 0, 0, 0), // 24:00:00 EAT D = 00:00:00 EAT D+1
       isLastD ? nowUtcMs + 1 : Number.MAX_SAFE_INTEGER,
@@ -6024,15 +6034,24 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // for backwards-compat with callers reading the response (always 0 now).
   let includedBadFormat = 0;
   for (let i = 1; i < sheet.length; i++) {
-    // Belt + suspenders: skip if ANY of three signals says "already processed"
-    //   (a) Row is at or below the last Column K "end of tick" marker
-    //       (= prior fire's boundary; rows are appended at bottom only)
-    //   (b) Column I (Fetched at) is set on this row
-    //   (c) Column J (QB pushed) is set on this row
-    // K is the primary fast check, I/J are per-row safety nets in case the
-    // K marker got deleted (operator error or malicious). Only way to defeat
-    // all three: delete I, J, AND K from the same row.
-    if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
+    // Fix A (Frank 2026-07-20): the "at or below K" position skip has been
+    // REMOVED. It relied on the append-only rule which the puller violates
+    // occasionally (manual pastes / puller race), causing 3 orphans on
+    // 2026-07-19 (rows 37401 SULTANI, 37403 SIMON, 37407 NAMANI). Per-row
+    // I / J / L markers are now the sole "already processed" signal — they
+    // survive puller reorderings and are per-row precise. Genuine dupes are
+    // caught downstream by consumed_transactions + external_consumed_refs
+    // + QB preflight (all check by bank_ref, not sheet position).
+    //
+    // Row-position K skip removed; K remains as a fire-boundary marker
+    // for the planner's own use (computeCatchupPlan reads it to plan
+    // sub-windows) but no longer as a "silently skip everything above me"
+    // gate at row-selection time.
+    //
+    // Payment-date invariant preserved: this fix does not touch window
+    // bounds. Rows still get filtered by [winStart, winEnd) below, which
+    // computeCatchupPlan guarantees straddle the kili1615 rule correctly
+    // so every accepted row's derived TxnDate matches the fire's TxnDate.
     const colI = String(sheet[i][8] || '').trim();
     const colJ = String(sheet[i][9] || '').trim();
     const colL = String(sheet[i][11] || '').trim();
