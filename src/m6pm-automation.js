@@ -738,6 +738,23 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         // Optional arrears_health mode: prove the morning arrears snapshot
         // saved. Returns last 7 days of officer_arrears_snapshots grouped by
         // date with cached_at + count + total.
+        if (req.body?.morning_arrears_cache === true) {
+          const q = await pool.query(`
+            SELECT key, updated_at,
+                   jsonb_array_length(value::jsonb) AS arrears_rows,
+                   octet_length(value::text) AS bytes
+              FROM app_settings
+             WHERE key LIKE 'morning_arrears:%'
+             ORDER BY updated_at DESC
+             LIMIT 20`);
+          const gate = await pool.query(`
+            SELECT key, value, updated_at
+              FROM app_settings
+             WHERE key LIKE 'm6pm_auto_fired:%'
+                OR key LIKE 'morning_link_sent:%'
+             ORDER BY updated_at DESC LIMIT 20`);
+          return res.json({ morning_arrears_cache: q.rows, autofire_gates: gate.rows });
+        }
         if (req.body?.recent_ticks === true) {
           const q = await pool.query(`
             SELECT created_by, status, MAX(created_at) AS last_seen, COUNT(*) AS batches
