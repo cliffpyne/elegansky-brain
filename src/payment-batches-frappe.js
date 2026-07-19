@@ -1754,6 +1754,8 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
       const customMessage = String(req.body?.custom_message || '').trim();
       const dryRun = req.body?.dry_run === true;
       const testOnlyTo = req.body?.test_only_to ? String(req.body.test_only_to).trim() : null;
+      const limit = Number.isFinite(Number(req.body?.limit)) && Number(req.body.limit) > 0
+        ? Math.floor(Number(req.body.limit)) : null;
       const confirm = String(req.body?.confirm || '').trim();
       if (!customMessage) return res.status(400).json({ error: 'custom_message required' });
       if (!dryRun && !testOnlyTo && confirm !== 'YES-BROADCAST') {
@@ -1808,7 +1810,8 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         targets.push({ phone, plate, name });
       }
 
-      const messages = targets.map((t) => ({
+      const trimmedTargets = limit ? targets.slice(0, limit) : targets;
+      const messages = trimmedTargets.map((t) => ({
         to: testOnlyTo || t.phone,
         text: customMessage,
         plate: t.plate,
