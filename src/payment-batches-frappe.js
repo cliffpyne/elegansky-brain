@@ -1916,6 +1916,26 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // GET /api/admin/broadcast-sms/log?batch_ref=X&status=REJECTED
+  app.get('/api/admin/broadcast-sms/log', requireSecretOrJwt, async (req, res) => {
+    try {
+      const batchRef = String(req.query?.batch_ref || '').trim();
+      const status = String(req.query?.status || '').trim();
+      if (!batchRef) return res.status(400).json({ error: 'batch_ref required' });
+      const params = [batchRef];
+      let where = 'batch_ref = $1';
+      if (status) { params.push(status); where += ` AND status = $${params.length}`; }
+      const q = await db().query(
+        `SELECT phone, plate, name, status, nextsms_message_id, nextsms_response, sent_at
+           FROM broadcast_sms_log
+          WHERE ${where}
+          ORDER BY sent_at`, params);
+      res.json({ batch_ref: batchRef, status_filter: status || null, count: q.rows.length, rows: q.rows });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/savcom/sms-log-seed
   // Frank 2026-07-02: seed savcom_sms_log with fake PENDING rows for
   // customer names that we KNOW received their SMS from the first blast
