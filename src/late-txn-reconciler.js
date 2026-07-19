@@ -30,8 +30,20 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 import { db } from './db/pool.js';
-import { qbVoid } from './qb-client.js';
+import { qbQuery, qbPost } from './qb-client.js';
 import { reversePayment } from './frappe-client.js';
+
+// Inline copy of server.js's qbVoid — kept here so the reconciler doesn't
+// need a runtime dependency injection just for the void step.
+async function qbVoidInline({ kind, qbId }) {
+  const entityName = kind === 'payment' ? 'Payment' : 'CreditMemo';
+  const q = await qbQuery(`SELECT * FROM ${entityName} WHERE Id = '${qbId}'`);
+  const entity = q.QueryResponse?.[entityName]?.[0];
+  if (!entity) return { alreadyGone: true, qbId };
+  const body = { Id: entity.Id, SyncToken: entity.SyncToken };
+  const path = kind === 'payment' ? 'payment?operation=delete' : 'creditmemo?operation=delete';
+  return await qbPost(path, body);
+}
 
 /**
  * APRUNA-style Frappe allocation: TODAY → oldest ARREARS → oldest FORWARD.
@@ -131,7 +143,7 @@ export async function voidOne(pu) {
       return { ok: true, kind: 'frappe_reverse', pu_id: pu.id, txn_id: txnId, response: r };
     }
     if (!pu.qb_id) return { ok: false, kind: 'qb_void', pu_id: pu.id, error: 'no qb_id on upload row' };
-    await qbVoid({ kind: pu.kind === 'credit_memo' ? 'credit_memo' : 'payment', qbId: pu.qb_id });
+    await qbVoidInline({ kind: pu.kind === 'credit_memo' ? 'credit_memo' : 'payment', qbId: pu.qb_id });
     return { ok: true, kind: 'qb_void', pu_id: pu.id, qb_id: pu.qb_id };
   } catch (err) {
     return { ok: false, kind: isFrappe ? 'frappe_reverse' : 'qb_void', pu_id: pu.id, error: String(err.message || err) };
