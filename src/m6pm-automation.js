@@ -738,6 +738,19 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         // Optional arrears_health mode: prove the morning arrears snapshot
         // saved. Returns last 7 days of officer_arrears_snapshots grouped by
         // date with cached_at + count + total.
+        if (req.body?.arrears_compare) {
+          const dates = req.body.arrears_compare;
+          if (!Array.isArray(dates) || dates.length !== 2) {
+            return res.status(400).json({ error: 'arrears_compare must be [date_a, date_b]' });
+          }
+          const q = await pool.query(`
+            SELECT snapshot_date::text AS snapshot_date, officer_id, officer_name,
+                   total_arrears, overdue_invoice_count, cached_at
+              FROM officer_arrears_snapshots
+             WHERE snapshot_date = ANY($1::date[])
+             ORDER BY snapshot_date, officer_name`, [dates]);
+          return res.json({ arrears_compare: q.rows });
+        }
         if (req.body?.arrears_health === true) {
           const q = await pool.query(`
             SELECT snapshot_date::text AS snapshot_date,
