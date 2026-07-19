@@ -3847,10 +3847,20 @@ export function mountPaymentBatchesApi(app, deps) {
    * Returns the cached APRUNA customer roster (from Frappe's
    * savcom_customers?officer=APRUNA THOMAS BODA). Diagnostic.
    */
-  app.get('/api/admin/apruna/roster', requireSecretOrJwt, async (_req, res) => {
+  app.get('/api/admin/apruna/roster', requireSecretOrJwt, async (req, res) => {
     try {
-      const { getAprunaStats } = await import('./apruna-resolver.js');
+      const { getAprunaStats, getAprunaCache } = await import('./apruna-resolver.js');
       const stats = await getAprunaStats();
+      if (req.query.full === '1' || req.query.full === 'true') {
+        const cache = await getAprunaCache();
+        stats.all = (cache?.all || []).map((c) => ({
+          plate: c.plate || null,
+          customer: c.customer || c.display_name || null,
+          qb_id: c.qb_id || null,
+          phone: c.phone9 || null,
+          source: c.source || null,
+        }));
+      }
       res.json(stats);
     } catch (err) {
       console.error('[apruna/roster]', err);
