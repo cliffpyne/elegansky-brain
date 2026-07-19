@@ -968,6 +968,17 @@ app.get('/arrears', async (req, res) => {
       console.error(`[/arrears] APRUNA Frappe fetch failed (falling back to QB for him): ${err.message}`);
     }
 
+    // Frank 2026-07-18: ESTHER SAVCOM's cohort is Frappe-only (no QB rows to
+    // swap — pure injection). Same 3-part path shape as APRUNA so m6pm
+    // sync_mobile registers her as an officer, not a portfolio holder.
+    let savcomRows = null;
+    try {
+      const { getSavcomOverdueRows } = await import('./savcom-arrears.js');
+      savcomRows = await getSavcomOverdueRows();
+    } catch (err) {
+      console.error(`[/arrears] SAVCOM Frappe fetch failed (skipping ESTHER SAVCOM): ${err.message}`);
+    }
+
     if (wantSummary) {
       // QB doesn't expose SUM(); page-walk the whole filtered set in chunks
       // of 1000 and tally on our side.
@@ -997,6 +1008,14 @@ app.get('/arrears', async (req, res) => {
       }
       if (aprunaRows) {
         for (const row of aprunaRows) {
+          if (!matchesFilters(row)) continue;
+          count++;
+          totalBalance += row.balance;
+          branchCounts[row.branch] = (branchCounts[row.branch] || 0) + 1;
+        }
+      }
+      if (savcomRows) {
+        for (const row of savcomRows) {
           if (!matchesFilters(row)) continue;
           count++;
           totalBalance += row.balance;
@@ -1034,6 +1053,12 @@ app.get('/arrears', async (req, res) => {
     // there are only a few hundred and pagination is done for this fetch.
     if (aprunaRows && nextStart === null) {
       for (const ar of aprunaRows) if (matchesFilters(ar)) rows.push(ar);
+    }
+    // Frank 2026-07-18: same last-page injection for SAVCOM (Frappe-only,
+    // no QB rows to filter out). m6pm sync_mobile fetches every /arrears
+    // page — inject only on the last page so we don't double-count.
+    if (savcomRows && nextStart === null) {
+      for (const sr of savcomRows) if (matchesFilters(sr)) rows.push(sr);
     }
     res.json({
       asOf,
@@ -1091,6 +1116,27 @@ app.get('/arrears/customer', async (req, res) => {
       };
     };
 
+    // Frappe-resident cohorts: APRUNA THOMAS BODA + ESTHER SAVCOM. Same
+    // pattern as main /arrears — load early so QB APRUNA rows can be filtered
+    // out and Frappe rows injected. Without this, /arrears/customer returns
+    // ZERO results for those customers even when they have real overdue.
+    const APRUNA_MARKER = 'APRUNA THOMAS BODA';
+    const isAprunaRow = (row) => String(row.customer || '').toUpperCase().includes(APRUNA_MARKER);
+    let aprunaRows = null;
+    try {
+      const { getAprunaOverdueRows } = await import('./apruna-arrears.js');
+      aprunaRows = await getAprunaOverdueRows(asOf);
+    } catch (err) {
+      console.error(`[/arrears/customer] APRUNA Frappe fetch failed (falling back to QB): ${err.message}`);
+    }
+    let savcomRows = null;
+    try {
+      const { getSavcomOverdueRows } = await import('./savcom-arrears.js');
+      savcomRows = await getSavcomOverdueRows();
+    } catch (err) {
+      console.error(`[/arrears/customer] SAVCOM Frappe fetch failed: ${err.message}`);
+    }
+
     // Page-walk the full QB result set. All-match search (customer or docNum
     // substring) is done in JS because QB SQL LIKE on CustomerRef isn't
     // reliable and DocNumber is a partial-match anyway. Cheap for a single
@@ -1108,11 +1154,26 @@ app.get('/arrears/customer', async (req, res) => {
       if (!invs.length) break;
       for (const inv of invs) {
         const row = enrich(inv);
+        if (aprunaRows && isAprunaRow(row)) continue; // skip QB APRUNA, Frappe below
         const hay = `${row.customer} ${row.no}`.toLowerCase();
         if (hay.includes(qLower)) matches.push(row);
       }
       if (invs.length < PAGE) break;
       startPos += PAGE;
+    }
+
+    // Merge Frappe cohorts: filter by same q substring, push into matches.
+    if (aprunaRows) {
+      for (const row of aprunaRows) {
+        const hay = `${row.customer} ${row.no}`.toLowerCase();
+        if (hay.includes(qLower)) matches.push(row);
+      }
+    }
+    if (savcomRows) {
+      for (const row of savcomRows) {
+        const hay = `${row.customer} ${row.no}`.toLowerCase();
+        if (hay.includes(qLower)) matches.push(row);
+      }
     }
 
     matches.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
