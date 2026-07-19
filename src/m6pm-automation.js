@@ -755,6 +755,23 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
              ORDER BY updated_at DESC LIMIT 20`);
           return res.json({ morning_arrears_cache: q.rows, autofire_gates: gate.rows });
         }
+        if (req.body?.probe_consumed === true) {
+          const like = String(req.body.like || '');
+          const q = await pool.query(`
+            SELECT bank_ref, batch_id, consumed_at FROM consumed_transactions
+             WHERE bank_ref LIKE $1 ORDER BY consumed_at DESC LIMIT 20`, [like]);
+          const locks = await pool.query(`SELECT * FROM auto_upload_locks`);
+          return res.json({ consumed: q.rows, locks: locks.rows });
+        }
+        if (req.body?.clear_test_state === true) {
+          const refs = Array.isArray(req.body?.refs) ? req.body.refs : [];
+          if (refs.length === 0) return res.status(400).json({ error: 'refs[] required' });
+          const del1 = await pool.query(
+            `DELETE FROM consumed_transactions WHERE bank_ref = ANY($1::text[])`, [refs]);
+          const del2 = await pool.query(
+            `DELETE FROM auto_upload_locks WHERE channel = ANY($1::text[])`, [['bank']]);
+          return res.json({ consumed_deleted: del1.rowCount, locks_deleted: del2.rowCount });
+        }
         if (req.body?.find_test_customer === true) {
           const q = await pool.query(`
             SELECT customer_name, customer_id, COUNT(*) AS payment_count,
