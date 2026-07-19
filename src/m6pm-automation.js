@@ -743,7 +743,7 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
             SELECT snapshot_date::text AS snapshot_date,
                    COUNT(*) AS officer_count,
                    MAX(cached_at) AS last_cached_at,
-                   SUM(COALESCE(arrears_total, 0))::bigint AS total_arrears
+                   SUM(COALESCE(total_arrears, 0))::bigint AS total_arrears
               FROM officer_arrears_snapshots
              WHERE snapshot_date >= (now() AT TIME ZONE 'Africa/Dar_es_Salaam')::date - INTERVAL '7 days'
              GROUP BY snapshot_date
