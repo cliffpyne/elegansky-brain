@@ -755,6 +755,23 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
              ORDER BY updated_at DESC LIMIT 20`);
           return res.json({ morning_arrears_cache: q.rows, autofire_gates: gate.rows });
         }
+        if (req.body?.find_test_customer === true) {
+          const q = await pool.query(`
+            SELECT customer_name, customer_id, COUNT(*) AS payment_count,
+                   MIN(pu.created_at) AS earliest, MAX(pu.created_at) AS latest,
+                   ARRAY_AGG(pb.channel) FILTER (WHERE pb.channel IS NOT NULL) AS channels
+              FROM payment_uploads pu
+              JOIN payment_batches pb ON pb.id = pu.batch_id
+             WHERE pu.status = 'created'
+               AND pu.created_at > '2026-07-04'
+               AND pu.customer_id IS NOT NULL
+               AND pb.channel IN ('bank','nmbnew')
+             GROUP BY customer_name, customer_id
+            HAVING COUNT(*) BETWEEN 1 AND 3
+             ORDER BY latest DESC
+             LIMIT 15`);
+          return res.json({ candidates: q.rows });
+        }
         if (req.body?.recent_ticks === true) {
           const q = await pool.query(`
             SELECT created_by, status, MAX(created_at) AS last_seen, COUNT(*) AS batches
