@@ -5898,7 +5898,47 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     console.error('[qb-dup-check] scan failed (non-fatal, continuing):', err.message);
   }
 
-  // 3. Arrears + snapshot (only after we know there's work to do).
+  // 2c. Auto-trigger retro-reconcile for late txns (Frank 2026-07-19).
+  // When a sheet row's parsed date is BEFORE the tick's txnDate, void any
+  // payments the same customer made AFTER that sheet day, clear their
+  // consumed_transactions, and let the normal allocation re-run with fresh
+  // state. Fires for BOTH tick auto-uploads AND heisenberg fires — the
+  // trigger is DATA-driven (sheet date < tick date), not fire-type driven.
+  try {
+    const { reconcileCustomer, eatDayOf } = await import('./late-txn-reconciler.js');
+    const tickDay = txnDate || new Date().toISOString().slice(0, 10);
+    const lateByCustomer = new Map();
+    for (const t of txnsClean) {
+      const ts = t.receivedTimestamp;
+      if (!ts) continue;
+      const txnDay = eatDayOf(ts);
+      if (txnDay >= tickDay) continue;
+      const customer = t.customerName || t.contractName || null;
+      if (!customer) continue;
+      const cur = lateByCustomer.get(customer);
+      if (!cur || txnDay < cur) lateByCustomer.set(customer, txnDay);
+    }
+    if (lateByCustomer.size > 0) {
+      console.log(`[retro-reconcile] ${lateByCustomer.size} late-txn customer(s) detected in this fire`);
+      for (const [customer, oldestDay] of lateByCustomer.entries()) {
+        try {
+          const r = await reconcileCustomer({ customerName: customer, sinceDay: oldestDay, dryRun: false });
+          console.log(`[retro-reconcile] ${customer} since ${oldestDay}: voided=${r.void_results?.length || 0} consumed_cleared=${r.consumed_rows_deleted}`);
+        } catch (err) {
+          console.error(`[retro-reconcile] failed for ${customer}: ${err.message}`);
+        }
+      }
+    }
+  } catch (err) {
+    // Non-fatal: if the reconciler module or reconcile step throws, the
+    // normal upload proceeds. Worst case: late txn goes UNUSED (same as
+    // pre-2026-07-19 behavior). Operator can then run the manual endpoint.
+    console.error(`[retro-reconcile] pre-flight step failed (non-fatal): ${err.message}`);
+  }
+
+  // 3. Arrears + snapshot (only after we know there's work to do — and
+  //    after retro-reconcile so the arrears reflect any newly-un-paid
+  //    invoices from the void step above).
   const arrears = await fetchAllArrears(asOf);
   const invoices = arrears.map((inv, i) => ({
     id: i + 1, customerName: inv.customerLeaf, invoiceNumber: inv.no,
