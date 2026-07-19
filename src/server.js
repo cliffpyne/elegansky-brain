@@ -1200,18 +1200,23 @@ app.get('/arrears/customer', async (req, res) => {
     for (const m of matches) {
       const key = m.customer;
       if (!perCustomer.has(key)) {
+        // Path shape: BRANCH:LOAN_OFFICER[:SUB_OFFICER]:CUSTOMER_LEAF
+        // For APRUNA/SAVCOM Frappe rows the same 3-part shape is used.
+        const parts = String(m.customer || '').split(':');
+        const loanOfficer = parts.length >= 3 ? parts[1] : '';
         perCustomer.set(key, {
-          customer: m.customer,
-          customerLeaf: m.customerLeaf,
+          customer: m.customerLeaf,
           branch: m.branch,
+          loan_officer: loanOfficer,
+          full_path: m.customer,
           invoices: 0,
-          open_balance: 0,
+          total_overdue: 0,
           partial_invoices: 0,
         });
       }
       const rec = perCustomer.get(key);
       rec.invoices++;
-      rec.open_balance += m.balance;
+      rec.total_overdue += m.balance;
       if (m.balance !== m.amount) rec.partial_invoices++;
       totalBalance += m.balance;
     }
@@ -1219,10 +1224,10 @@ app.get('/arrears/customer', async (req, res) => {
     const customersArr = Array.from(perCustomer.values());
     // Sort by open_balance DESC so the guy shutting down bikes sees biggest
     // overdue first — natural order for range-based decisions.
-    customersArr.sort((a, b) => b.open_balance - a.open_balance);
+    customersArr.sort((a, b) => b.total_overdue - a.total_overdue);
     // Round balances to 2dp for stable display.
     for (const c of customersArr) {
-      c.open_balance = Math.round(c.open_balance * 100) / 100;
+      c.total_overdue = Math.round(c.total_overdue * 100) / 100;
     }
     const payload = {
       asOf,
