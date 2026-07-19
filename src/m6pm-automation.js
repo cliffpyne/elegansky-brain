@@ -745,10 +745,11 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
                    MAX(cached_at) AS last_cached_at,
                    SUM(COALESCE(total_arrears, 0))::bigint AS total_arrears
               FROM officer_arrears_snapshots
-             WHERE snapshot_date >= (now() AT TIME ZONE 'Africa/Dar_es_Salaam')::date - INTERVAL '7 days'
              GROUP BY snapshot_date
-             ORDER BY snapshot_date DESC`);
-          return res.json({ arrears_health: q.rows });
+             ORDER BY snapshot_date DESC
+             LIMIT 15`);
+          const total = await pool.query(`SELECT COUNT(*)::int AS total_rows FROM officer_arrears_snapshots`);
+          return res.json({ arrears_health: q.rows, total_rows_all_time: total.rows[0].total_rows });
         }
         // Optional refs[] mode: look up specific bank_refs (probes both bare
         // form + SAV suffixed CS/NS forms so callers can pass raw sheet refs).
