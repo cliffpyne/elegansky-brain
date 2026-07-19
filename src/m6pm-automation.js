@@ -738,6 +738,17 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
         // Optional arrears_health mode: prove the morning arrears snapshot
         // saved. Returns last 7 days of officer_arrears_snapshots grouped by
         // date with cached_at + count + total.
+        if (req.body?.recent_ticks === true) {
+          const q = await pool.query(`
+            SELECT created_by, status, MAX(created_at) AS last_seen, COUNT(*) AS batches
+              FROM payment_batches
+             WHERE created_at > now() - interval '24 hours'
+               AND created_by LIKE 'auto-upload:%'
+             GROUP BY created_by, status
+             ORDER BY last_seen DESC
+             LIMIT 40`);
+          return res.json({ recent_ticks: q.rows });
+        }
         if (req.body?.arrears_compare) {
           const dates = req.body.arrears_compare;
           if (!Array.isArray(dates) || dates.length !== 2) {
