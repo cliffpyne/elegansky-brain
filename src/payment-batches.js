@@ -3853,13 +3853,8 @@ export function mountPaymentBatchesApi(app, deps) {
       const stats = await getAprunaStats();
       if (req.query.full === '1' || req.query.full === 'true') {
         const cache = await getAprunaCache();
-        stats.all = (cache?.all || []).map((c) => ({
-          plate: c.plate || null,
-          customer: c.customer || c.display_name || null,
-          qb_id: c.qb_id || null,
-          phone: c.phone9 || null,
-          source: c.source || null,
-        }));
+        stats.all_plates = Array.from(cache?.byPlate?.keys() || []);
+        stats.all_phones = Array.from(cache?.byPhone?.keys() || []);
       }
       res.json(stats);
     } catch (err) {
