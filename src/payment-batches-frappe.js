@@ -1736,6 +1736,172 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
     }
   });
 
+  // POST /api/admin/broadcast-sms
+  //
+  // Send a CUSTOM message body to every phone on the master pikipiki
+  // records2 sheet. Unlike sms-blast (which sends a hardcoded loan-summary
+  // template to SAVCOM cache customers only), this endpoint sends whatever
+  // text the caller provides to every unique phone number in the sheet.
+  //
+  // Body:
+  //   custom_message: string   REQUIRED, the SMS body
+  //   dry_run: true            preview only, no SMS sent
+  //   test_only_to: "255..."   send ALL messages to this single phone
+  //                            (boss preview mode)
+  //   confirm: "YES-BROADCAST" required for real send (dry_run bypasses)
+  app.post('/api/admin/broadcast-sms', requireSecretOrJwt, async (req, res) => {
+    try {
+      const customMessage = String(req.body?.custom_message || '').trim();
+      const dryRun = req.body?.dry_run === true;
+      const testOnlyTo = req.body?.test_only_to ? String(req.body.test_only_to).trim() : null;
+      const confirm = String(req.body?.confirm || '').trim();
+      if (!customMessage) return res.status(400).json({ error: 'custom_message required' });
+      if (!dryRun && !testOnlyTo && confirm !== 'YES-BROADCAST') {
+        return res.status(400).json({ error: 'confirm: "YES-BROADCAST" required for real broadcast' });
+      }
+
+      await db().query(`
+        CREATE TABLE IF NOT EXISTS broadcast_sms_log (
+          id BIGSERIAL PRIMARY KEY,
+          batch_ref TEXT,
+          phone TEXT,
+          plate TEXT,
+          name TEXT,
+          status TEXT,
+          nextsms_message_id TEXT,
+          nextsms_response JSONB,
+          message_body TEXT,
+          sent_at TIMESTAMPTZ DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS broadcast_sms_log_phone_sent_idx
+          ON broadcast_sms_log (phone, sent_at DESC);
+      `);
+
+      const PHONE_SHEET_ID = '1XFwPITQgZmzZ8lbg8MKD9S4rwHyk2cDOKrcxO7SAjHA';
+      const PHONE_TAB = 'pikipiki records2';
+      const phoneData = await readSheet(PHONE_SHEET_ID, `${PHONE_TAB}!A2:E5000`);
+      const phoneRows = phoneData.values || phoneData.data || [];
+
+      const seen = new Set();
+      const targets = [];
+      for (const row of phoneRows) {
+        const padded = [...row, '', '', '', '', ''];
+        const plate = String(padded[1] || '').trim().toUpperCase();
+        const name = String(padded[2] || '').trim();
+        let phone = String(padded[3] || '').trim().replace(/[^0-9]/g, '');
+        if (!phone) continue;
+        if (phone.startsWith('0')) phone = '255' + phone.slice(1);
+        else if (phone.startsWith('7') || phone.startsWith('6')) phone = '255' + phone;
+        if (phone.length < 12) continue;
+        if (seen.has(phone)) continue;
+        seen.add(phone);
+        targets.push({ phone, plate, name });
+      }
+
+      const messages = targets.map((t) => ({
+        to: testOnlyTo || t.phone,
+        text: customMessage,
+        plate: t.plate,
+        name: t.name,
+        phone: t.phone,
+      }));
+
+      const batchRef = `broadcast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      if (dryRun) {
+        return res.json({
+          dry_run: true,
+          sheet_rows_scanned: phoneRows.length,
+          unique_phones: targets.length,
+          would_send_to: messages.length,
+          test_only_to: testOnlyTo,
+          message_body: customMessage,
+          message_length_chars: customMessage.length,
+          sms_segments_per_message: customMessage.length <= 160 ? 1
+            : customMessage.length <= 306 ? 2
+            : customMessage.length <= 459 ? 3
+            : Math.ceil(customMessage.length / 153),
+          preview_first_5: messages.slice(0, 5).map((m) => ({
+            phone: m.phone, plate: m.plate, name: m.name, to: m.to,
+          })),
+        });
+      }
+
+      const user = process.env.NEXTSMS_USERNAME;
+      const pass = process.env.NEXTSMS_PASSWORD;
+      const sender = process.env.NEXTSMS_SENDER_ID || 'NEXTSMS';
+      if (!user || !pass) return res.status(500).json({ error: 'no NEXTSMS credentials in env' });
+      const auth = Buffer.from(`${user}:${pass}`).toString('base64');
+
+      let sentOk = 0, sentErr = 0;
+      const statusCounts = {};
+      const CHUNK = 100;
+      for (let i = 0; i < messages.length; i += CHUNK) {
+        const chunk = messages.slice(i, i + CHUNK);
+        try {
+          const r = await fetch('https://messaging-service.co.tz/api/sms/v1/text/multi', {
+            method: 'POST',
+            headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ messages: chunk.map((m) => ({ from: sender, to: String(m.to), text: String(m.text) })) }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          const j = await r.json().catch(() => ({}));
+          const msgs = j?.messages || [];
+          const logRows = [];
+          for (let mi = 0; mi < chunk.length; mi++) {
+            const msg = msgs[mi];
+            const c = chunk[mi];
+            const gn = msg?.status?.groupName || 'UNKNOWN';
+            statusCounts[gn] = (statusCounts[gn] || 0) + 1;
+            if (['PENDING', 'DELIVERED', 'PENDING_ENROUTE'].includes(gn)) sentOk++;
+            else sentErr++;
+            logRows.push([batchRef, c.phone, c.plate, c.name, gn,
+              msg?.messageId || null, JSON.stringify(msg?.status || null), customMessage]);
+          }
+          if (logRows.length > 0) {
+            const placeholders = logRows.map((_, ri) => {
+              const b = ri * 8;
+              return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7}::jsonb,$${b+8})`;
+            }).join(',');
+            await db().query(
+              `INSERT INTO broadcast_sms_log
+                 (batch_ref, phone, plate, name, status, nextsms_message_id, nextsms_response, message_body)
+               VALUES ${placeholders}`, logRows.flat());
+          }
+        } catch (e) {
+          sentErr += chunk.length;
+          statusCounts.HTTP_FAILURE = (statusCounts.HTTP_FAILURE || 0) + chunk.length;
+          const logRows = chunk.map((c) => [batchRef, c.phone, c.plate, c.name,
+            'HTTP_FAILURE', null, JSON.stringify({ error: String(e.message || e).slice(0, 200) }), customMessage]);
+          if (logRows.length > 0) {
+            const placeholders = logRows.map((_, ri) => {
+              const b = ri * 8;
+              return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7}::jsonb,$${b+8})`;
+            }).join(',');
+            await db().query(
+              `INSERT INTO broadcast_sms_log
+                 (batch_ref, phone, plate, name, status, nextsms_message_id, nextsms_response, message_body)
+               VALUES ${placeholders}`, logRows.flat());
+          }
+        }
+      }
+
+      res.json({
+        dry_run: false,
+        batch_ref: batchRef,
+        unique_phones: targets.length,
+        messages_sent: messages.length,
+        sms_ok: sentOk,
+        sms_error: sentErr,
+        test_only_to: testOnlyTo,
+        nextsms_status_distribution: statusCounts,
+      });
+    } catch (err) {
+      console.error('[broadcast-sms]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // POST /api/admin/savcom/sms-log-seed
   // Frank 2026-07-02: seed savcom_sms_log with fake PENDING rows for
   // customer names that we KNOW received their SMS from the first blast
