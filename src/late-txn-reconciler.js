@@ -209,7 +209,7 @@ export async function reconcileCustomer({ customerId, customerName, sinceDay, dr
       `UPDATE payment_uploads
           SET status = 'voided',
               failure_reason = COALESCE(failure_reason, '') || ' | retro-reconcile ' || now()::text
-        WHERE id = ANY($1::bigint[])`,
+        WHERE id = ANY($1::uuid[])`,
       [puIds],
     );
   }
