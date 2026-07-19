@@ -735,6 +735,21 @@ export function mountM6pmApi(app, { requireSecretOrJwt, sharedSecret, pool }) {
       const sqlOnly = req.body?.sql_only === true;
       const brainSelfBase = `${req.protocol}://${req.get('host')}`;
       if (sqlOnly) {
+        // Optional arrears_health mode: prove the morning arrears snapshot
+        // saved. Returns last 7 days of officer_arrears_snapshots grouped by
+        // date with cached_at + count + total.
+        if (req.body?.arrears_health === true) {
+          const q = await pool.query(`
+            SELECT snapshot_date::text AS snapshot_date,
+                   COUNT(*) AS officer_count,
+                   MAX(cached_at) AS last_cached_at,
+                   SUM(COALESCE(arrears_total, 0))::bigint AS total_arrears
+              FROM officer_arrears_snapshots
+             WHERE snapshot_date >= (now() AT TIME ZONE 'Africa/Dar_es_Salaam')::date - INTERVAL '7 days'
+             GROUP BY snapshot_date
+             ORDER BY snapshot_date DESC`);
+          return res.json({ arrears_health: q.rows });
+        }
         // Optional refs[] mode: look up specific bank_refs (probes both bare
         // form + SAV suffixed CS/NS forms so callers can pass raw sheet refs).
         const refs = Array.isArray(req.body?.refs) ? req.body.refs.map(String).map((s) => s.trim()).filter(Boolean) : [];
