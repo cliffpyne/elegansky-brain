@@ -6223,27 +6223,39 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   }
 
   // 2c. Auto-trigger retro-reconcile for late txns (Frank 2026-07-19).
-  // When a sheet row's parsed date is BEFORE the tick's txnDate, void any
-  // payments the same customer made AFTER that sheet day, clear their
-  // consumed_transactions, and let the normal allocation re-run with fresh
-  // state. Fires for BOTH tick auto-uploads AND heisenberg fires — the
-  // trigger is DATA-driven (sheet date < tick date), not fire-type driven.
+  // A txn is "late" when its physical EAT day precedes the fire's AS_OF day.
+  // Physical day < asOf means the row belongs to a business day the fire
+  // is not currently owning → we need to void any subsequent payments for
+  // that same customer, clear their consumed_transactions, and let the
+  // normal allocation re-run.
+  //
+  // Speed fix (Frank 2026-07-20): the previous version compared physical
+  // day against `txnDate` which, in sub-window B (kili tail), equals D+1
+  // while physical = D. That flagged EVERY txn as "late" and reconciled
+  // hundreds of customers unnecessarily, adding 10-15 min to each fire.
+  // Comparing against `asOf` (which does NOT roll with kili) correctly
+  // ignores same-business-day txns that just kili-rolled their TxnDate.
+  //
+  // Fires for BOTH tick auto-uploads AND heisenberg fires — the trigger
+  // is DATA-driven (physical day < as_of), not fire-type driven.
   try {
     const { reconcileCustomer, eatDayOf } = await import('./late-txn-reconciler.js');
-    const tickDay = txnDate || new Date().toISOString().slice(0, 10);
+    // Prefer explicit asOf; fall back to txnDate; final fallback = today.
+    // Never use txnDate when asOf is available — kili rule would misfire.
+    const asOfDay = asOf || txnDate || new Date().toISOString().slice(0, 10);
     const lateByCustomer = new Map();
     for (const t of txnsClean) {
       const ts = t.receivedTimestamp;
       if (!ts) continue;
       const txnDay = eatDayOf(ts);
-      if (txnDay >= tickDay) continue;
+      if (txnDay >= asOfDay) continue;
       const customer = t.customerName || t.contractName || null;
       if (!customer) continue;
       const cur = lateByCustomer.get(customer);
       if (!cur || txnDay < cur) lateByCustomer.set(customer, txnDay);
     }
     if (lateByCustomer.size > 0) {
-      console.log(`[retro-reconcile] ${lateByCustomer.size} late-txn customer(s) detected in this fire`);
+      console.log(`[retro-reconcile] ${lateByCustomer.size} late-txn customer(s) detected in this fire (asOf=${asOfDay})`);
       for (const [customer, oldestDay] of lateByCustomer.entries()) {
         try {
           const r = await reconcileCustomer({ customerName: customer, sinceDay: oldestDay, dryRun: false });
