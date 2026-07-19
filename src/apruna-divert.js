@@ -24,6 +24,7 @@
 import { db } from './db/pool.js';
 import { getAprunaCache, resolveAprunaAny } from './apruna-resolver.js';
 import { ingestPayment, getOpenInvoices } from './frappe-client.js';
+import { writeSheetCells } from './sheets.js';
 import { randomUUID } from 'node:crypto';
 
 const KILI_MIN = 16 * 60 + 15; // 16:15 EAT
@@ -149,6 +150,10 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName }
   const results = { matched: 0, pushed: 0, failed: 0, fallthrough: 0, details: [] };
   const mode = modeForChannel(channel);
 
+  // Track sheet-row marker writes so we can batch them at end of loop
+  // (one writeSheetCells call for the whole tick vs one per row).
+  const markerWrites = []; // { row, payment_entry_id, iso }
+
   for (const t of txns) {
     const m = await matchAprunaTxn(t);
     if (!m) { qbTxns.push(t); continue; }
@@ -189,9 +194,41 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName }
       );
       results.pushed++;
       results.details.push({ bank_ref: bankRef, customer, amount, matched_via: m.matchedVia, status, allocs: plan.length, unallocated: remain });
+      // Queue sheet I+J marker for this row so operators can SEE Frappe-routed
+      // rows on the sheet (previously they showed as unprocessed, causing
+      // Frank's 2026-07-19 "why no marker" investigation). Frappe returns
+      // { message: { status, payment_entry } } from ingest_payment — fall back
+      // to 'FRAPPE_OK' if the shape changes.
+      if (t.sheet_row_number) {
+        const pe = resp?.payment_entry || resp?.name || resp?.entry || 'FRAPPE_OK';
+        markerWrites.push({
+          row: t.sheet_row_number,
+          payment_entry_id: String(pe),
+          iso: new Date().toISOString(),
+        });
+      }
     } catch (err) {
       console.error(`[apruna-divert] push failed for ${bankRef} (${customer}) — falling through to QB: ${err.message}`);
       qbTxns.push(t); results.failed++;
+    }
+  }
+
+  // Flush I + J markers for all successfully-diverted rows in one call.
+  // Column I: "Fetched at: {iso} (FRAPPE)"  → distinguishes from QB rows
+  // Column J: "FRAPPE:{payment_entry} | {iso}"  → sheet-visible landing proof
+  // Non-fatal: divert already succeeded server-side and consumed_transactions
+  // has the ref — sheet-marker failure just means operators re-see the row.
+  if (sheetId && tab && markerWrites.length > 0) {
+    const updates = [];
+    for (const u of markerWrites) {
+      updates.push({ range: `${tab}!I${u.row}`, value: `Fetched at: ${u.iso} (FRAPPE)` });
+      updates.push({ range: `${tab}!J${u.row}`, value: `FRAPPE:${u.payment_entry_id} | ${u.iso}` });
+    }
+    try {
+      const r = await writeSheetCells(sheetId, updates);
+      console.log(`[apruna-divert] wrote I+J markers for ${markerWrites.length} Frappe rows (${r.updatedCells || '?'} cells) tab=${tab}`);
+    } catch (err) {
+      console.error(`[apruna-divert] I+J marker-write failed (non-fatal): ${err.message}`);
     }
   }
 

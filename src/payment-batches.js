@@ -4924,6 +4924,259 @@ export function mountPaymentBatchesApi(app, deps) {
       res.status(500).json({ error: err.message });
     }
   });
+
+  // ── POST /api/admin/backfill-frappe-markers ─────────────────────────────
+  // Body: { date: "YYYY-MM-DD"|"all", channels?: ['bank','nmbnew','iphone_bank'],
+  //         dry_run?: boolean, only_missing?: boolean }
+  //
+  // Backfills I + J markers for APRUNA-diverted (Frappe) rows on the sheet.
+  // The divert code writes markers going forward (2026-07-20), but rows already
+  // in consumed_transactions from prior fires have empty I/J — they LOOK like
+  // orphans in the sheet. This endpoint reconciles that.
+  //
+  // Data source: consumed_transactions rows whose batch_id belongs to a
+  // 'frappe_*' channel payment_batches row. Frappe payment_entry_id (for the
+  // J value) comes from frappe_payments.name where reference_no = bank_ref.
+  // Rows without a mirrored payment_entry get J = "FRAPPE_OK" fallback.
+  //
+  // dry_run: only reports how many I/J cells WOULD be written per channel.
+  // only_missing: default true — never overwrite existing non-empty I/J values.
+  app.post('/api/admin/backfill-frappe-markers', requireSecretOrJwt, async (req, res) => {
+    try {
+      const date = String(req.body?.date || '').trim();
+      const dryRun = req.body?.dry_run === true;
+      const onlyMissing = req.body?.only_missing !== false; // default true
+      const wantChannels = Array.isArray(req.body?.channels) && req.body.channels.length
+        ? req.body.channels : ['bank', 'nmbnew', 'iphone_bank'];
+      if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD or "all")' });
+
+      // 1. Fetch Frappe-diverted refs for the requested date + channels.
+      //    apruna-divert writes payment_batches with channel like 'frappe_*'
+      //    and idempotency_key 'apruna-divert-{date}-{frappe_channel}'.
+      const channelMap = {
+        bank: 'frappe_crdb', nmbnew: 'frappe_nmb', iphone_bank: 'frappe_iphone',
+      };
+      const frappeChannels = wantChannels.map((c) => channelMap[c]).filter(Boolean);
+      const dateFilter = date === 'all' ? '' : `AND pb.txn_date = $2::date`;
+      const params = [frappeChannels];
+      if (date !== 'all') params.push(date);
+      const q = await db().query(
+        `SELECT ct.bank_ref, ct.consumed_at, pb.channel AS frappe_channel, pb.txn_date
+           FROM consumed_transactions ct
+           JOIN payment_batches pb ON pb.id = ct.batch_id
+          WHERE pb.channel = ANY($1::text[]) ${dateFilter}
+          ORDER BY ct.consumed_at`,
+        params,
+      );
+      const consumed = q.rows;
+      if (consumed.length === 0) {
+        return res.json({ ok: true, date, dry_run: dryRun, message: 'no diverted refs found', consumed_count: 0 });
+      }
+
+      // 2. Join with frappe_payments (reference_no = bank_ref) for payment_entry IDs.
+      const bankRefs = consumed.map((r) => r.bank_ref);
+      const peQ = await db().query(
+        `SELECT reference_no, name AS payment_entry FROM frappe_payments
+          WHERE reference_no = ANY($1::text[])`,
+        [bankRefs],
+      );
+      const peByRef = new Map(peQ.rows.map((r) => [r.reference_no, r.payment_entry]));
+
+      // 3. Reverse-map bank source: which UI channel + sheet each ref came from.
+      const invChannel = {
+        frappe_crdb: 'bank', frappe_nmb: 'nmbnew', frappe_iphone: 'iphone_bank',
+      };
+      const refsByChannel = new Map();
+      for (const r of consumed) {
+        const ch = invChannel[r.frappe_channel];
+        if (!ch || !wantChannels.includes(ch)) continue;
+        if (!refsByChannel.has(ch)) refsByChannel.set(ch, []);
+        refsByChannel.get(ch).push({
+          bank_ref: r.bank_ref,
+          consumed_at: r.consumed_at,
+          payment_entry: peByRef.get(r.bank_ref) || 'FRAPPE_OK',
+        });
+      }
+
+      // 4. For each channel, read the sheet + build I/J updates for matched rows.
+      const perChannel = [];
+      for (const [ch, refs] of refsByChannel) {
+        const cfg = CHANNEL_SHEETS[ch];
+        if (!cfg) continue;
+        const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
+        const sheet = sheetData.values || sheetData.data || [];
+        // Build ref → row-index lookup. Ref lives in Col H (idx 7).
+        const rowByRef = new Map();
+        for (let i = 1; i < sheet.length; i++) {
+          const r = String(sheet[i][7] || '').trim();
+          if (r) rowByRef.set(r, i);
+        }
+        const updates = [];
+        const stats = {
+          channel: ch, tab: cfg.tab, refs_in_frappe: refs.length,
+          not_found_in_sheet: 0, already_marked: 0, will_write: 0,
+          sample_writes: [], sample_not_found: [], sample_already_marked: [],
+        };
+        for (const r of refs) {
+          const idx = rowByRef.get(r.bank_ref);
+          if (idx === undefined) {
+            stats.not_found_in_sheet++;
+            if (stats.sample_not_found.length < 3) stats.sample_not_found.push(r.bank_ref);
+            continue;
+          }
+          const colI = String(sheet[idx][8] || '').trim();
+          const colJ = String(sheet[idx][9] || '').trim();
+          if (onlyMissing && (colI || colJ)) {
+            stats.already_marked++;
+            if (stats.sample_already_marked.length < 3) stats.sample_already_marked.push({ ref: r.bank_ref, row: idx + 1, colI, colJ });
+            continue;
+          }
+          const iso = new Date(r.consumed_at).toISOString();
+          const iVal = `Fetched at: ${iso} (FRAPPE)`;
+          const jVal = `FRAPPE:${r.payment_entry} | ${iso}`;
+          updates.push({ range: `${cfg.tab}!I${idx + 1}`, value: iVal });
+          updates.push({ range: `${cfg.tab}!J${idx + 1}`, value: jVal });
+          stats.will_write++;
+          if (stats.sample_writes.length < 5) {
+            stats.sample_writes.push({ ref: r.bank_ref, row: idx + 1, I: iVal, J: jVal });
+          }
+        }
+        // 5. Apply (unless dry_run).
+        if (!dryRun && updates.length > 0) {
+          const w = await writeSheetCells(cfg.sheetId, updates);
+          stats.applied_cells = w.updatedCells || updates.length;
+        } else {
+          stats.applied_cells = 0;
+        }
+        perChannel.push(stats);
+      }
+
+      res.json({
+        ok: true, date, dry_run: dryRun, only_missing: onlyMissing,
+        total_diverted_refs: consumed.length,
+        payment_entries_matched: peQ.rows.length,
+        channels: perChannel,
+      });
+    } catch (err) {
+      console.error('[backfill-frappe-markers]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── POST /api/admin/heisenberg-diag ─────────────────────────────────────
+  // Body: { channel, since_iso, until_iso, txn_date?, as_of? }
+  //
+  // DIAGNOSTIC ONLY — runs prepareAutoUpload's row-selection + skip logic
+  // WITHOUT firing anything. Returns:
+  //   - skip_reasons: per-row why the fire would (or wouldn't) process it
+  //   - K marker: current max K row + its date
+  //   - since_iso vs marker: exposes the "markerMs+1 dead zone" bug
+  //   - per-row disposition: apruna_divert / qb / dropped
+  //
+  // Use this to prove why specific unmarked rows are skipped before writing
+  // any fix. No side effects.
+  app.post('/api/admin/heisenberg-diag', requireSecretOrJwt, async (req, res) => {
+    try {
+      const channel = String(req.body?.channel || '');
+      if (!CHANNEL_SHEETS[channel]) return res.status(400).json({ error: `bad channel; need one of: ${Object.keys(CHANNEL_SHEETS).join(',')}` });
+      const cfg = CHANNEL_SHEETS[channel];
+      const sinceIsoStr = String(req.body?.since_iso || '');
+      const untilIsoStr = String(req.body?.until_iso || '');
+      const sinceIso = new Date(sinceIsoStr);
+      const untilIso = new Date(untilIsoStr);
+      if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso + until_iso required (ISO 8601)' });
+
+      const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
+      const sheet = sheetData.values || sheetData.data || [];
+
+      // Find maxKRow (mirrors line 5714).
+      let maxKRow = 0;
+      let maxKTick = '';
+      let maxKDateB = '';
+      for (let i = 1; i < sheet.length; i++) {
+        const k = String(sheet[i][10] || '').trim().toLowerCase();
+        if (k.startsWith('end of ') && !k.includes('(dry_run)')) {
+          maxKRow = i + 1;
+          maxKTick = String(sheet[i][10] || '').trim();
+          maxKDateB = String(sheet[i][1] || '').trim();
+        }
+      }
+
+      // Walk every row and classify. Same order of checks as prepareAutoUpload.
+      const dispositions = {
+        skip_at_or_below_K: [],
+        skip_has_I_or_J: [],
+        skip_has_L_qb_dup: [],
+        skip_no_date: 0,
+        skip_out_of_window_before: [],
+        skip_out_of_window_after: [],
+        included_bad_format: [],
+        candidate_for_processing: [],
+      };
+      for (let i = 1; i < sheet.length; i++) {
+        const rowNum = i + 1;
+        const dCell = String(sheet[i][1] || '').trim();
+        const ref = String(sheet[i][7] || '').trim();
+        const amt = sheet[i][4] ? Number(String(sheet[i][4]).replace(/,/g, '')) : null;
+        const plate = String(sheet[i][5] || '').trim();
+        const name = String(sheet[i][6] || '').trim();
+        const colI = String(sheet[i][8] || '').trim();
+        const colJ = String(sheet[i][9] || '').trim();
+        const colL = String(sheet[i][11] || '').trim();
+        const summary = { row: rowNum, ref, plate, name, amount: amt, dateB: dCell, colI, colJ, colL };
+
+        if (maxKRow > 0 && rowNum <= maxKRow) {
+          if (dispositions.skip_at_or_below_K.length < 30) dispositions.skip_at_or_below_K.push(summary);
+          continue;
+        }
+        const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
+        const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
+        if (colIReal || colJReal) {
+          if (dispositions.skip_has_I_or_J.length < 30) dispositions.skip_has_I_or_J.push(summary);
+          continue;
+        }
+        if (colL.startsWith('QB_DUPLICATE')) {
+          if (dispositions.skip_has_L_qb_dup.length < 30) dispositions.skip_has_L_qb_dup.push(summary);
+          continue;
+        }
+        if (!dCell) { dispositions.skip_no_date++; continue; }
+        const ts = parseTsAny(dCell);
+        if (ts && ts < sinceIso) {
+          if (dispositions.skip_out_of_window_before.length < 30) dispositions.skip_out_of_window_before.push({ ...summary, ts: ts.toISOString() });
+          continue;
+        }
+        if (ts && ts >= untilIso) {
+          if (dispositions.skip_out_of_window_after.length < 30) dispositions.skip_out_of_window_after.push({ ...summary, ts: ts.toISOString() });
+          continue;
+        }
+        if (!ts) {
+          if (dispositions.included_bad_format.length < 30) dispositions.included_bad_format.push(summary);
+        }
+        if (dispositions.candidate_for_processing.length < 100) dispositions.candidate_for_processing.push({ ...summary, ts: ts?.toISOString() || null });
+      }
+
+      res.json({
+        ok: true, channel, tab: cfg.tab,
+        window: { since_iso: sinceIso.toISOString(), until_iso: untilIso.toISOString() },
+        max_k_marker: { row: maxKRow, tick: maxKTick, date_b: maxKDateB },
+        counts: {
+          skip_at_or_below_K: dispositions.skip_at_or_below_K.length,
+          skip_has_I_or_J: dispositions.skip_has_I_or_J.length,
+          skip_has_L_qb_dup: dispositions.skip_has_L_qb_dup.length,
+          skip_no_date: dispositions.skip_no_date,
+          skip_out_of_window_before: dispositions.skip_out_of_window_before.length,
+          skip_out_of_window_after: dispositions.skip_out_of_window_after.length,
+          included_bad_format: dispositions.included_bad_format.length,
+          candidate_for_processing: dispositions.candidate_for_processing.length,
+        },
+        // Truncated samples per bucket for inspection.
+        samples: dispositions,
+      });
+    } catch (err) {
+      console.error('[heisenberg-diag]', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
