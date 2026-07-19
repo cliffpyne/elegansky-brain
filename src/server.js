@@ -1225,6 +1225,27 @@ app.get('/arrears/customer', async (req, res) => {
     // Sort by open_balance DESC so the guy shutting down bikes sees biggest
     // overdue first — natural order for range-based decisions.
     customersArr.sort((a, b) => b.total_overdue - a.total_overdue);
+    // Attach plate numbers by matching normalized customer name against
+    // pikipiki records + records2 (Frank's master plate roster). A customer
+    // can own multiple bikes; plates comes back as an array.
+    try {
+      const plateMap = await getPikipikiPlateMap();
+      const norm = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
+      const nameToPlates = new Map();
+      for (const rec of plateMap.values()) {
+        const key = norm(rec.name);
+        if (!key) continue;
+        const arr = nameToPlates.get(key) || [];
+        if (!arr.includes(rec.plate)) arr.push(rec.plate);
+        nameToPlates.set(key, arr);
+      }
+      for (const c of customersArr) {
+        c.plates = nameToPlates.get(norm(c.customer)) || [];
+      }
+    } catch (err) {
+      console.error(`[/arrears/customer] plate map lookup failed: ${err.message}`);
+      for (const c of customersArr) c.plates = [];
+    }
     // Round balances to 2dp for stable display.
     for (const c of customersArr) {
       c.total_overdue = Math.round(c.total_overdue * 100) / 100;
