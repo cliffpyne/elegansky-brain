@@ -5086,10 +5086,25 @@ export function mountPaymentBatchesApi(app, deps) {
       const untilIso = new Date(untilIsoStr);
       if (isNaN(+sinceIso) || isNaN(+untilIso)) return res.status(400).json({ error: 'since_iso + until_iso required (ISO 8601)' });
 
+      // Optional: focus_refs[] — list of bank_refs to report per-row disposition
+      // for regardless of sample-cap. Lets callers prove a SPECIFIC row's fate
+      // even when it's buried under thousands of other same-bucket rows (e.g.
+      // 8 orphans in a skip_at_or_below_K bucket of ~40k).
+      const focusRefs = Array.isArray(req.body?.focus_refs)
+        ? req.body.focus_refs.map(String).map((s) => s.trim()).filter(Boolean)
+        : [];
+      const focusSet = new Set(focusRefs);
+      const focusOut = new Map(); // ref → disposition record
+
+      // Optional: simulate_max_k_row — pretend maxKRow is a specific value (or 0
+      // to disable the K-skip entirely). Use to replay a historical fire's
+      // state before subsequent K markers advanced past the target rows.
+      const simulateMaxK = req.body?.simulate_max_k_row;
+
       const sheetData = await readSheet(cfg.sheetId, `${cfg.tab}!A1:L200000`);
       const sheet = sheetData.values || sheetData.data || [];
 
-      // Find maxKRow (mirrors line 5714).
+      // Find maxKRow (mirrors line 5714) — but let caller override via simulate_max_k_row.
       let maxKRow = 0;
       let maxKTick = '';
       let maxKDateB = '';
@@ -5100,6 +5115,12 @@ export function mountPaymentBatchesApi(app, deps) {
           maxKTick = String(sheet[i][10] || '').trim();
           maxKDateB = String(sheet[i][1] || '').trim();
         }
+      }
+      const realMaxKRow = maxKRow;
+      const realMaxKTick = maxKTick;
+      const realMaxKDateB = maxKDateB;
+      if (Number.isFinite(Number(simulateMaxK))) {
+        maxKRow = Math.max(0, Math.floor(Number(simulateMaxK)));
       }
 
       // Walk every row and classify. Same order of checks as prepareAutoUpload.
@@ -5125,40 +5146,59 @@ export function mountPaymentBatchesApi(app, deps) {
         const colL = String(sheet[i][11] || '').trim();
         const summary = { row: rowNum, ref, plate, name, amount: amt, dateB: dCell, colI, colJ, colL };
 
+        const isFocus = ref && focusSet.has(ref);
+
         if (maxKRow > 0 && rowNum <= maxKRow) {
           if (dispositions.skip_at_or_below_K.length < 30) dispositions.skip_at_or_below_K.push(summary);
+          if (isFocus) focusOut.set(ref, { ...summary, bucket: 'skip_at_or_below_K', reason: `row ${rowNum} <= maxKRow ${maxKRow}` });
           continue;
         }
         const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
         const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
         if (colIReal || colJReal) {
           if (dispositions.skip_has_I_or_J.length < 30) dispositions.skip_has_I_or_J.push(summary);
+          if (isFocus) focusOut.set(ref, { ...summary, bucket: 'skip_has_I_or_J', reason: `colI or colJ non-empty` });
           continue;
         }
         if (colL.startsWith('QB_DUPLICATE')) {
           if (dispositions.skip_has_L_qb_dup.length < 30) dispositions.skip_has_L_qb_dup.push(summary);
+          if (isFocus) focusOut.set(ref, { ...summary, bucket: 'skip_has_L_qb_dup', reason: `colL starts with QB_DUPLICATE` });
           continue;
         }
-        if (!dCell) { dispositions.skip_no_date++; continue; }
+        if (!dCell) {
+          dispositions.skip_no_date++;
+          if (isFocus) focusOut.set(ref, { ...summary, bucket: 'skip_no_date', reason: 'colB empty' });
+          continue;
+        }
         const ts = parseTsAny(dCell);
         if (ts && ts < sinceIso) {
           if (dispositions.skip_out_of_window_before.length < 30) dispositions.skip_out_of_window_before.push({ ...summary, ts: ts.toISOString() });
+          if (isFocus) focusOut.set(ref, { ...summary, ts: ts.toISOString(), bucket: 'skip_out_of_window_before', reason: `ts ${ts.toISOString()} < since_iso ${sinceIso.toISOString()}` });
           continue;
         }
         if (ts && ts >= untilIso) {
           if (dispositions.skip_out_of_window_after.length < 30) dispositions.skip_out_of_window_after.push({ ...summary, ts: ts.toISOString() });
+          if (isFocus) focusOut.set(ref, { ...summary, ts: ts.toISOString(), bucket: 'skip_out_of_window_after', reason: `ts ${ts.toISOString()} >= until_iso ${untilIso.toISOString()}` });
           continue;
         }
         if (!ts) {
           if (dispositions.included_bad_format.length < 30) dispositions.included_bad_format.push(summary);
         }
         if (dispositions.candidate_for_processing.length < 100) dispositions.candidate_for_processing.push({ ...summary, ts: ts?.toISOString() || null });
+        if (isFocus) focusOut.set(ref, { ...summary, ts: ts?.toISOString() || null, bucket: ts ? 'candidate_for_processing' : 'included_bad_format', reason: 'passed all skip checks' });
       }
+
+      // Assemble per-ref focus output preserving input order + reporting refs
+      // not found at all (empty ref column or ref not in the sheet).
+      const focus_report = focusRefs.map((r) => focusOut.get(r) || { ref: r, bucket: 'not_found_in_sheet', reason: 'ref not present in sheet col H' });
 
       res.json({
         ok: true, channel, tab: cfg.tab,
         window: { since_iso: sinceIso.toISOString(), until_iso: untilIso.toISOString() },
         max_k_marker: { row: maxKRow, tick: maxKTick, date_b: maxKDateB },
+        real_max_k_marker: { row: realMaxKRow, tick: realMaxKTick, date_b: realMaxKDateB },
+        simulate_max_k_row_used: Number.isFinite(Number(simulateMaxK)) ? Number(simulateMaxK) : null,
+        focus_report: focusRefs.length ? focus_report : null,
         counts: {
           skip_at_or_below_K: dispositions.skip_at_or_below_K.length,
           skip_has_I_or_J: dispositions.skip_has_I_or_J.length,
