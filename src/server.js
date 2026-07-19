@@ -1085,9 +1085,16 @@ app.get('/arrears', async (req, res) => {
 app.get('/arrears/customer', async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
-    if (!q) return res.status(400).json({ error: 'q= required' });
+    const allMode = !q; // no q → return ALL customers (aggregate only, no invoice list)
     const asOf = (req.query.asOf || new Date().toISOString().slice(0, 10)).toString();
-    const excludeToday = req.query.excludeToday === '1' || req.query.excludeToday === 'true';
+    // In all-customers mode default to excludeToday=true (only overdues, no
+    // today's due) so external consumers get a clean overdue snapshot without
+    // having to remember the flag. Filtered-q mode keeps its historical
+    // default (false = includes today's due, matches payment code path).
+    const excludeTodayDefault = allMode;
+    const excludeToday = req.query.excludeToday != null
+      ? (req.query.excludeToday === '1' || req.query.excludeToday === 'true')
+      : excludeTodayDefault;
     const dueOp = excludeToday ? '<' : '<=';
 
     const customerMap = await getCustomerPathMap();
@@ -1155,8 +1162,11 @@ app.get('/arrears/customer', async (req, res) => {
       for (const inv of invs) {
         const row = enrich(inv);
         if (aprunaRows && isAprunaRow(row)) continue; // skip QB APRUNA, Frappe below
-        const hay = `${row.customer} ${row.no}`.toLowerCase();
-        if (hay.includes(qLower)) matches.push(row);
+        if (allMode) { matches.push(row); }
+        else {
+          const hay = `${row.customer} ${row.no}`.toLowerCase();
+          if (hay.includes(qLower)) matches.push(row);
+        }
       }
       if (invs.length < PAGE) break;
       startPos += PAGE;
@@ -1165,14 +1175,20 @@ app.get('/arrears/customer', async (req, res) => {
     // Merge Frappe cohorts: filter by same q substring, push into matches.
     if (aprunaRows) {
       for (const row of aprunaRows) {
-        const hay = `${row.customer} ${row.no}`.toLowerCase();
-        if (hay.includes(qLower)) matches.push(row);
+        if (allMode) { matches.push(row); }
+        else {
+          const hay = `${row.customer} ${row.no}`.toLowerCase();
+          if (hay.includes(qLower)) matches.push(row);
+        }
       }
     }
     if (savcomRows) {
       for (const row of savcomRows) {
-        const hay = `${row.customer} ${row.no}`.toLowerCase();
-        if (hay.includes(qLower)) matches.push(row);
+        if (allMode) { matches.push(row); }
+        else {
+          const hay = `${row.customer} ${row.no}`.toLowerCase();
+          if (hay.includes(qLower)) matches.push(row);
+        }
       }
     }
 
@@ -1200,15 +1216,27 @@ app.get('/arrears/customer', async (req, res) => {
       totalBalance += m.balance;
     }
 
-    res.json({
+    const customersArr = Array.from(perCustomer.values());
+    // Sort by open_balance DESC so the guy shutting down bikes sees biggest
+    // overdue first — natural order for range-based decisions.
+    customersArr.sort((a, b) => b.open_balance - a.open_balance);
+    // Round balances to 2dp for stable display.
+    for (const c of customersArr) {
+      c.open_balance = Math.round(c.open_balance * 100) / 100;
+    }
+    const payload = {
       asOf,
-      q,
+      q: q || null,
       excludeToday,
       total_invoices: matches.length,
       total_open_balance: Math.round(totalBalance * 100) / 100,
-      customers: Array.from(perCustomer.values()),
-      invoices: matches,
-    });
+      total_customers: customersArr.length,
+      customers: customersArr,
+    };
+    // In "all customers" mode omit invoices[] — 17K rows would OOM the response.
+    // Filtered-q mode keeps invoices so single-customer lookups stay detailed.
+    if (!allMode) payload.invoices = matches;
+    res.json(payload);
   } catch (err) {
     console.error('[GET /arrears/customer]', err);
     res.status(500).json({ error: err.message, intuit_tid: err.intuit_tid });
