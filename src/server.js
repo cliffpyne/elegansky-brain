@@ -28,6 +28,7 @@ import { mountFrappeWebhookApi } from './frappe-webhook.js';
 import { mountFrappePushApi } from './frappe-push.js';
 import { mountFrappeSavApi } from './frappe-push-sav.js';
 import { mountSavFrappeApi } from './payment-batches-frappe.js';
+import { mountLateTxnReconcilerApi } from './late-txn-reconciler.js';
 import { mountSavcomMorningApi } from './savcom-morning.js';
 import { startQbMirrorPoller } from './qb-mirror-poller.js';
 import { startSnapshotRefresher } from './qb-snapshot-refresher.js';
@@ -698,6 +699,7 @@ mountFrappeWebhookApi(app, { pool: db() });
 mountFrappePushApi(app, { requireSecretOrJwt });
 mountFrappeSavApi(app, { requireSecretOrJwt });
 mountSavFrappeApi(app, { requireSecretOrJwt });
+mountLateTxnReconcilerApi(app, { requireSecretOrJwt });
 mountSavcomMorningApi(app, { requireSecretOrJwt, pool: db() });
 startM6pmWatchers({
   pool: db(),
