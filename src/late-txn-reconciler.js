@@ -119,7 +119,7 @@ export async function findAffectedPayments({ customerId, sinceDay, customerName 
   const q = await db().query(
     `SELECT pu.id, pu.bank_ref, pu.kind, pu.qb_id, pu.amount, pu.invoice_no,
             pu.customer_name, pu.customer_id, pb.channel,
-            pu.created_at, pu.batch_id, pu.sheet_row_number, pu.memo
+            pu.created_at, pu.batch_id
        FROM payment_uploads pu
        JOIN payment_batches pb ON pb.id = pu.batch_id
       WHERE ${where.join(' AND ')}
