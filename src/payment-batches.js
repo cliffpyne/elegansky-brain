@@ -5125,7 +5125,10 @@ export function mountPaymentBatchesApi(app, deps) {
 
       // Walk every row and classify. Same order of checks as prepareAutoUpload.
       const dispositions = {
-        skip_at_or_below_K: [],
+        // Fix A (2026-07-20): row-position K skip retired. Kept as an
+        // informational bucket so operators can still see which
+        // candidates sit above K vs below.
+        above_K_row_but_not_skipped_by_position: [],
         skip_has_I_or_J: [],
         skip_has_L_qb_dup: [],
         skip_no_date: 0,
@@ -5147,11 +5150,15 @@ export function mountPaymentBatchesApi(app, deps) {
         const summary = { row: rowNum, ref, plate, name, amount: amt, dateB: dCell, colI, colJ, colL };
 
         const isFocus = ref && focusSet.has(ref);
-
-        if (maxKRow > 0 && rowNum <= maxKRow) {
-          if (dispositions.skip_at_or_below_K.length < 30) dispositions.skip_at_or_below_K.push(summary);
-          if (isFocus) focusOut.set(ref, { ...summary, bucket: 'skip_at_or_below_K', reason: `row ${rowNum} <= maxKRow ${maxKRow}` });
-          continue;
+        // Position vs maxKRow is INFORMATIONAL only (Fix A landed 2026-07-20:
+        // prepareAutoUpload no longer skips by row position). Track above_K
+        // count so operators can see how many candidates sit above K, but
+        // don't skip. Real skip decisions come from per-row I/J/L below.
+        const isAboveK = maxKRow > 0 && rowNum <= maxKRow;
+        if (isAboveK) {
+          if (dispositions.above_K_row_but_not_skipped_by_position.length < 30) {
+            dispositions.above_K_row_but_not_skipped_by_position.push(summary);
+          }
         }
         const colIReal = colI && !colI.includes('(DRY_RUN)') ? colI : '';
         const colJReal = colJ && !colJ.includes('(DRY_RUN)') ? colJ : '';
@@ -5200,7 +5207,7 @@ export function mountPaymentBatchesApi(app, deps) {
         simulate_max_k_row_used: Number.isFinite(Number(simulateMaxK)) ? Number(simulateMaxK) : null,
         focus_report: focusRefs.length ? focus_report : null,
         counts: {
-          skip_at_or_below_K: dispositions.skip_at_or_below_K.length,
+          above_K_row_but_not_skipped_by_position: dispositions.above_K_row_but_not_skipped_by_position.length,
           skip_has_I_or_J: dispositions.skip_has_I_or_J.length,
           skip_has_L_qb_dup: dispositions.skip_has_L_qb_dup.length,
           skip_no_date: dispositions.skip_no_date,
