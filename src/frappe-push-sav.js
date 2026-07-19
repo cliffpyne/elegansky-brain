@@ -32,7 +32,7 @@
 import { db } from './db/pool.js';
 import { getOpenInvoices, ingestPayment } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
-import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
+import { processInvoicePaymentsFrappe } from './payment-algorithm-v2.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
 const SAV_CHANNELS = new Set(['nmbnew_sav', 'bank_sav']);
@@ -107,7 +107,16 @@ async function allocateGroupAgainstFrappe(group, customerKey) {
       algorithm_trace: { open_invoices: 0, note: 'no open invoices on Frappe — full amount becomes credit' },
     };
   }
-  const { payments, leftoverPerTx } = processInvoicePaymentsV2(v2Invoices, v2Txs);
+  // Frank 2026-07-19: Frappe uses APRUNA-style order (TODAY → oldest ARREARS
+  // → oldest FORWARD) instead of V2's newest-first. physicalDay = the txn's
+  // own EAT day when known (retro-reconcile safe), else today.
+  const eatDayOfTs = (ts) => {
+    if (!ts) return null;
+    const d = ts instanceof Date ? ts : new Date(ts);
+    return new Date(d.getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+  };
+  const txDay = eatDayOfTs(v2Txs[0]?.receivedTimestamp) || eatDayOfTs(new Date());
+  const { payments, leftoverPerTx } = processInvoicePaymentsFrappe(v2Invoices, v2Txs, txDay);
   const allocations = [];
   let allocatedSum = 0;
   for (const p of payments) {

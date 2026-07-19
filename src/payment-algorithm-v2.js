@@ -148,6 +148,128 @@ export function processInvoicePaymentsV2(invoices, transactions) {
 }
 
 /**
+ * APRUNA-style Frappe allocator — Frank 2026-07-19.
+ *
+ * Same inputs/outputs as processInvoicePaymentsV2 so it drops in cleanly
+ * on Frappe paths (SAVCOM sav_nmb / sav_crdb, plus any future Frappe channel).
+ *
+ * Difference from V2: sort order per customer.
+ *   V2:      invoices NEWEST-first (D0, D-1, D-2, ...)
+ *   Frappe:  TODAY (matching physicalDay) → oldest ARREARS → oldest FORWARD
+ *            (D0, D-oldest → D-1, D+1 → D+furthest)
+ *
+ * physicalDay: 'YYYY-MM-DD' EAT day. If null, defaults to today's EAT day.
+ *              Used to bucket each customer's invoices into today/arrear/forward.
+ *
+ * Everything else (cap-no-overflow, per-tx leftover for phase 2, customer
+ * match keys, unused tag) is byte-identical to V2.
+ */
+export function processInvoicePaymentsFrappe(invoices, transactions, physicalDay) {
+  const day = physicalDay || (() => {
+    const now = new Date();
+    const eat = new Date(now.getTime() + 3 * 3600 * 1000);
+    return eat.toISOString().slice(0, 10);
+  })();
+  const usedTx = new Set();
+  const invByCust = {};
+  invoices.forEach((inv) => {
+    const key = inv.customerPhone || inv.customerName.toLowerCase().trim();
+    (invByCust[key] ||= []).push(inv);
+  });
+  // APRUNA sort per customer: TODAY → oldest ARREARS → oldest FORWARD.
+  Object.keys(invByCust).forEach((k) => {
+    const arr = invByCust[k];
+    const today = arr.filter((iv) => (iv.invoiceDate || '') === day)
+      .sort((a, b) => String(a.invoiceNumber).localeCompare(String(b.invoiceNumber)));
+    const arrears = arr.filter((iv) => (iv.invoiceDate || '') < day)
+      .sort((a, b) => (a.invoiceDate || '').localeCompare(b.invoiceDate || '')
+        || String(a.invoiceNumber).localeCompare(String(b.invoiceNumber)));
+    const forward = arr.filter((iv) => (iv.invoiceDate || '') > day)
+      .sort((a, b) => (a.invoiceDate || '').localeCompare(b.invoiceDate || '')
+        || String(a.invoiceNumber).localeCompare(String(b.invoiceNumber)));
+    invByCust[k] = [...today, ...arrears, ...forward];
+  });
+
+  const txByCust = {};
+  const seen = new Set();
+  transactions.forEach((t) => {
+    if (!t.amount) return;
+    const uid = `${t.transactionId || t.id}_${t.receivedTimestamp}_${t.amount}`;
+    if (seen.has(uid)) return;
+    const keys = [t.customerPhone, t.contractName?.toLowerCase().trim(), t.customerName?.toLowerCase().trim()].filter(Boolean);
+    const k = keys.find((key) => invByCust[key]);
+    if (k) { (txByCust[k] ||= []).push(t); seen.add(uid); }
+  });
+  Object.keys(txByCust).forEach((k) => txByCust[k].sort((a, b) => (a.receivedTimestamp || 0) - (b.receivedTimestamp || 0)));
+
+  const out = [];
+  const leftoverPerTx = [];
+
+  Object.keys(invByCust).forEach((ck) => {
+    const ci = invByCust[ck];
+    const ct = txByCust[ck] || [];
+    if (ct.length === 0) return;
+    const ib = ci.map((inv) => ({ inv, remainingBalance: inv.amount, fullyPaid: false }));
+    let idx = 0;
+    ct.forEach((tx) => {
+      let amt = tx.amount;
+      let used = false;
+      while (amt > 0 && idx < ib.length) {
+        const cur = ib[idx];
+        if (cur.fullyPaid) { idx++; continue; }
+        const pay = Math.min(amt, cur.remainingBalance);
+        out.push({
+          customerName: cur.inv.customerName,
+          invoiceNo: cur.inv.invoiceNumber,
+          amount: pay,
+          memo: tx.transactionId,
+          memoWithSuffix: appendSuf(tx.transactionId, tx.channel),
+          channel: tx.channel,
+          customerId: cur.inv.customerId,
+          qbId: cur.inv.qbId,
+          sheet_row_number: tx.sheet_row_number,
+        });
+        cur.remainingBalance -= pay;
+        amt -= pay;
+        used = true;
+        if (cur.remainingBalance <= 1) { cur.fullyPaid = true; cur.remainingBalance = 0; idx++; }
+      }
+      if (used) usedTx.add(tx.transactionId || tx.id);
+      if (amt > 0 && used) {
+        const sampleInv = ib.find((b) => b.inv) || ib[0];
+        leftoverPerTx.push({
+          customerKey: ck,
+          customerName: sampleInv?.inv?.customerName || tx.customerName || tx.contractName,
+          customerId: sampleInv?.inv?.customerId || null,
+          qbId: sampleInv?.inv?.qbId || null,
+          channel: tx.channel,
+          transactionId: tx.transactionId || tx.id,
+          memoWithSuffix: appendSuf(tx.transactionId, tx.channel),
+          sheet_row_number: tx.sheet_row_number,
+          leftover: amt,
+          txDate: tx.receivedTimestamp ? new Date(tx.receivedTimestamp).toISOString().slice(0, 10) : null,
+        });
+      }
+    });
+  });
+
+  const unused = transactions.filter((t) => !usedTx.has(t.transactionId || t.id));
+  unused.forEach((t) => out.push({
+    customerName: t.customerName || t.contractName || 'UNKNOWN',
+    invoiceNo: 'UNUSED',
+    amount: t.amount,
+    transactionAmount: t.amount,
+    memo: t.transactionId,
+    memoWithSuffix: appendSuf(t.transactionId, t.channel),
+    isUnused: true,
+    channel: t.channel,
+    sheet_row_number: t.sheet_row_number,
+  }));
+
+  return { payments: out, leftoverPerTx };
+}
+
+/**
  * Phase 2 — the forward-pay baby. Takes leftoverPerTx from V2 and rolls
  * each per-tx leftover onto that customer's FUTURE invoices (TxnDate >
  * today, balance > 0), oldest-first (closest day first).

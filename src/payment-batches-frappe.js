@@ -5,7 +5,7 @@
 // Source of invoices: Frappe (elegansky.api.get_open_invoices per customer)
 // Destination of payments: Frappe (elegansky.api.ingest_payment per customer)
 // Bank-txn source: SAME PASSED_SAV_NMB / PASSED_SAV sheets as today
-// Algorithm: SAME — processInvoicePaymentsV2 (sacred, byte-identical)
+// Algorithm: processInvoicePaymentsFrappe (APRUNA-style: TODAY → oldest ARREARS → oldest FORWARD)
 // AS_OF + TxnDate: SAME semantics as the QB path
 // Sheet markers (I/J/K): SAME write logic
 // Locks + consumed_transactions: SAME safeguards
@@ -28,7 +28,7 @@ import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
 import { getOpenInvoices, ingestPayment, reversePayment, getPaymentEntry, getSalesInvoice, getLoanSummary } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
-import { processInvoicePaymentsV2 } from './payment-algorithm-v2.js';
+import { processInvoicePaymentsFrappe } from './payment-algorithm-v2.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
 
