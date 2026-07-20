@@ -5553,10 +5553,32 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
     return c;
   };
 
-  // ── 4. Walk EAT clock dates from markerYmdEat → nowYmdEat (inclusive) ──
-  const dates = [];
+  // ── 4. Build the ordered list of EAT dates to plan windows for ──
+  //
+  // Fix B3 (Frank 2026-07-20): the old code walked ONLY forward from
+  // markerYmdEat → nowYmdEat, missing rows physically appended BELOW K
+  // with sheet-dates from PRIOR business days (bank posts late, puller
+  // strict-appends, but the row's txn-date is old). Those rows were
+  // skipped as `skippedOutOfWindow` on every subsequent scheduled fire
+  // and never recovered because no plan window ever covered their date.
+  //
+  // New behavior: take EVERY unique EAT date present in below-K rows,
+  // UNION with markerYmdEat → nowYmdEat walk (preserves the "fire the
+  // current day even if it has zero rows" habit some downstream watchers
+  // relied on), sort ascending so retro windows fire OLDEST FIRST — the
+  // chronological order matters for the retro-reconciler's void-and-replay
+  // logic.
+  //
+  // Cap dates at nowYmdEat so a bogus future-date row (bank posted with
+  // wrong date) doesn't create a plan window in the future.
+  const datesSeen = new Set();
+  for (const t of tsBelow) {
+    const dEat = ymdInEat(t);
+    if (dEat <= nowYmdEat) datesSeen.add(dEat);
+  }
   let cur = markerYmdEat;
-  while (cur <= nowYmdEat) { dates.push(cur); cur = eatDateAfter(cur); }
+  while (cur <= nowYmdEat) { datesSeen.add(cur); cur = eatDateAfter(cur); }
+  const dates = [...datesSeen].sort();
 
   const plan = [];
   for (let di = 0; di < dates.length; di++) {
