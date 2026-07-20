@@ -192,7 +192,7 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
       const resp = await ingestPayment(body);
       const status = resp?.status || 'ok';
       // consumed_transactions gate
-      const batch = await ensureFrappeBatch(channel, txnDate);
+      const batch = await ensureFrappeBatch(channel, postDate);
       const tsIso = t.receivedTimestamp ? new Date(t.receivedTimestamp).toISOString() : new Date().toISOString();
       await db().query(
         `INSERT INTO consumed_transactions (batch_id, bank_ref, consumed_at, sheet_ts) VALUES ($1,$2,NOW(),$3::timestamptz) ON CONFLICT DO NOTHING`,
