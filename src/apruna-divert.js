@@ -161,11 +161,10 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
 
     // physical = row's bank calendar day EAT (used for allocation ordering:
     // TODAY vs OLDER ARREARS vs FORWARD in foldAllocations).
-    // rowTxnDate = row's kili-adjusted date (legacy fallback for callers that
-    // don't pass a fire txnDate — Frank 2026-07-20 wants callers to pass the
-    // FIRE's txnDate so the Frappe posting_date reflects when we booked,
-    // not the row's bank-clock date, so already-closed periods don't get
-    // late payments).
+    // rowTxnDate = row's kili-adjusted date (used as posting_date when the
+    // caller doesn't pass one; caller's `fireTxnDate` — which is really the
+    // plan-window's kili day — takes precedence and should match rowTxnDate
+    // for well-formed windows).
     const { physical, txnDate: rowTxnDate } = daysFromTs(t.receivedTimestamp);
     const bankRef = t.transactionId;
     if (!bankRef) {
@@ -182,9 +181,9 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
     try {
       const inv = await getOpenInvoices(customer);
       const { plan, remain } = foldAllocations(inv?.invoices || [], amount, physical);
-      // Prefer the caller's fire txnDate (from computeCatchupPlan's kili-adjusted
-      // firing business day); fall back to row's own kili-adjusted date if the
-      // caller didn't pass one (backwards-compat for pre-2026-07-20 callers).
+      // Posting date = plan-window txn_date (kili business day of the WINDOW,
+      // which for well-formed rows equals rowTxnDate). Fall back to
+      // rowTxnDate if caller didn't pass a plan txnDate.
       const postDate = fireTxnDate || rowTxnDate;
       const body = {
         customer, amount, date: postDate, txn_id: String(bankRef), mode_of_payment: mode,
