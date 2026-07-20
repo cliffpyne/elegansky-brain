@@ -133,7 +133,7 @@ async function ensureFrappeBatch(channel, txnDate) {
  * If the feature flag is off, this is a no-op: returns everything as qbTxns.
  * Any per-txn failure logs + falls through to qbTxns (safest default).
  */
-export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName }) {
+export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, txnDate: fireTxnDate }) {
   if (!isEnabled()) return { qbTxns: txns, aprunaResults: null, skipped: 'flag_off' };
   if (!Array.isArray(txns) || txns.length === 0) return { qbTxns: txns, aprunaResults: null, skipped: 'empty' };
 
@@ -159,7 +159,14 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName }
     if (!m) { qbTxns.push(t); continue; }
     results.matched++;
 
-    const { physical, txnDate } = daysFromTs(t.receivedTimestamp);
+    // physical = row's bank calendar day EAT (used for allocation ordering:
+    // TODAY vs OLDER ARREARS vs FORWARD in foldAllocations).
+    // rowTxnDate = row's kili-adjusted date (legacy fallback for callers that
+    // don't pass a fire txnDate — Frank 2026-07-20 wants callers to pass the
+    // FIRE's txnDate so the Frappe posting_date reflects when we booked,
+    // not the row's bank-clock date, so already-closed periods don't get
+    // late payments).
+    const { physical, txnDate: rowTxnDate } = daysFromTs(t.receivedTimestamp);
     const bankRef = t.transactionId;
     if (!bankRef) {
       console.warn(`[apruna-divert] APRUNA match but no bank_ref — falling through to QB: ${JSON.stringify(t).slice(0,120)}`);
@@ -175,8 +182,12 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName }
     try {
       const inv = await getOpenInvoices(customer);
       const { plan, remain } = foldAllocations(inv?.invoices || [], amount, physical);
+      // Prefer the caller's fire txnDate (from computeCatchupPlan's kili-adjusted
+      // firing business day); fall back to row's own kili-adjusted date if the
+      // caller didn't pass one (backwards-compat for pre-2026-07-20 callers).
+      const postDate = fireTxnDate || rowTxnDate;
       const body = {
-        customer, amount, date: txnDate, txn_id: String(bankRef), mode_of_payment: mode,
+        customer, amount, date: postDate, txn_id: String(bankRef), mode_of_payment: mode,
         allocations: plan.map((a) => ({ reference_doctype: 'Sales Invoice', reference_name: a.reference_name, allocated_amount: a.allocated_amount })),
       };
       const resp = await ingestPayment(body);

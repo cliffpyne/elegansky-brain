@@ -5497,6 +5497,21 @@ function eatDateAfter(ymd) {
  * skip incremental fires (Frank 2026-06-15 hanang0700 bug). The planner is
  * now the single source of windows for both catchup and incremental cases.
  */
+// kili1615 business-day resolver — the business day (for QB TxnDate assignment)
+// is the EAT calendar date shifted forward one day when now is at or after
+// 16:15 EAT. So [16:15 EAT day-1, 16:15 EAT day) all book to `day`. Frank
+// 2026-07-20: TxnDate on QB Payments follows the FIRING window's business
+// day, NOT the row's original bank-txn date. This lets retro sweeps stamp
+// today's date on payments recovered for old bank rows — accountant's
+// already-closed period never receives late-dated payments.
+function kiliBusinessDayFromUtcMs(utcMs) {
+  const KILI_MIN = 16 * 60 + 15;
+  const eat = new Date(utcMs + 3 * 3600 * 1000);
+  const totalMin = eat.getUTCHours() * 60 + eat.getUTCMinutes();
+  const shifted = totalMin < KILI_MIN ? eat : new Date(eat.getTime() + 86400000);
+  return shifted.toISOString().slice(0, 10);
+}
+
 export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
   // ── 1. Find last K marker (= last "end of {tick}" line in column K) ──
   let maxKRow = -1;
@@ -5610,7 +5625,7 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
           since_iso: new Date(aLoInc).toISOString(),
           until_iso: new Date(aHiExc).toISOString(),
           as_of: D,
-          txn_date: D,
+          txn_date: kiliBusinessDayFromUtcMs(nowUtcMs), // Frank 2026-07-20: stamp firing day, not row's window day
           row_count: c,
         });
       }
@@ -5634,7 +5649,7 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
           since_iso: new Date(bLoInc).toISOString(),
           until_iso: new Date(bHiExc).toISOString(),
           as_of: D,
-          txn_date: eatDateAfter(D),
+          txn_date: kiliBusinessDayFromUtcMs(nowUtcMs), // Frank 2026-07-20: stamp firing day, not row's window day
           row_count: c,
         });
       }
@@ -6131,7 +6146,10 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // needs the backfill script.
   try {
     const { divertAprunaTxns } = await import('./apruna-divert.js');
-    const divert = await divertAprunaTxns(txns, { channel, sheetId: cfg.sheetId, tab: cfg.tab, tickName });
+    // Pass the fire's txnDate through so Frappe posting_date matches the
+    // firing business day (kili-adjusted), not the row's bank-clock date.
+    // Frank 2026-07-20 — protects already-closed accounting periods.
+    const divert = await divertAprunaTxns(txns, { channel, sheetId: cfg.sheetId, tab: cfg.tab, tickName, txnDate });
     if (divert && Array.isArray(divert.qbTxns)) {
       txns.length = 0; txns.push(...divert.qbTxns);
     }
