@@ -147,7 +147,7 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
   }
 
   const qbTxns = [];
-  const results = { matched: 0, pushed: 0, failed: 0, fallthrough: 0, details: [] };
+  const results = { matched: 0, pushed: 0, failed: 0, fallthrough: 0, qb_duplicate_skipped: 0, details: [] };
   const mode = modeForChannel(channel);
 
   // Track sheet-row marker writes so we can batch them at end of loop
@@ -176,6 +176,35 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
     if (!customer || !amount || amount <= 0) {
       console.warn(`[apruna-divert] missing customer/amount for ref ${bankRef} — falling through to QB`);
       qbTxns.push(t); results.fallthrough++; continue;
+    }
+
+    // QB-side duplicate check — Frank 2026-07-20 incident (batch e6bd789a,
+    // 38 double-payments). Duplicate rows can appear below the K marker
+    // (bank puller re-inject, manual paste, etc). Before Frappe-pushing,
+    // check whether this bank_ref is already in QB under any suffix. If so,
+    // SKIP entirely — do NOT push to Frappe, do NOT fall through to QB.
+    // Gate the ref in consumed_transactions bound to the pre-existing QB
+    // batch so future fires keep skipping.
+    const priorQb = await db().query(
+      `SELECT pu.qb_id, pu.batch_id
+         FROM payment_uploads pu
+        WHERE pu.bank_ref IN ($1, $1 || 'B', $1 || 'N', $1 || 'P')
+          AND pu.kind = 'payment'
+          AND pu.status = 'created'
+          AND pu.qb_id IS NOT NULL
+        LIMIT 1`,
+      [bankRef],
+    );
+    if (priorQb.rows.length > 0) {
+      const hit = priorQb.rows[0];
+      console.warn(`[apruna-divert] ref=${bankRef} (${customer}) already has QB Payment ${hit.qb_id} in batch ${hit.batch_id} — SKIP (no Frappe push, no QB fallthrough, no double payment)`);
+      const tsIso = t.receivedTimestamp ? new Date(t.receivedTimestamp).toISOString() : new Date().toISOString();
+      await db().query(
+        `INSERT INTO consumed_transactions (batch_id, bank_ref, consumed_at, sheet_ts) VALUES ($1,$2,NOW(),$3::timestamptz) ON CONFLICT DO NOTHING`,
+        [hit.batch_id, bankRef, tsIso],
+      );
+      results.qb_duplicate_skipped++;
+      continue;
     }
 
     try {
@@ -246,6 +275,6 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
   // rollups that additional fires (evening / heisenberg / catchup) may
   // append to. Reconciliation queries filter by channel prefix 'frappe_'.
 
-  console.log(`[apruna-divert] ${channel} tick=${tickName || '?'}: matched=${results.matched} pushed=${results.pushed} fell_through=${results.fallthrough + results.failed} (qb_txns=${qbTxns.length}/${txns.length})`);
+  console.log(`[apruna-divert] ${channel} tick=${tickName || '?'}: matched=${results.matched} pushed=${results.pushed} fell_through=${results.fallthrough + results.failed} qb_dup_skipped=${results.qb_duplicate_skipped} (qb_txns=${qbTxns.length}/${txns.length})`);
   return { qbTxns, aprunaResults: results };
 }
