@@ -6027,6 +6027,16 @@ async function captureInvoiceSnapshot(asOf, arrears) {
 }
 
 async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate, forceSkipMaxKRow }) {
+  // SAV channels (bank_sav, nmbnew_sav) route to SAVCOM/Frappe — payments
+  // NEVER hit QB. Skip QB preflight dedup entirely: it would query QB with
+  // SAV customer IDs and (a) waste time (b) fail if any ID isn't a QB
+  // customer number (which is common for SAV cohort). Frank 2026-07-20:
+  // bank_sav preflight aborted 31 payments today with "Invalid ID" for this
+  // exact reason. The SAV path has its own dedup via consumed_transactions
+  // and the SAVCOM idempotency layer downstream.
+  if (channel === 'bank_sav' || channel === 'nmbnew_sav') {
+    qbPreflightDedup = null;
+  }
   const cfg = CHANNEL_SHEETS[channel];
   const winStart = new Date(sinceIso);
   const winEnd = new Date(untilIso);
