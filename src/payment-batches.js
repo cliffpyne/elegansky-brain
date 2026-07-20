@@ -5497,23 +5497,6 @@ function eatDateAfter(ymd) {
  * skip incremental fires (Frank 2026-06-15 hanang0700 bug). The planner is
  * now the single source of windows for both catchup and incremental cases.
  */
-// kili1615 business-day resolver — the business day (for QB TxnDate assignment)
-// is the EAT calendar date shifted forward one day when now is at or after
-// 16:15 EAT. So [16:15 EAT day-1, 16:15 EAT day) all book to `day`.
-//
-// Frank 2026-07-20 (definitive rule): AS_OF stays as the row's kili day (for
-// invoice allocation), but TxnDate (QB) / posting_date (Frappe) tracks the
-// PROCESSING WINDOW — the kili day of when we FIRE. This decouples the two:
-// as_of picks the right invoices; txn_date lands the payment in the current
-// open accounting period, protecting closed-book periods from late fires.
-function kiliBusinessDayFromUtcMs(utcMs) {
-  const KILI_MIN = 16 * 60 + 15;
-  const eat = new Date(utcMs + 3 * 3600 * 1000);
-  const totalMin = eat.getUTCHours() * 60 + eat.getUTCMinutes();
-  const shifted = totalMin < KILI_MIN ? eat : new Date(eat.getTime() + 86400000);
-  return shifted.toISOString().slice(0, 10);
-}
-
 export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
   // ── 1. Find last K marker (= last "end of {tick}" line in column K) ──
   let maxKRow = -1;
@@ -5597,11 +5580,6 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
   while (cur <= nowYmdEat) { datesSeen.add(cur); cur = eatDateAfter(cur); }
   const dates = [...datesSeen].sort();
 
-  // Frank 2026-07-20 (definitive): txn_date = firing window's kili day (NOT
-  // row's kili day). All windows in one fire share the SAME txn_date =
-  // kili day of nowUtcMs. Only as_of varies per window (row's kili day).
-  const fireTxnDate = kiliBusinessDayFromUtcMs(nowUtcMs);
-
   const plan = [];
   for (let di = 0; di < dates.length; di++) {
     const D = dates[di];
@@ -5632,7 +5610,7 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
           since_iso: new Date(aLoInc).toISOString(),
           until_iso: new Date(aHiExc).toISOString(),
           as_of: D,
-          txn_date: fireTxnDate, // Frank rule: TxnDate = firing kili day, not row's
+          txn_date: D, // kili rule: rows before 16:15 EAT book to same-day D
           row_count: c,
         });
       }
@@ -5656,7 +5634,7 @@ export function computeCatchupPlan({ channel, sheet, nowUtcMs }) {
           since_iso: new Date(bLoInc).toISOString(),
           until_iso: new Date(bHiExc).toISOString(),
           as_of: D,
-          txn_date: fireTxnDate, // Frank rule: TxnDate = firing kili day, not row's
+          txn_date: eatDateAfter(D), // kili rule: rows at/after 16:15 EAT roll to D+1
           row_count: c,
         });
       }
