@@ -579,6 +579,10 @@ export function mountPaymentBatchesApi(app, deps) {
       // dashboard can render progress + poll batch states.
       setImmediate(async () => {
         const batchIds = [];
+        // Frank 2026-07-21: track MAX row across ALL windows in this session
+        // and read cfg (sheetId/tab) once for the final K marker write.
+        let sessionMaxRow = 0;
+        const cfgAtFireStart = CHANNEL_SHEETS[channel];
         // Fix #3 (Frank 2026-06-29): 30-sec heartbeat keeps locked_at fresh
         // for the WHOLE catchup orchestration (which can span many windows
         // and 5-15 minutes). Paired with the 90-sec stale-reclaim, a dead
@@ -672,10 +676,10 @@ export function mountPaymentBatchesApi(app, deps) {
               continue; // next window
             }
 
-            // REAL push — await runAutoUploadBackground so K marker advances
-            // before we compute the next entry's plan (NB: the plan we already
-            // computed is sequential by design, but Column I/J/K writes must
-            // land before the next prepareAutoUpload to keep the sheet honest).
+            // REAL push — await runAutoUploadBackground so I/J writes land
+            // before the next prepareAutoUpload. K marker is deferred to the
+            // end of the whole session (see below) so retro-window K markers
+            // don't orphan fresh rows appended later in the sheet.
             await runAutoUploadBackground({
               batchId: result.batchId,
               paid: result.paid,
@@ -689,11 +693,36 @@ export function mountPaymentBatchesApi(app, deps) {
               qbCreateCreditMemo,
               cfg: result.cfg,
               tickName: entryTickName,
+              skipEndOfTickMarker: true,
             }).catch((err) => {
               console.error(`[start-channel ${channel}] ${entry.tick_label} runAutoUploadBackground threw:`, err);
             });
+            // Track max processed row for the single final K marker.
+            for (const p of (result.paid || [])) {
+              if (p.sheet_row_number && p.sheet_row_number > sessionMaxRow) sessionMaxRow = p.sheet_row_number;
+            }
+            for (const u of (result.unused || [])) {
+              if (u.sheet_row_number && u.sheet_row_number > sessionMaxRow) sessionMaxRow = u.sheet_row_number;
+            }
           }
           console.log(`[start-channel ${channel}] all ${planResult.plan.length} window(s) done; batches=${batchIds.join(',')}`);
+          // Frank 2026-07-21: ONE final K marker at MAX(row) across all
+          // windows this session. Prevents per-window K markers from being
+          // written on retro rows (whose bank_ts is old but row_number is
+          // high because they were appended late) — those markers used to
+          // orphan fresh rows sitting below the retro K in the sheet.
+          try {
+            const firstResult = batchIds.length ? { cfg: cfgAtFireStart } : null;
+            const sheetCfg = cfgAtFireStart;
+            if (sessionMaxRow > 0 && sheetCfg && sheetCfg.sheetId && sheetCfg.tab) {
+              await paintRowEndMarker(sheetCfg.sheetId, sheetCfg.tab, sessionMaxRow, buttonTickName);
+              console.log(`[start-channel ${channel}] SESSION-END K marker at row ${sessionMaxRow} tick='end of ${buttonTickName}' on ${sheetCfg.tab}`);
+            } else if (sessionMaxRow === 0) {
+              console.log(`[start-channel ${channel}] no rows processed across ${planResult.plan.length} window(s) — skipping session-end K marker`);
+            }
+          } catch (err) {
+            console.error(`[start-channel ${channel}] session-end K marker failed (non-fatal):`, err.message);
+          }
         } catch (err) {
           console.error(`[start-channel ${channel}] background orchestrator threw:`, err);
         } finally {
@@ -6558,6 +6587,9 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   qbCreateCreditMemo,  // kept only for fallback in sweep retry
   cfg,  // { sheetId, tab } — used to write Column I + J markers
   tickName,  // 'meru0300' / 'kili1615' / 'heisenberg' (manual button) etc.
+  skipEndOfTickMarker, // Frank 2026-07-21: start-channel writes ONE final K at
+                       // end of full session (max row across all windows) to
+                       // avoid retro-window K markers orphaning fresh rows.
 }) {
   await logBatch(batchId, 'info', `runAutoUploadBackground start: paid=${paid.length} unused=${unused.length} txnDate=${txnDate} tick=${tickName || 'unknown'}`, 'qb-push');
 
@@ -6940,6 +6972,14 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
   // K) and write "end of {tick_name}" into Column K. Lets the operator see
   // visually on the sheet where each tick stopped. Applies to scheduler
   // ticks (kili1615, mawenzi1800, etc.) and manual button fires ('heisenberg').
+  //
+  // Frank 2026-07-21: when skipEndOfTickMarker=true (start-channel plan
+  // walks), skip the per-window K marker — caller writes ONE K at max row
+  // after all windows complete, to prevent retro-window K markers from
+  // orphaning fresh rows appended later in the sheet.
+  if (skipEndOfTickMarker) {
+    return;
+  }
   try {
     if (cfg && cfg.sheetId && cfg.tab && tickName) {
       const allRows = [];
