@@ -1311,27 +1311,63 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     // Need at least one trigger tick to have finalized batches today (EAT day,
     // not 30-min window — the report should fire after 05:00 EAT even if
     // meru0100 finalized at 01:08 EAT, 4 hours earlier).
+    //
+    // Frank 2026-07-21: also require ALL expected channels (nmbnew, bank) to
+    // have a finalized batch before firing — otherwise the report was going
+    // out with just NMB data whenever bank preflight aborted. Wait up to
+    // allChannelsGraceMin past the first channel finalize; after that, fire
+    // anyway with a "PARTIAL — missing X" annotation so ops sees the gap.
     const tickPatterns = cfg.triggerTicks.map((t) => `auto-upload:${t}%`);
-    const recent = await pool.query(
-      `SELECT created_by FROM payment_batches
+    const expectedChannels = cfg.expectedChannels || ['nmbnew', 'bank'];
+    const graceMin = cfg.allChannelsGraceMin ?? 20;
+    const chanQ = await pool.query(
+      `SELECT channel, MIN(finalized_at) AS first_at, MAX(created_by) AS created_by
+         FROM payment_batches
         WHERE status = 'finalized'
           AND created_at >= (
             date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
             AT TIME ZONE 'Africa/Dar_es_Salaam'
           )
           AND created_by LIKE ANY ($1::text[])
-        LIMIT 1`,
+        GROUP BY channel`,
       [tickPatterns],
     );
+    const seenChans = new Set(chanQ.rows.map((r) => r.channel));
+    const missingChans = expectedChannels.filter((c) => !seenChans.has(c));
+    const firstFinalizedAt = chanQ.rows.length
+      ? new Date(Math.min(...chanQ.rows.map((r) => new Date(r.first_at).getTime())))
+      : null;
+    const graceElapsedMs = firstFinalizedAt ? (Date.now() - firstFinalizedAt.getTime()) : 0;
+
+    // Frank 2026-07-21: also require the auto_upload_locks to be CLEAR on
+    // every expected channel. First-batch-finalized is not enough — a
+    // start-channel walk can have multiple retro windows and still be
+    // firing later batches while its first is done. Lock stays held until
+    // the walker exits, so lock-clear === channel session complete.
+    const lockedChanQ = await pool.query(
+      `SELECT channel FROM auto_upload_locks WHERE channel = ANY($1::text[])`,
+      [expectedChannels],
+    );
+    const lockedChans = new Set(lockedChanQ.rows.map((r) => r.channel));
+    const chansStillFiring = expectedChannels.filter((c) => lockedChans.has(c));
+
+    const chansReady =
+      (missingChans.length === 0 && chansStillFiring.length === 0)
+      || graceElapsedMs >= graceMin * 60 * 1000;
+
     // Frank 2026-06-28: forceAtHourEat fallback. If NO trigger tick has
     // finalized today AND the clock has passed the force hour, fire the
     // ritual anyway with whatever current arrears we can pull. The arrears
     // endpoint reads QB live, so a meaningful morning report is still
     // produceable even when all overnight upload ticks failed.
-    const forced = !recent.rows.length
+    const forced = !chanQ.rows.length
       && cfg.forceAtHourEat != null
       && eatHour >= cfg.forceAtHourEat;
-    if (!recent.rows.length && !forced) continue;
+    if (!chanQ.rows.length && !forced) continue;
+    if (chanQ.rows.length && !chansReady) {
+      console.log(`[m6pm/autofire] mode=${mode} waiting for channels: missing=[${missingChans.join(',')}] elapsed=${Math.round(graceElapsedMs/60000)}min < grace=${graceMin}min`);
+      continue;
+    }
 
     // Atomic gate acquire — only one BRAIN process wins per mode per day.
     const acquired = await pool.query(
@@ -1342,8 +1378,11 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     );
     if (!acquired.rows.length) continue;
 
-    const armingTick = (recent.rows[0].created_by || '').match(/auto-upload:([^:]+)/)?.[1] || '?';
-    console.log(`[m6pm/autofire] mode=${mode} armed by ${armingTick} — starting report fire (eatHour=${eatHour})`);
+    const armingTick = (chanQ.rows[0]?.created_by || '').match(/auto-upload:([^:]+)/)?.[1] || '?';
+    const chanNote = missingChans.length
+      ? ` PARTIAL — missing [${missingChans.join(',')}] after ${Math.round(graceElapsedMs/60000)}min grace`
+      : '';
+    console.log(`[m6pm/autofire] mode=${mode} armed by ${armingTick} seen=[${[...seenChans].join(',')}] — starting report fire (eatHour=${eatHour})${chanNote}`);
     try {
       // Fix #1 (Frank 2026-06-29): cache fallback as default. /arrears is a
       // single-point-of-failure for the whole morning chain — if it 500s,
@@ -1511,18 +1550,46 @@ async function maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, t
   const gate = await pool.query(`SELECT value FROM app_settings WHERE key=$1`, [gateKey]);
   if (gate.rows.length) return;
 
-  // Need kili1615 batches finalized today (EAT day).
-  const recent = await pool.query(
-    `SELECT created_by FROM payment_batches
+  // Frank 2026-07-21: comparison used to fire on the FIRST kili1615 batch
+  // that finalized (LIMIT 1) — meaning NMB-only data reached the report
+  // while bank's per-window walk was still processing later retro windows.
+  // Now require BOTH: each expected channel has ≥1 finalized batch AND
+  // its auto_upload_locks row is clear (walker done). Grace timeout still
+  // fires partial after N minutes so a truly dead channel doesn't block.
+  const expectedChannels = ['nmbnew', 'bank'];
+  const graceMin = 20;
+  const chanQ = await pool.query(
+    `SELECT channel, MIN(finalized_at) AS first_at
+       FROM payment_batches
       WHERE status = 'finalized'
         AND created_at >= (
           date_trunc('day', now() AT TIME ZONE 'Africa/Dar_es_Salaam')
           AT TIME ZONE 'Africa/Dar_es_Salaam'
         )
         AND created_by LIKE 'auto-upload:kili1615%'
-      LIMIT 1`,
+      GROUP BY channel`,
   );
-  if (!recent.rows.length) return;
+  if (!chanQ.rows.length) return;
+  const seenChans = new Set(chanQ.rows.map((r) => r.channel));
+  const missingChans = expectedChannels.filter((c) => !seenChans.has(c));
+  const firstFinalizedAt = new Date(Math.min(...chanQ.rows.map((r) => new Date(r.first_at).getTime())));
+  const graceElapsedMs = Date.now() - firstFinalizedAt.getTime();
+
+  const lockedChanQ = await pool.query(
+    `SELECT channel FROM auto_upload_locks WHERE channel = ANY($1::text[])`,
+    [expectedChannels],
+  );
+  const lockedChans = new Set(lockedChanQ.rows.map((r) => r.channel));
+  const chansStillFiring = expectedChannels.filter((c) => lockedChans.has(c));
+
+  const chansReady =
+    (missingChans.length === 0 && chansStillFiring.length === 0)
+    || graceElapsedMs >= graceMin * 60 * 1000;
+
+  if (!chansReady) {
+    console.log(`[m6pm/autofire/evening] waiting: missing=[${missingChans.join(',')}] stillFiring=[${chansStillFiring.join(',')}] elapsed=${Math.round(graceElapsedMs/60000)}min < grace=${graceMin}min`);
+    return;
+  }
 
   // Atomic claim
   const acquired = await pool.query(
