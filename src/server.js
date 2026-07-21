@@ -484,10 +484,21 @@ async function qbPreflightDedup({ tuples, sinceTxnDate }) {
   // dedup misses them and the next auto-fire pushes a duplicate.
   const byCust = new Map();
   const SUFFIX_LETTERS = new Set(['N', 'B', 'P']);
+  // QB Customer.Id is always a numeric string. A non-numeric ID in the IN
+  // clause makes QB reject the whole 50-customer chunk with "Invalid ID",
+  // which used to abort the entire upload. Frank 2026-07-21: swallow the
+  // bad ID, log it once, keep going — one broken invoice mirror row
+  // shouldn't kill 40 legit payments.
+  const droppedIds = new Set();
   for (const t of tuples) {
     if (!t.customerId || !t.ref) continue;
-    if (!byCust.has(t.customerId)) byCust.set(t.customerId, new Map());
-    const m = byCust.get(t.customerId);
+    const cid = String(t.customerId);
+    if (!/^\d+$/.test(cid)) {
+      droppedIds.add(cid + '|ref=' + t.ref);
+      continue;
+    }
+    if (!byCust.has(cid)) byCust.set(cid, new Map());
+    const m = byCust.get(cid);
     // canonical = the suffixed form (what BRAIN writes + what we use as the dedup key)
     if (!m.has(t.ref)) m.set(t.ref, t.ref);
     // also map the bare form (suffix stripped) → canonical, so a manual
@@ -497,6 +508,9 @@ async function qbPreflightDedup({ tuples, sinceTxnDate }) {
       const bare = t.ref.slice(0, -1);
       if (bare && !m.has(bare)) m.set(bare, t.ref);
     }
+  }
+  if (droppedIds.size > 0) {
+    console.warn(`[qb-preflight] dropped ${droppedIds.size} tuple(s) with non-numeric customer_id — SKIPPING preflight for these (batch continues): ${[...droppedIds].slice(0, 5).join(', ')}${droppedIds.size > 5 ? ' …' : ''}`);
   }
   if (byCust.size === 0) return { duplicateKeys: new Set(), detail: [] };
 

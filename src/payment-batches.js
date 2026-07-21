@@ -6482,11 +6482,10 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
             [`BRAIN ABORTED upload for channel=${channel}: QB pre-flight check failed 3× (${String(err.message || err).slice(0, 150)}). ${paid.length} paid + ${unused.length} unused NOT pushed. Retry the upload window manually after QB recovers.`],
           );
         } catch { /* notify enqueue must not crash the pipeline */ }
-        // Delete the batch + consumed_transactions so refs stay eligible for retry.
-        try {
-          await db().query(`DELETE FROM consumed_transactions WHERE batch_id = $1`, [batchId]);
-          await db().query(`DELETE FROM payment_batches WHERE id = $1`, [batchId]);
-        } catch (e) { console.error('[auto-upload] cleanup after preflight-fail:', e.message); }
+        // NB: preflight runs BEFORE the payment_batches INSERT at line ~6550,
+        // so no batch row / consumed_transactions rows exist yet — nothing to
+        // clean up here. Previous cleanup code referenced batchId in TDZ and
+        // crashed silently. Just return aborted. (Frank 2026-07-21)
         return {
           aborted: true,
           reason: 'qb-preflight-failed',
