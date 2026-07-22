@@ -765,9 +765,16 @@ export async function runSavFrappeUpload({
   // 9. Sheet markers — SHIFTED one column right vs the QB path so the
   //    wakandi_member_id in column I stays untouched. Operator sees:
   //      J = "Fetched at: <iso>"        (was I on QB tabs)
-  //      K = "Frappe pending/pushed"    (was J on QB tabs)
+  //      K = "Frappe pushed: <name>"    (was J on QB tabs)
   //      L = "end of <tick>"            (was K on QB tabs)
-  const fetchedAt = new Date().toISOString();
+  //
+  // Frank 2026-07-22: STOP writing "Frappe pending" pre-emptively —
+  // it was staying "pending" forever because no follow-up code ever
+  // updated it to "Frappe pushed" after a successful ingest_payment.
+  // New behavior: only DRY_RUN pre-writes markers (needed for the plan
+  // walker); real fires paint J + K = "Frappe pushed: <payment_name>"
+  // AFTER Frappe confirms in section 11/12 below. Failed rows stay
+  // marker-less so the next fire retries them.
   const fetchRows = new Set();
   // Skip-listed txns (NOT_YET_IN_FRAPPE_PLATES) don't get sheet J/K
   // markers written — they stay marker-less so a future re-fire (once
@@ -776,18 +783,20 @@ export async function runSavFrappeUpload({
     if (t._skipNotInFrappe) continue;
     if (t.sheet_row_number) fetchRows.add(t.sheet_row_number);
   }
-  if (fetchRows.size > 0 && cfg.sheetId && cfg.tab) {
+  if (dryRun && fetchRows.size > 0 && cfg.sheetId && cfg.tab) {
+    // DRY_RUN only: pre-write markers so the operator can inspect the
+    // plan on the sheet. Real fires paint post-success (below).
     const updates = [];
-    const dryTag = dryRun ? ' (DRY_RUN)' : '';
+    const fetchedAt = new Date().toISOString();
     for (const row of fetchRows) {
-      updates.push({ range: `${cfg.tab}!${cfg.fetchedAtLetter}${row}`, value: `Fetched at: ${fetchedAt}${dryTag}` });
-      updates.push({ range: `${cfg.tab}!${cfg.pushedLetter}${row}`,    value: `${dryRun ? 'DRY_RUN' : 'Frappe pending'}${dryTag}` });
+      updates.push({ range: `${cfg.tab}!${cfg.fetchedAtLetter}${row}`, value: `Fetched at: ${fetchedAt} (DRY_RUN)` });
+      updates.push({ range: `${cfg.tab}!${cfg.pushedLetter}${row}`,    value: `DRY_RUN (DRY_RUN)` });
     }
     try {
       const r = await writeSheetCells(cfg.sheetId, updates);
-      console.log(`[sav-frappe] ${cfg.fetchedAtLetter}+${cfg.pushedLetter} markers: ${r.updatedCells} cells, ${fetchRows.size} rows, tab=${cfg.tab}, dryRun=${dryRun}`);
+      console.log(`[sav-frappe] DRY_RUN pre-write ${cfg.fetchedAtLetter}+${cfg.pushedLetter}: ${r.updatedCells} cells, ${fetchRows.size} rows, tab=${cfg.tab}`);
     } catch (e) {
-      console.error('[sav-frappe] sheet marker write failed (non-fatal):', e.message);
+      console.error('[sav-frappe] DRY_RUN sheet marker write failed (non-fatal):', e.message);
     }
     // End-of-tick marker on the last sheet row processed. paintRowEndMarker
     // now accepts paintEndColumnIndex + textColumnIndex overrides so SAV can
@@ -850,7 +859,21 @@ export async function runSavFrappeUpload({
       txn_id: ref,
       allocations,
       pu_ids: entries.map((e) => e.pu_id),
+      // Frank 2026-07-22: sheet rows attached to the group so the
+      // post-success paint below can mark J + K only on rows whose
+      // Frappe POST landed cleanly.
+      sheet_rows: [...new Set(entries.map((e) => e.paid.sheet_row_number).filter(Boolean))],
     });
+  }
+
+  // Map bank_ref → sheet rows for unused (credit) lines too, so section
+  // 12's success branch can paint markers on those rows.
+  const unusedSheetRows = new Map();  // memoWithSuffix → [rows]
+  for (const u of unused) {
+    if (u.sheet_row_number) {
+      if (!unusedSheetRows.has(u.memoWithSuffix)) unusedSheetRows.set(u.memoWithSuffix, []);
+      unusedSheetRows.get(u.memoWithSuffix).push(u.sheet_row_number);
+    }
   }
 
   const frappeResults = [];
@@ -925,6 +948,44 @@ export async function runSavFrappeUpload({
         [batchId, String(err.message || err).slice(0, 500), u.memoWithSuffix],
       );
       frappeResults.push({ bank_ref: u.memoWithSuffix, status: 'error', credit: true, error: err.message });
+    }
+  }
+
+  // 12b. Post-success sheet paint (Frank 2026-07-22 refactor).
+  //     Only rows whose Frappe POST landed cleanly get J + K markers.
+  //     Failed rows stay marker-less so a re-fire picks them up. This
+  //     replaces the old pre-write of "Frappe pending" that never got
+  //     updated to "Frappe pushed" after success — the sheet now shows
+  //     the actual Frappe payment name so the operator can audit at a
+  //     glance without cross-referencing the DB.
+  if (!dryRun && cfg.sheetId && cfg.tab) {
+    const nowIso = new Date().toISOString();
+    const paintUpdates = [];
+    for (const res of frappeResults) {
+      if (res.status === 'error') continue;
+      const g = groupsByRef.get(res.bank_ref);
+      const paymentName =
+        res.frappe?.payment ||
+        res.frappe?.payment_entry ||
+        res.frappe?.name ||
+        res.frappe?.data?.name ||
+        '';
+      const kValue = paymentName ? `Frappe pushed: ${paymentName}` : `Frappe pushed`;
+      const rows = g?.sheet_rows || unusedSheetRows.get(res.bank_ref) || [];
+      for (const row of rows) {
+        paintUpdates.push({ range: `${cfg.tab}!${cfg.fetchedAtLetter}${row}`, value: `Fetched at: ${nowIso}` });
+        paintUpdates.push({ range: `${cfg.tab}!${cfg.pushedLetter}${row}`,    value: kValue });
+      }
+    }
+    if (paintUpdates.length > 0) {
+      try {
+        const r = await writeSheetCells(cfg.sheetId, paintUpdates);
+        console.log(`[sav-frappe] post-success ${cfg.fetchedAtLetter}+${cfg.pushedLetter} markers: ${r.updatedCells} cells, tab=${cfg.tab}`);
+      } catch (e) {
+        // Non-fatal: batch already landed in Frappe. Marker gap can be
+        // reconciled by the sheet-recon script (paints IN_FRAPPE_UNMARKED).
+        console.error('[sav-frappe] post-success sheet marker write failed (non-fatal — Frappe already accepted):', e.message);
+      }
     }
   }
 
