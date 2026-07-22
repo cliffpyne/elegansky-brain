@@ -6325,30 +6325,55 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // is DATA-driven (physical day < as_of), not fire-type driven.
   try {
     const { reconcileCustomer, eatDayOf } = await import('./late-txn-reconciler.js');
-    // Prefer explicit asOf; fall back to txnDate; final fallback = today.
-    // Never use txnDate when asOf is available — kili rule would misfire.
-    const asOfDay = asOf || txnDate || new Date().toISOString().slice(0, 10);
+    // 2026-07-22 fix: compare against the day the fire is RUNNING, not asOf.
+    // Catch-up/heisenberg windows pin asOf to the row's own day, so the old
+    // `physical < asOf` trigger could never fire in the recovery flow —
+    // which is exactly where retro rows arrive. Result: zero voids ever.
+    const fireDay = eatDayOf(new Date());
     const lateByCustomer = new Map();
     for (const t of txnsClean) {
       const ts = t.receivedTimestamp;
       if (!ts) continue;
       const txnDay = eatDayOf(ts);
-      if (txnDay >= asOfDay) continue;
+      if (txnDay >= fireDay) continue;
       const customer = t.customerName || t.contractName || null;
       if (!customer) continue;
       const cur = lateByCustomer.get(customer);
       if (!cur || txnDay < cur) lateByCustomer.set(customer, txnDay);
     }
+    // One batched pre-filter keeps overnight-tail fires fast (the old
+    // asOf comparison existed because per-customer reconciles added
+    // 10-15 min): only customers who actually have created payments
+    // uploaded AFTER their late day go through void-and-replay.
+    let toReconcile = [];
     if (lateByCustomer.size > 0) {
-      console.log(`[retro-reconcile] ${lateByCustomer.size} late-txn customer(s) detected in this fire (asOf=${asOfDay})`);
-      for (const [customer, oldestDay] of lateByCustomer.entries()) {
+      const names = [...lateByCustomer.keys()];
+      const q = await db().query(
+        `SELECT customer_name,
+                max((created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date::text) AS max_day
+           FROM payment_uploads
+          WHERE status = 'created' AND customer_name = ANY($1::text[])
+          GROUP BY customer_name`,
+        [names],
+      );
+      const maxDayBy = new Map(q.rows.map((r) => [r.customer_name, r.max_day]));
+      toReconcile = names.filter((n) => (maxDayBy.get(n) || '') > lateByCustomer.get(n));
+    }
+    if (toReconcile.length > 0) {
+      console.log(`[retro-reconcile] ${toReconcile.length}/${lateByCustomer.size} late-txn customer(s) have downstream payments to void (fireDay=${fireDay})`);
+      for (const customer of toReconcile) {
+        const oldestDay = lateByCustomer.get(customer);
         try {
           const r = await reconcileCustomer({ customerName: customer, sinceDay: oldestDay, dryRun: false });
-          console.log(`[retro-reconcile] ${customer} since ${oldestDay}: voided=${r.void_results?.length || 0} consumed_cleared=${r.consumed_rows_deleted}`);
+          const okVoids = (r.void_results || []).filter((v) => v.ok).length;
+          const failed = r.void_failures?.length || 0;
+          console.log(`[retro-reconcile] ${customer} since ${oldestDay}: voided=${okVoids} failed=${failed} consumed_cleared=${r.consumed_rows_deleted} replay_refs=${(r.ready_to_replay_refs || []).length}`);
         } catch (err) {
           console.error(`[retro-reconcile] failed for ${customer}: ${err.message}`);
         }
       }
+    } else if (lateByCustomer.size > 0) {
+      console.log(`[retro-reconcile] ${lateByCustomer.size} late txn(s) detected, none with downstream payments — nothing to void (fireDay=${fireDay})`);
     }
   } catch (err) {
     // Non-fatal: if the reconciler module or reconcile step throws, the

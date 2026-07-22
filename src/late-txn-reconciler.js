@@ -182,37 +182,68 @@ export async function reconcileCustomer({ customerId, customerName, sinceDay, dr
   // Void each unique payment (dedupe by qb_id or bank_ref since a single
   // QB Payment can span multiple payment_uploads rows).
   const seenKey = new Set();
+  const keyOk = new Map(); // dedupe key -> void succeeded in QB/Frappe
   for (const pu of affected) {
     const key = pu.qb_id || pu.bank_ref;
     if (seenKey.has(key)) continue;
     seenKey.add(key);
     const r = await voidOne(pu);
     out.void_results.push(r);
+    keyOk.set(key, r.ok === true);
   }
 
-  // Clear consumed_transactions for all affected bank_refs so they can
-  // flow through the puller/upload path again.
-  const bareRefs = Array.from(new Set(affected.map((p) => String(p.bank_ref || '').replace(/[NBP]$/, '')).filter(Boolean)));
-  const suffixedRefs = Array.from(new Set(affected.map((p) => p.bank_ref).filter(Boolean)));
-  const del = await db().query(
-    `DELETE FROM consumed_transactions
-      WHERE bank_ref = ANY($1::text[]) OR bank_ref = ANY($2::text[])`,
-    [bareRefs, suffixedRefs],
-  );
-  out.consumed_rows_deleted = del.rowCount || 0;
-  out.ready_to_replay_refs = suffixedRefs;
-
-  // Mark the payment_uploads rows as voided so the batch history is clean.
-  const puIds = affected.map((p) => p.id);
-  if (puIds.length) {
-    await db().query(
-      `UPDATE payment_uploads
-          SET status = 'voided',
-              failure_reason = COALESCE(failure_reason, '') || ' | retro-reconcile ' || now()::text
-        WHERE id = ANY($1::uuid[])`,
-      [puIds],
+  // SAFETY (2026-07-22): a ref may only be cleared for replay when EVERY
+  // payment on it voided successfully. Clearing a ref whose void failed
+  // re-pushes the txn while the old payment is still live in QB — that is
+  // exactly how the 2026-07-19 test run minted duplicate payments. Failed
+  // voids keep their consumed rows: the late txn stays unused (safe,
+  // pre-retro behavior) and the fire log carries a VOID FAILURE line.
+  const failedRows = affected.filter((p) => keyOk.get(p.qb_id || p.bank_ref) !== true);
+  const failedRefs = new Set(failedRows.map((p) => p.bank_ref));
+  const clearRows = affected.filter((p) => !failedRefs.has(p.bank_ref));
+  if (failedRows.length) {
+    out.void_failures = failedRows.map((p) => ({ id: p.id, qb_id: p.qb_id, bank_ref: p.bank_ref }));
+    console.error(
+      `[retro-reconcile] VOID FAILURE ${customerName || customerId}: ${failedRows.length}/${affected.length} row(s) kept consumed (no replay) — refs: ${[...failedRefs].join(',')}`,
     );
   }
+
+  // Clear consumed_transactions for the fully-voided refs so they can flow
+  // through the puller/upload path again, and mark their payment_uploads
+  // rows voided — in ONE transaction so a crash can't clear a ref without
+  // recording the void (the other half of the 07-19 burn).
+  const bareRefs = Array.from(new Set(clearRows.map((p) => String(p.bank_ref || '').replace(/[NBP]$/, '')).filter(Boolean)));
+  const suffixedRefs = Array.from(new Set(clearRows.map((p) => p.bank_ref).filter(Boolean)));
+  const puIds = clearRows.map((p) => p.id);
+  const client = await db().connect();
+  try {
+    await client.query('BEGIN');
+    if (suffixedRefs.length) {
+      const del = await client.query(
+        `DELETE FROM consumed_transactions
+          WHERE bank_ref = ANY($1::text[]) OR bank_ref = ANY($2::text[])`,
+        [bareRefs, suffixedRefs],
+      );
+      out.consumed_rows_deleted = del.rowCount || 0;
+    }
+    if (puIds.length) {
+      await client.query(
+        `UPDATE payment_uploads
+            SET status = 'voided',
+                voided_at = now(),
+                failure_reason = COALESCE(failure_reason, '') || ' | retro-reconcile ' || now()::text
+          WHERE id = ANY($1::uuid[])`,
+        [puIds],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  out.ready_to_replay_refs = suffixedRefs;
 
   return out;
 }
