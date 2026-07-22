@@ -990,7 +990,9 @@ app.get('/arrears', async (req, res) => {
     let savcomRows = null;
     try {
       const { getSavcomOverdueRows } = await import('./savcom-arrears.js');
-      savcomRows = await getSavcomOverdueRows();
+      // asOf passed since 2026-07-22 (per-invoice rows): same due_date < asOf
+      // eligibility as APRUNA so ESTHER's numbers are like-for-like.
+      savcomRows = await getSavcomOverdueRows(asOf);
     } catch (err) {
       console.error(`[/arrears] SAVCOM Frappe fetch failed (skipping ESTHER SAVCOM): ${err.message}`);
     }
@@ -1155,7 +1157,8 @@ app.get('/arrears/customer', async (req, res) => {
     let savcomRows = null;
     try {
       const { getSavcomOverdueRows } = await import('./savcom-arrears.js');
-      savcomRows = await getSavcomOverdueRows();
+      // asOf passed since 2026-07-22 (per-invoice rows) — see main /arrears.
+      savcomRows = await getSavcomOverdueRows(asOf);
     } catch (err) {
       console.error(`[/arrears/customer] SAVCOM Frappe fetch failed: ${err.message}`);
     }

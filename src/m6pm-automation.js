@@ -2646,8 +2646,15 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/scraper-retry watcher]', err.message); }
       try { await savcomPostTickWatcher({ pool, brainSelfBase: brainBase }); }
       catch (err) { console.error('[savcom/post-tick watcher]', err.message); }
-      try { await savcomMorningAutoFireWatcher({ pool, brainSelfBase: brainBase }); }
-      catch (err) { console.error('[savcom/morning-autofire watcher]', err.message); }
+      // savcomMorningAutoFireWatcher RETIRED (Frank 2026-07-22): ESTHER
+      // SAVCOM is now fully inside the main QB-style pipeline — her per-
+      // invoice Frappe rows flow through /arrears into the morning debt
+      // report, comparison, sync-mobile AND the m6pm arrears SMS (she's in
+      // m6pm's officer whitelist). Running the separate ritual as well
+      // would DOUBLE-SMS her whole cohort every morning. The function and
+      // the /api/admin/savcom/morning-ritual endpoint remain for manual
+      // recovery only. NOTE: savcomPostTickWatcher above stays — that's
+      // PAYMENT ingestion (sav_nmb/sav_crdb → Frappe), not reporting.
     } finally {
       running = false;
     }
@@ -2656,5 +2663,5 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
   // raced with the interval's first tick, causing double-counts in the
   // POC-alert watcher. Single setInterval = one run per 60s, no race.
   setInterval(tick, 60_000);
-  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe + scraper-retry + savcom-post-tick + savcom-morning-autofire watchers armed (60s, no overlap)');
+  console.log('[m6pm/watchers] auto-fire + POC-alert + tick-notif + phone-hb + morning-probe + scraper-retry + savcom-post-tick watchers armed (60s, no overlap; savcom-morning-autofire retired 2026-07-22 — ESTHER in main pipeline)');
 }
