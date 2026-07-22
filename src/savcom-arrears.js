@@ -11,6 +11,8 @@
 // SAVCOM customers now surface in /arrears' last page.
 // ───────────────────────────────────────────────────────────────────────────
 
+import { lookupSavcomPhone } from './savcom-phones.js';
+
 const FETCH_TIMEOUT_MS = 60_000;
 const SAVCOM_OFFICER = 'ESTHER SAVCOM';
 const SAVCOM_BRANCH = 'KIJICHI BRANCH';
@@ -61,10 +63,25 @@ const PAGE = 500;
 async function fetchOverdueSavcomInvoices(asOf) {
   const roster = await fetchSavcomArrears();          // roster + display names
   const nameById = new Map();
+  const phoneById = new Map();
   for (const r of roster) {
-    if (r.customer) nameById.set(String(r.customer), String(r.display_name || r.customer));
+    if (!r.customer) continue;
+    nameById.set(String(r.customer), String(r.display_name || r.customer));
+    // Phone coverage (Frank 2026-07-22): SAVCOM customers' phones live in
+    // the SAVCOM roster sheet (plate / wakandi id / name keyed), NOT in the
+    // pikipiki sheet m6pm resolves from — a dry run showed ~180 of ~250
+    // would land in no_phone. Resolve here and ship the phone inside the
+    // arrears row so m6pm can fall back to it when pikipiki misses.
+    try {
+      const hit = await lookupSavcomPhone({
+        plate: r.plate,
+        wakandi_member_id: r.wakandi_member_id,
+        name: r.display_name || r.customer,
+      });
+      if (hit?.phone) phoneById.set(String(r.customer), String(hit.phone));
+    } catch (_) { /* phone lookup is best-effort — row still ships without */ }
   }
-  if (!nameById.size) return { invoices: [], nameById };
+  if (!nameById.size) return { invoices: [], nameById, phoneById };
   const filters = JSON.stringify([
     ['outstanding_amount', '>', 0],
     ['due_date', '<', asOf],
@@ -90,7 +107,7 @@ async function fetchOverdueSavcomInvoices(asOf) {
     if (page.length < PAGE) break;
     start += PAGE;
   }
-  return { invoices, nameById };
+  return { invoices, nameById, phoneById };
 }
 
 /**
@@ -107,7 +124,7 @@ export async function getSavcomOverdueRows(asOf) {
   const day = (asOf && /^\d{4}-\d{2}-\d{2}$/.test(String(asOf)))
     ? String(asOf)
     : new Date(Date.now() + 3 * 3600_000).toISOString().slice(0, 10);
-  const { invoices, nameById } = await fetchOverdueSavcomInvoices(day);
+  const { invoices, nameById, phoneById } = await fetchOverdueSavcomInvoices(day);
   return invoices.map((inv) => {
     const display = nameById.get(String(inv.customer)) || String(inv.customer || '');
     return {
@@ -124,6 +141,9 @@ export async function getSavcomOverdueRows(asOf) {
       balance: Number(inv.outstanding_amount || 0),
       amount: Number(inv.grand_total || 0),
       status: 'overdue',
+      // Optional phone from the SAVCOM roster — buildArrearsXls ships it in
+      // a trailing Phone column; m6pm uses it only when pikipiki misses.
+      phone: phoneById.get(String(inv.customer)) || '',
     };
   });
 }

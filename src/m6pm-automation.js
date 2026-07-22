@@ -119,9 +119,14 @@ function fmtDateQbStyle(iso) {
  * BIFF8 (.xls binary) because m6pm uses xlrd engine which only reads .xls.
  */
 function buildArrearsXls(arrears, asOf) {
+  // Trailing Phone column (2026-07-22): carries the SAVCOM-roster phone for
+  // Frappe-cohort rows whose customers aren't in m6pm's pikipiki sheet.
+  // APPENDED LAST on purpose — m6pm's parse_quickbooks picks Date/No. by
+  // POSITION (cols 0 and 2) and Customer/Balance by NAME, so a trailing
+  // column changes nothing for any existing consumer. QB rows ship ''.
   const aoa = [
     [`Type: Invoices Status: Overdue Date: All${asOf ? '   As of ' + asOf : ''}`],
-    ['Date', 'Type', 'No.', 'Customer', 'Memo', 'Balance', 'Amount', 'Status'],
+    ['Date', 'Type', 'No.', 'Customer', 'Memo', 'Balance', 'Amount', 'Status', 'Phone'],
   ];
   for (const inv of arrears) {
     aoa.push([
@@ -133,6 +138,7 @@ function buildArrearsXls(arrears, asOf) {
       Number(inv.balance) || 0,
       Number(inv.amount) || 0,
       inv.status || 'overdue',
+      inv.phone || '',
     ]);
   }
   const ws = XLSX.utils.aoa_to_sheet(aoa);
