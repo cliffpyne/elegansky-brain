@@ -200,11 +200,19 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
   // (QB-path sheets do have a header at row 1; that's why the QB code skips i=0.)
   //
   // Find the highest row index whose endTickCol carries an "end of <tick>"
-  // marker. Same boundary semantics as the QB path, just one column over.
-  // `forceSkipMaxKRow` disables this gate — used by the savcom-recall
-  // re-fire path when a rogue post-recall end-tick marker blocks the
-  // catchup windows. Per-row J/K marker checks still apply, so only
-  // rows we explicitly cleared become eligible.
+  // marker. Kept ONLY for diagnostic reporting (max_k_row) — no longer
+  // used as a "everything below this is done" gate.
+  //
+  // BUG FIX 2026-07-22: the old row-number gate assumed row-number order
+  // equals temporal order. That breaks whenever a retro row is appended
+  // to the sheet bottom with an older timestamp, then a later end-tick
+  // marker lands on that retro row. All rows above it (with fresher
+  // timestamps that never got pushed) got treated as "already done" and
+  // silently orphaned. Confirmed skipping 2,900 SAV_NMB + 105 SAV_CRDB
+  // rows across [2026-06-01 → 2026-07-22]. Per-row J/K marker check
+  // below is authoritative — it looks at each row's own "Fetched at" /
+  // "Frappe pending" markers, so removing the row-number shortcut
+  // doesn't cost correctness, only a couple ms per fire.
   let maxKRow = 0;
   if (!forceSkipMaxKRow) {
     for (let i = 0; i < sheet.length; i++) {
@@ -217,7 +225,6 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
   let skippedNoDate = 0, skippedOutOfWindow = 0, skippedAlreadyPushed = 0;
   let skippedBadFormat = 0;
   for (let i = 0; i < sheet.length; i++) {
-    if (maxKRow > 0 && i + 1 <= maxKRow) { skippedAlreadyPushed++; continue; }
     // "Fetched at" / "Frappe pushed" markers live in shifted columns
     // (J/K instead of I/J) so the wakandi_member_id in col I doesn't trip
     // the "already pushed" check. We ALSO require the marker text to
