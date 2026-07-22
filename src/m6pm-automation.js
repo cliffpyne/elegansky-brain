@@ -1163,6 +1163,13 @@ const REPORT_MODES = {
     // Frank calls lengai1230 the "noon fire" (12:30 EAT). Internally was
     // "afternoon" up through 2026-06-27, renamed to match his vocabulary.
     triggerTicks: ['lengai1230'],
+    forceAtHourEat: 14,   // Frank 2026-07-22: no grace timer — the report
+                          // waits for every channel's completion signal.
+                          // 14:00 EAT is the absolute deadline: a channel
+                          // with zero rows in lengai's window leaves no
+                          // batch (indistinguishable from a dead fire), so
+                          // without a deadline the noon report would never
+                          // go out on a quiet-channel day.
   },
 };
 
@@ -1293,6 +1300,65 @@ async function sendNextSms(phone, text) {
  * Idempotency: per-day-per-tick gate in app_settings prevents duplicate
  * fires even if multiple BRAIN processes are running.
  */
+/**
+ * SAV completion signal for the report watchers (Frank 2026-07-22).
+ *
+ * The SAVCOM channels (sav_nmb/sav_crdb → Frappe) auto-fire at T+8min
+ * after every QB tick via savcomPostTickWatcher, so when the QB channels
+ * finalize the SAV fires may not even have STARTED yet. Reports must wait
+ * for them. Two signals, both in Postgres:
+ *
+ *   1. auto_upload_locks rows for sav_nmb/sav_crdb (fresh within 90s —
+ *      same heartbeat/stale-reclaim semantics as the QB channels). Covers
+ *      manual fires too.
+ *   2. app_settings savcom_post_tick:<ymd>:<tick> per-tick gates: absent
+ *      = not started, 'firing' = in flight, JSON summary = done. Checked
+ *      for every tick that has passed within the last 4h — from T+0, NOT
+ *      from T+SAVCOM_POST_TICK_GRACE_MIN, because in the T+0..T+8min gap
+ *      the gate is legitimately absent yet the sav fire is imminent. The
+ *      4h upper bound mirrors savcomPostTickWatcher's own firing window,
+ *      so a gate stuck 'firing' by a crashed BRAIN stops blocking once
+ *      its tick ages out. Skipped when savcom_auto_disabled='1'.
+ *
+ * Returns an array of human-readable pending markers (empty = SAV done).
+ */
+async function savUploadsPending(pool) {
+  const pending = [];
+  const savLocks = await pool.query(
+    `SELECT channel FROM auto_upload_locks
+      WHERE channel = ANY($1::text[])
+        AND locked_at > now() - interval '90 seconds'`,
+    [['sav_nmb', 'sav_crdb']],
+  );
+  for (const r of savLocks.rows) pending.push(`${r.channel}:locked`);
+
+  const autoDisabled = await pool.query(
+    `SELECT value FROM app_settings WHERE key='savcom_auto_disabled'`);
+  if (autoDisabled.rows[0]?.value === '1') return pending;
+
+  const today = todayYmdEat();
+  const eatNow = new Date(Date.now() + 3 * 3600_000);
+  const eatTotalMin = eatNow.getUTCHours() * 60 + eatNow.getUTCMinutes();
+  const dueTicks = TICK_SCHEDULE_EAT.filter(({ hour, min }) => {
+    const sinceMin = eatTotalMin - (hour * 60 + min);
+    return sinceMin >= 0 && sinceMin <= 4 * 60;
+  });
+  if (!dueTicks.length) return pending;
+
+  const keys = dueTicks.map(({ tick }) => `savcom_post_tick:${today}:${tick}`);
+  const gates = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key = ANY($1::text[])`,
+    [keys],
+  );
+  const byKey = new Map(gates.rows.map((r) => [r.key, r.value]));
+  for (const { tick } of dueTicks) {
+    const v = byKey.get(`savcom_post_tick:${today}:${tick}`);
+    if (v === undefined) pending.push(`sav:${tick}:not_started`);
+    else if (v === 'firing') pending.push(`sav:${tick}:firing`);
+  }
+  return pending;
+}
+
 async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
   if (process.env.M6PM_AUTO_FIRE !== 'true') return;
   const today = todayYmdEat();
@@ -1314,12 +1380,15 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     //
     // Frank 2026-07-21: also require ALL expected channels (nmbnew, bank) to
     // have a finalized batch before firing — otherwise the report was going
-    // out with just NMB data whenever bank preflight aborted. Wait up to
-    // allChannelsGraceMin past the first channel finalize; after that, fire
-    // anyway with a "PARTIAL — missing X" annotation so ops sees the gap.
+    // out with just NMB data whenever bank preflight aborted.
+    // Frank 2026-07-22: NO grace timer. The report waits for every
+    // channel's actual completion signal (finalized batch + lock clear +
+    // SAV post-tick gates done). The only override is forceAtHourEat — an
+    // absolute deadline for the day, needed because a zero-row window
+    // leaves no batch at all (indistinguishable from a dead fire), so a
+    // quiet channel would otherwise block the report forever.
     const tickPatterns = cfg.triggerTicks.map((t) => `auto-upload:${t}%`);
     const expectedChannels = cfg.expectedChannels || ['nmbnew', 'bank'];
-    const graceMin = cfg.allChannelsGraceMin ?? 20;
     const chanQ = await pool.query(
       `SELECT channel, MIN(finalized_at) AS first_at, MAX(created_by) AS created_by
          FROM payment_batches
@@ -1334,38 +1403,49 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     );
     const seenChans = new Set(chanQ.rows.map((r) => r.channel));
     const missingChans = expectedChannels.filter((c) => !seenChans.has(c));
-    const firstFinalizedAt = chanQ.rows.length
-      ? new Date(Math.min(...chanQ.rows.map((r) => new Date(r.first_at).getTime())))
-      : null;
-    const graceElapsedMs = firstFinalizedAt ? (Date.now() - firstFinalizedAt.getTime()) : 0;
 
     // Frank 2026-07-21: also require the auto_upload_locks to be CLEAR on
     // every expected channel. First-batch-finalized is not enough — a
     // start-channel walk can have multiple retro windows and still be
     // firing later batches while its first is done. Lock stays held until
     // the walker exits, so lock-clear === channel session complete.
+    // Only FRESH locks count (heartbeat refreshes every 30s, stale reclaim
+    // is 90s) — a lock row abandoned by a crashed job must not block the
+    // report until the next fire happens to reclaim it.
     const lockedChanQ = await pool.query(
-      `SELECT channel FROM auto_upload_locks WHERE channel = ANY($1::text[])`,
+      `SELECT channel FROM auto_upload_locks
+        WHERE channel = ANY($1::text[])
+          AND locked_at > now() - interval '90 seconds'`,
       [expectedChannels],
     );
     const lockedChans = new Set(lockedChanQ.rows.map((r) => r.channel));
     const chansStillFiring = expectedChannels.filter((c) => lockedChans.has(c));
 
-    const chansReady =
-      (missingChans.length === 0 && chansStillFiring.length === 0)
-      || graceElapsedMs >= graceMin * 60 * 1000;
+    // Frank 2026-07-22: SAV uploads (sav_nmb/sav_crdb → Frappe) fire at
+    // T+8min after every QB tick — the report must wait for them too.
+    const savPending = await savUploadsPending(pool);
 
-    // Frank 2026-06-28: forceAtHourEat fallback. If NO trigger tick has
-    // finalized today AND the clock has passed the force hour, fire the
-    // ritual anyway with whatever current arrears we can pull. The arrears
-    // endpoint reads QB live, so a meaningful morning report is still
-    // produceable even when all overnight upload ticks failed.
-    const forced = !chanQ.rows.length
+    const chansReady =
+      missingChans.length === 0
+      && chansStillFiring.length === 0
+      && savPending.length === 0;
+
+    // Frank 2026-06-28 / 2026-07-22: forceAtHourEat is the absolute
+    // deadline for the day — but it NEVER cuts off actively running work
+    // (fresh lock / sav gate mid-fire; those states self-clear). It only
+    // overrides the one state waiting cannot resolve: a channel with no
+    // finalized batch and nothing running (zero-row window or dead fire —
+    // indistinguishable in the DB). Also covers "no tick finalized at
+    // all": the arrears endpoint reads QB live, so a meaningful report is
+    // still produceable.
+    const forced = !chansReady
       && cfg.forceAtHourEat != null
-      && eatHour >= cfg.forceAtHourEat;
+      && eatHour >= cfg.forceAtHourEat
+      && chansStillFiring.length === 0
+      && savPending.length === 0;
     if (!chanQ.rows.length && !forced) continue;
-    if (chanQ.rows.length && !chansReady) {
-      console.log(`[m6pm/autofire] mode=${mode} waiting for channels: missing=[${missingChans.join(',')}] elapsed=${Math.round(graceElapsedMs/60000)}min < grace=${graceMin}min`);
+    if (!chansReady && !forced) {
+      console.log(`[m6pm/autofire] mode=${mode} waiting for uploads to finish: missing=[${missingChans.join(',')}] stillFiring=[${chansStillFiring.join(',')}] sav=[${savPending.join(',')}]`);
       continue;
     }
 
@@ -1379,8 +1459,8 @@ async function autoFireReportsWatcher({ pool, sharedSecret, brainSelfBase }) {
     if (!acquired.rows.length) continue;
 
     const armingTick = (chanQ.rows[0]?.created_by || '').match(/auto-upload:([^:]+)/)?.[1] || '?';
-    const chanNote = missingChans.length
-      ? ` PARTIAL — missing [${missingChans.join(',')}] after ${Math.round(graceElapsedMs/60000)}min grace`
+    const chanNote = forced
+      ? ` FORCED at deadline ${cfg.forceAtHourEat}:00 EAT — no batch from: [${missingChans.join(',')}] (zero-row window or dead fire)`
       : '';
     console.log(`[m6pm/autofire] mode=${mode} armed by ${armingTick} seen=[${[...seenChans].join(',')}] — starting report fire (eatHour=${eatHour})${chanNote}`);
     try {
@@ -1553,11 +1633,16 @@ async function maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, t
   // Frank 2026-07-21: comparison used to fire on the FIRST kili1615 batch
   // that finalized (LIMIT 1) — meaning NMB-only data reached the report
   // while bank's per-window walk was still processing later retro windows.
-  // Now require BOTH: each expected channel has ≥1 finalized batch AND
-  // its auto_upload_locks row is clear (walker done). Grace timeout still
-  // fires partial after N minutes so a truly dead channel doesn't block.
+  // Frank 2026-07-22: NO grace timer. Wait for the real completion
+  // signals: each expected channel has ≥1 finalized batch, its
+  // auto_upload_locks row is clear (fresh-lock check — walker done), and
+  // the SAV post-tick fires are done. The only override is the absolute
+  // 19:00 EAT deadline, needed because a zero-row kili window leaves no
+  // batch (indistinguishable from a dead fire) and would otherwise block
+  // the comparison forever. The deadline never cuts off actively running
+  // work — it only fires when the sole blocker is a missing batch.
   const expectedChannels = ['nmbnew', 'bank'];
-  const graceMin = 20;
+  const FORCE_HOUR_EAT = 19;
   const chanQ = await pool.query(
     `SELECT channel, MIN(finalized_at) AS first_at
        FROM payment_batches
@@ -1572,23 +1657,35 @@ async function maybeFireEveningComparison({ pool, sharedSecret, brainSelfBase, t
   if (!chanQ.rows.length) return;
   const seenChans = new Set(chanQ.rows.map((r) => r.channel));
   const missingChans = expectedChannels.filter((c) => !seenChans.has(c));
-  const firstFinalizedAt = new Date(Math.min(...chanQ.rows.map((r) => new Date(r.first_at).getTime())));
-  const graceElapsedMs = Date.now() - firstFinalizedAt.getTime();
 
   const lockedChanQ = await pool.query(
-    `SELECT channel FROM auto_upload_locks WHERE channel = ANY($1::text[])`,
+    `SELECT channel FROM auto_upload_locks
+      WHERE channel = ANY($1::text[])
+        AND locked_at > now() - interval '90 seconds'`,
     [expectedChannels],
   );
   const lockedChans = new Set(lockedChanQ.rows.map((r) => r.channel));
   const chansStillFiring = expectedChannels.filter((c) => lockedChans.has(c));
 
-  const chansReady =
-    (missingChans.length === 0 && chansStillFiring.length === 0)
-    || graceElapsedMs >= graceMin * 60 * 1000;
+  const savPending = await savUploadsPending(pool);
 
-  if (!chansReady) {
-    console.log(`[m6pm/autofire/evening] waiting: missing=[${missingChans.join(',')}] stillFiring=[${chansStillFiring.join(',')}] elapsed=${Math.round(graceElapsedMs/60000)}min < grace=${graceMin}min`);
+  const chansReady =
+    missingChans.length === 0
+    && chansStillFiring.length === 0
+    && savPending.length === 0;
+
+  const eatHour = new Date(Date.now() + 3 * 3600_000).getUTCHours();
+  const forced = !chansReady
+    && eatHour >= FORCE_HOUR_EAT
+    && chansStillFiring.length === 0
+    && savPending.length === 0;
+
+  if (!chansReady && !forced) {
+    console.log(`[m6pm/autofire/evening] waiting for uploads to finish: missing=[${missingChans.join(',')}] stillFiring=[${chansStillFiring.join(',')}] sav=[${savPending.join(',')}]`);
     return;
+  }
+  if (forced) {
+    console.warn(`[m6pm/autofire/evening] FORCED at deadline ${FORCE_HOUR_EAT}:00 EAT — no kili1615 batch from: [${missingChans.join(',')}] (zero-row window or dead fire)`);
   }
 
   // Atomic claim
