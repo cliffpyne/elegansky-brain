@@ -784,8 +784,8 @@ export async function runSavFrappeUpload({
     if (t.sheet_row_number) fetchRows.add(t.sheet_row_number);
   }
   if (dryRun && fetchRows.size > 0 && cfg.sheetId && cfg.tab) {
-    // DRY_RUN only: pre-write markers so the operator can inspect the
-    // plan on the sheet. Real fires paint post-success (below).
+    // DRY_RUN only: pre-write J+K markers so the operator can inspect the
+    // plan on the sheet. Real fires paint post-success (in section 12b).
     const updates = [];
     const fetchedAt = new Date().toISOString();
     for (const row of fetchRows) {
@@ -798,19 +798,23 @@ export async function runSavFrappeUpload({
     } catch (e) {
       console.error('[sav-frappe] DRY_RUN sheet marker write failed (non-fatal):', e.message);
     }
-    // End-of-tick marker on the last sheet row processed. paintRowEndMarker
-    // now accepts paintEndColumnIndex + textColumnIndex overrides so SAV can
-    // paint A..L purple + write "end of <tick>" to col L (index 11) — matching
-    // the visible marker line QB path produces on col K.
+  }
+
+  // End-of-tick L marker on the last sheet row processed. Fires for BOTH
+  // dry_run and real fires (Frank 2026-07-23: the `19685c7` refactor
+  // accidentally nested this INSIDE the dry_run block, silently killing
+  // the L marker on every real fire since deploy). Uses fetchRows from
+  // txnsClean (all considered rows in window, including any that will
+  // later fail Frappe POST) — the L is a "tick boundary" marker, not a
+  // "success" marker, so it goes at max(considered) not max(pushed).
+  if (fetchRows.size > 0 && cfg.sheetId && cfg.tab) {
     try {
-      if (fetchRows.size > 0) {
-        const lastRow = Math.max(...fetchRows);
-        await paintRowEndMarker(cfg.sheetId, cfg.tab, lastRow, tickName || 'heisenberg', {
-          dryRun,
-          paintEndColumnIndex: 12,   // paint A..L (0..11 inclusive)
-          textColumnIndex: 11,       // write "end of <tick>" to L
-        });
-      }
+      const lastRow = Math.max(...fetchRows);
+      await paintRowEndMarker(cfg.sheetId, cfg.tab, lastRow, tickName || 'heisenberg', {
+        dryRun,
+        paintEndColumnIndex: 12,   // paint A..L (0..11 inclusive)
+        textColumnIndex: 11,       // write "end of <tick>" to L
+      });
     } catch (e) {
       console.error('[sav-frappe] end-of-tick marker paint failed (non-fatal):', e.message);
     }
