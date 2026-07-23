@@ -286,6 +286,7 @@ export function mountPaymentBatchesApi(app, deps) {
         txnDate: txnDateOverride,
         qbPreflightDedup: dryRun ? null : qbPreflightDedup,
         forceSkipMaxKRow: req.body?.force_skip_max_k_row === true,
+        dryRun,
       });
       if (result.skipped) {
         await releaseLock();
@@ -617,6 +618,7 @@ export function mountPaymentBatchesApi(app, deps) {
               tickName: entryTickName,
               txnDate: entry.txn_date,
               qbPreflightDedup: dryRun ? null : qbPreflightDedup,
+              dryRun,
             });
             if (result.skipped) {
               console.log(`[start-channel ${channel}] ${entry.tick_label} skipped: ${result.reason}`);
@@ -6055,7 +6057,7 @@ async function captureInvoiceSnapshot(asOf, arrears) {
   return ins.rows[0].id;
 }
 
-async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate, forceSkipMaxKRow }) {
+async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPreflightDedup, tickName, txnDate, forceSkipMaxKRow, dryRun = false }) {
   // SAV channels (bank_sav, nmbnew_sav) route to SAVCOM/Frappe — payments
   // NEVER hit QB. Skip QB preflight dedup entirely: it would query QB with
   // SAV customer IDs and (a) waste time (b) fail if any ID isn't a QB
@@ -6360,16 +6362,50 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
       toReconcile = names.filter((n) => (maxDayBy.get(n) || '') > lateByCustomer.get(n));
     }
     if (toReconcile.length > 0) {
-      console.log(`[retro-reconcile] ${toReconcile.length}/${lateByCustomer.size} late-txn customer(s) have downstream payments to void (fireDay=${fireDay})`);
+      console.log(`[retro-reconcile] ${toReconcile.length}/${lateByCustomer.size} late-txn customer(s) have downstream payments to void (fireDay=${fireDay}${dryRun ? ', DRY RUN — no voids' : ''})`);
+      const replayRefs = new Set();
       for (const customer of toReconcile) {
         const oldestDay = lateByCustomer.get(customer);
         try {
-          const r = await reconcileCustomer({ customerName: customer, sinceDay: oldestDay, dryRun: false });
+          // dryRun MUST flow through: a dry-run fire that voids real QB
+          // payments (but never replays them) would strand the customer's
+          // ledger — that was a live landmine until 2026-07-23.
+          const r = await reconcileCustomer({ customerName: customer, sinceDay: oldestDay, dryRun });
+          if (dryRun) {
+            console.log(`[retro-reconcile] DRY RUN ${customer} since ${oldestDay}: would void ${r.affected_count} payment row(s)`);
+            continue;
+          }
           const okVoids = (r.void_results || []).filter((v) => v.ok).length;
           const failed = r.void_failures?.length || 0;
+          for (const ref of r.ready_to_replay_refs || []) replayRefs.add(ref);
           console.log(`[retro-reconcile] ${customer} since ${oldestDay}: voided=${okVoids} failed=${failed} consumed_cleared=${r.consumed_rows_deleted} replay_refs=${(r.ready_to_replay_refs || []).length}`);
         } catch (err) {
           console.error(`[retro-reconcile] failed for ${customer}: ${err.message}`);
+        }
+      }
+      // Same-fire replay (2026-07-23): the refs we just released were
+      // filtered out of txnsClean by the consumed check at selection time.
+      // Re-add their rows NOW so this very fire replays them in sheet
+      // order — "next fire will pick them up" is a lie for old rows, whose
+      // sheet timestamps fall outside every scheduled tick's window (the
+      // noon 07-23 reconciles voided 244k TZS that nothing ever replayed).
+      if (replayRefs.size > 0) {
+        const cleanKeys = new Set(txnsClean.map((t) => appendSuf(t.transactionId, channel)));
+        const readd = txns.filter((t) => {
+          const suf = appendSuf(t.transactionId, channel);
+          return replayRefs.has(suf) && !cleanKeys.has(suf);
+        });
+        if (readd.length) {
+          txnsClean = txns.filter((t) => {
+            const suf = appendSuf(t.transactionId, channel);
+            return cleanKeys.has(suf) || replayRefs.has(suf);
+          });
+          console.log(`[retro-reconcile] re-added ${readd.length} released row(s) to this fire for same-fire replay`);
+        }
+        const inWindow = new Set(txns.map((t) => appendSuf(t.transactionId, channel)));
+        const orphans = [...replayRefs].filter((r) => !inWindow.has(r));
+        if (orphans.length) {
+          console.error(`[retro-reconcile] REPLAY ORPHANS: ${orphans.length} released ref(s) OUTSIDE this window — fire a manual window covering them or they stay unpaid: ${orphans.join(',')}`);
         }
       }
     } else if (lateByCustomer.size > 0) {
