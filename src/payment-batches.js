@@ -6618,6 +6618,33 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     }
   }
 
+  // Frank 2026-07-23 BAND LAW (supersedes e151d0b for prior-band rows):
+  // every row is dated by ITS OWN kili band day, derived from its bank
+  // timestamp — never the firing day. Firing-day dating dumped 1,850,500
+  // TZS of prior-band money into 07-23's ledger slice and broke Frank's
+  // drag-drop (marker-to-marker) vs books reconciliation. Rows whose kili
+  // day equals the firing day are unaffected (same value). Voided-replay
+  // refs keep their original payment day (3d2bf7a rule, set above, wins).
+  try {
+    for (const t of txnsClean) {
+      if (!t.receivedTimestamp) continue;
+      const suf = appendSuf(t.transactionId, channel);
+      if (!suf) continue;
+      if (replayTxnDateByRef && replayTxnDateByRef[suf]) continue; // replay original date wins
+      const ownKiliDay = kiliBusinessDayFromUtcMs(new Date(t.receivedTimestamp).getTime());
+      if (ownKiliDay && txnDate && ownKiliDay < txnDate) {
+        if (!replayTxnDateByRef) replayTxnDateByRef = {};
+        replayTxnDateByRef[suf] = ownKiliDay;
+      }
+    }
+    const mapped = Object.keys(replayTxnDateByRef || {}).length;
+    if (mapped > 0) {
+      console.log(`[band-law] ${mapped} ref(s) carry non-firing TxnDates (prior-band rows → own kili day, replays → original day)`);
+    }
+  } catch (err) {
+    console.error(`[band-law] own-kili-day mapping failed (rows fall back to fire txnDate): ${err.message}`);
+  }
+
   const sumPaid = paid.reduce((s, p) => s + p.amount, 0);
   const sumUnused = unused.reduce((s, p) => s + (p.transactionAmount || 0), 0);
   const sheetSum = txnsClean.reduce((s, t) => s + (t.amount || 0), 0);
