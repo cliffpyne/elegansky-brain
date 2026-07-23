@@ -28,6 +28,7 @@ import { db } from './db/pool.js';
 import { readSheet, writeSheetCells, paintRowEndMarker } from './sheets.js';
 import { getOpenInvoices, ingestPayment, reversePayment, getPaymentEntry, getSalesInvoice, getLoanSummary } from './frappe-client.js';
 import { resolveSavcom } from './savcom-resolver.js';
+import { daysFromTs } from './apruna-divert.js';
 import { processInvoicePaymentsFrappe } from './payment-algorithm-v2.js';
 
 const MODE_OF_PAYMENT = 'SAVCOM';
@@ -880,13 +881,30 @@ export async function runSavFrappeUpload({
     }
   }
 
+  // BAND LAW (Frank 2026-07-23, commit d2c02bd): each ref posts on its OWN
+  // kili band day, derived from its bank timestamp — never the firing day.
+  // Prior-band rescues complete their own band's ledger; same-band refs
+  // are unaffected (own band === txnDate).
+  const bandByRef = new Map();
+  for (const t of txnsClean) {
+    if (!t.receivedTimestamp) continue;
+    const suf = appendSavSuffix(t.transactionId, channel);
+    if (!suf) continue;
+    const { txnDate: ownBand } = daysFromTs(t.receivedTimestamp);
+    if (ownBand && txnDate && ownBand < txnDate) bandByRef.set(suf, ownBand);
+  }
+  if (bandByRef.size > 0) {
+    console.log(`[sav-frappe band-law] ${bandByRef.size} prior-band ref(s) post on their own kili day`);
+  }
+  const bandDateFor = (ref) => bandByRef.get(ref) || txnDate;
+
   const frappeResults = [];
   for (const [ref, g] of groupsByRef.entries()) {
     try {
       const r = await ingestPayment({
         customer: g.customer,
         amount: g.amount,
-        date: txnDate,
+        date: bandDateFor(ref),
         txn_id: g.txn_id + FRAPPE_TXN_MARKER,
         mode_of_payment: MODE_OF_PAYMENT,
         allocations: g.allocations,
@@ -929,7 +947,7 @@ export async function runSavFrappeUpload({
       const r = await ingestPayment({
         customer: u.customerName,
         amount: Number(u.transactionAmount || u.amount),
-        date: txnDate,
+        date: bandDateFor(u.memoWithSuffix),
         txn_id: u.memoWithSuffix + FRAPPE_TXN_MARKER,
         mode_of_payment: MODE_OF_PAYMENT,
         allocations: [],

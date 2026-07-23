@@ -42,7 +42,7 @@ function modeForChannel(channel) {
 
 // EAT physical day + kili-adjusted TxnDate from a receivedTimestamp (ms).
 // If ts is null (bad-format date row), fall back to today's UTC date.
-function daysFromTs(ts) {
+export function daysFromTs(ts) {
   const base = ts ? new Date(ts) : new Date();
   const eatMs = base.getTime() + 3 * 3600 * 1000;
   const eat = new Date(eatMs);
@@ -210,10 +210,14 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
     try {
       const inv = await getOpenInvoices(customer);
       const { plan, remain } = foldAllocations(inv?.invoices || [], amount, physical);
-      // Posting date = plan-window txn_date (kili business day of the WINDOW,
-      // which for well-formed rows equals rowTxnDate). Fall back to
-      // rowTxnDate if caller didn't pass a plan txnDate.
-      const postDate = fireTxnDate || rowTxnDate;
+      // BAND LAW (Frank 2026-07-23, commit d2c02bd): posting date = the
+      // row's OWN kili band day. A prior-band row rescued by a later fire
+      // must complete its own band's ledger — the old fireTxnDate
+      // precedence dumped prior-band APRUNA money into the rescue day.
+      // Same-band rows are unaffected (rowTxnDate === fireTxnDate).
+      const postDate = (rowTxnDate && fireTxnDate && rowTxnDate < fireTxnDate)
+        ? rowTxnDate
+        : (fireTxnDate || rowTxnDate);
       const body = {
         customer, amount, date: postDate, txn_id: String(bankRef), mode_of_payment: mode,
         allocations: plan.map((a) => ({ reference_doctype: 'Sales Invoice', reference_name: a.reference_name, allocated_amount: a.allocated_amount })),
