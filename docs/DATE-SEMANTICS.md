@@ -24,8 +24,13 @@ This is intentional. It is NOT a bug, NOT a timezone error, NOT drift.
 |---|---|
 | Fresh row, before 16:15 on day D | D |
 | Fresh row, after 16:15 on day D (evening tail) | **D+1** (kili roll) |
-| Late/retro row (arrived days late), first-ever push | **the firing day** (rule `e151d0b`) |
+| Any row processed after its own kili band ended (rescues, catch-ups, append-lag stragglers) | **its OWN kili band day**, derived from its bank timestamp (BAND LAW, 2026-07-23 evening, commit `d2c02bd` — supersedes `e151d0b`'s firing-day rule) |
 | Voided-and-replayed payment (existed before, re-pushed) | **its ORIGINAL payment day** (rule of 2026-07-23, commit `3d2bf7a`) |
+
+The band law exists because firing-day dating dumped 1,850,500 TZS of
+prior-band money into 2026-07-23's ledger slice and broke Frank's
+marker-to-marker (16:15→16:15 drag-drop) reconciliation. Every payment now
+lands in the ledger day its bank timestamp belongs to.
 
 The last rule exists because reposting old money on today's date inflates
 today's collections and drains the original day's ledger. BRAIN enforces it
