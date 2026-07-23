@@ -436,6 +436,7 @@ export function mountPaymentBatchesApi(app, deps) {
           paid: result.paid,
           unused: result.unused,
           txnDate: txnDateOverride,
+          txnDateByRef: result.replayTxnDateByRef,
           qbCreatePayment,
           qbBatchCreatePayments,
           qbCreateUnappliedPayment,
@@ -687,6 +688,7 @@ export function mountPaymentBatchesApi(app, deps) {
               paid: result.paid,
               unused: result.unused,
               txnDate: entry.txn_date,
+              txnDateByRef: result.replayTxnDateByRef,
               qbCreatePayment,
               qbBatchCreatePayments,
               qbCreateUnappliedPayment,
@@ -6325,6 +6327,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   //
   // Fires for BOTH tick auto-uploads AND heisenberg fires — the trigger
   // is DATA-driven (physical day < as_of), not fire-type driven.
+  let replayTxnDateByRef = null;
   try {
     const { reconcileCustomer, eatDayOf } = await import('./late-txn-reconciler.js');
     // 2026-07-22 fix: compare against the day the fire is RUNNING, not asOf.
@@ -6406,6 +6409,26 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
         const orphans = [...replayRefs].filter((r) => !inWindow.has(r));
         if (orphans.length) {
           console.error(`[retro-reconcile] REPLAY ORPHANS: ${orphans.length} released ref(s) OUTSIDE this window — fire a manual window covering them or they stay unpaid: ${orphans.join(',')}`);
+        }
+        // Frank 2026-07-23: replayed payments must keep their ORIGINAL
+        // TxnDate — reposting a voided 07-22 payment dated today inflates
+        // today's collections and drains the original day's ledger. Only
+        // the late row itself gets the firing day (e151d0b rule). Map each
+        // released ref to its earliest voided generation's batch txn_date;
+        // the pusher stamps per-ref dates from this map.
+        try {
+          const dq = await db().query(
+            `SELECT v.bank_ref, min(b.txn_date::date)::text AS orig
+               FROM payment_uploads v JOIN payment_batches b ON b.id = v.batch_id
+              WHERE v.bank_ref = ANY($1::text[]) AND v.status = 'voided'
+              GROUP BY v.bank_ref`,
+            [[...replayRefs]],
+          );
+          replayTxnDateByRef = {};
+          for (const row of dq.rows) replayTxnDateByRef[row.bank_ref] = row.orig;
+          console.log(`[retro-reconcile] replay TxnDate map: ${dq.rows.map((r) => `${r.bank_ref}→${r.orig}`).join(', ')}`);
+        } catch (err) {
+          console.error(`[retro-reconcile] replay TxnDate map failed (replays will use fire txnDate — patch after via /api/admin/patch-batch-txndate): ${err.message}`);
         }
       }
     } else if (lateByCustomer.size > 0) {
@@ -6637,10 +6660,11 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   }
   client.release();
 
-  return { skipped: false, batchId, paid, unused, sheetSum, cfg };
+  return { skipped: false, batchId, paid, unused, sheetSum, cfg, replayTxnDateByRef };
 }
 
 async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
+  txnDateByRef, // ref → original TxnDate for retro-replayed refs (Frank 2026-07-23)
   qbCreatePayment, qbBatchCreatePayments,
   qbCreateUnappliedPayment, qbBatchCreateUnappliedPayments,
   qbBatchLookupCustomers,
@@ -6651,7 +6675,10 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
                        // end of full session (max row across all windows) to
                        // avoid retro-window K markers orphaning fresh rows.
 }) {
-  await logBatch(batchId, 'info', `runAutoUploadBackground start: paid=${paid.length} unused=${unused.length} txnDate=${txnDate} tick=${tickName || 'unknown'}`, 'qb-push');
+  await logBatch(batchId, 'info', `runAutoUploadBackground start: paid=${paid.length} unused=${unused.length} txnDate=${txnDate} tick=${tickName || 'unknown'}${txnDateByRef && Object.keys(txnDateByRef).length ? ` replayDates=${Object.keys(txnDateByRef).length}` : ''}`, 'qb-push');
+  // Replayed refs keep their original TxnDate; everything else uses the
+  // fire's txnDate.
+  const dateFor = (ref) => (txnDateByRef && ref && txnDateByRef[ref]) || txnDate;
 
   // ─── Per-payment J-marker state (cumulative across chunks) ────────────
   // rowToQbIds maps sheet_row_number -> [qb_id, qb_id, ...] for that row.
@@ -6741,7 +6768,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
         const items = chunk.map((p) => ({
           customerId: p.customerId, invoiceQbId: p.qbId,
           amount: Number(p.amount), memo: p.memoWithSuffix || '',
-          txnDate,
+          txnDate: dateFor(p.memoWithSuffix),
         }));
         let results;
         let chunkError = null;
@@ -6807,7 +6834,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
           const qb = await qbCreatePayment({
             customerId: p.customerId, invoiceQbId: p.qbId,
             amount: Number(p.amount), memo: p.memoWithSuffix || '',
-            txnDate,
+            txnDate: dateFor(p.memoWithSuffix),
           });
           await db().query(
             `INSERT INTO payment_uploads (
@@ -6876,7 +6903,7 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
             customerId: u.customerId,
             amount: Number(u.transactionAmount),
             memo: u.memoWithSuffix || '',
-            txnDate,
+            txnDate: dateFor(u.memoWithSuffix),
           }));
           let results;
           try { results = await qbBatchCreateUnappliedPayments(items); }
