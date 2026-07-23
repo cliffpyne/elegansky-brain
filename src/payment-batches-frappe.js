@@ -886,7 +886,10 @@ export async function runSavFrappeUpload({
   // Prior-band rescues complete their own band's ledger; same-band refs
   // are unaffected (own band === txnDate).
   const bandByRef = new Map();
-  for (const t of txnsClean) {
+  // EXCEPTION (Frank 2026-07-23 night): operator MANUAL_RECON fires are
+  // deliberate backfills — they keep the operator-given txn_date verbatim.
+  const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ""));
+  for (const t of (bandLawApplies ? txnsClean : [])) {
     if (!t.receivedTimestamp) continue;
     const suf = appendSavSuffix(t.transactionId, channel);
     if (!suf) continue;

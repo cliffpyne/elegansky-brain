@@ -6626,7 +6626,9 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // day equals the firing day are unaffected (same value). Voided-replay
   // refs keep their original payment day (3d2bf7a rule, set above, wins).
   try {
-    for (const t of txnsClean) {
+    // EXCEPTION: operator MANUAL_RECON fires keep their given txn_date.
+    const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''));
+    for (const t of (bandLawApplies ? txnsClean : [])) {
       if (!t.receivedTimestamp) continue;
       const suf = appendSuf(t.transactionId, channel);
       if (!suf) continue;

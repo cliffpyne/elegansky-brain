@@ -215,7 +215,9 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
       // must complete its own band's ledger — the old fireTxnDate
       // precedence dumped prior-band APRUNA money into the rescue day.
       // Same-band rows are unaffected (rowTxnDate === fireTxnDate).
-      const postDate = (rowTxnDate && fireTxnDate && rowTxnDate < fireTxnDate)
+      // EXCEPTION: operator MANUAL_RECON fires keep their given date.
+      const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''));
+      const postDate = (bandLawApplies && rowTxnDate && fireTxnDate && rowTxnDate < fireTxnDate)
         ? rowTxnDate
         : (fireTxnDate || rowTxnDate);
       const body = {
