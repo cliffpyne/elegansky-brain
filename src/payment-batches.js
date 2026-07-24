@@ -6329,6 +6329,12 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   // is DATA-driven (physical day < as_of), not fire-type driven.
   let replayTxnDateByRef = null;
   try {
+    // EMERGENCY BRAKE (Frank 2026-07-24 evening): multi-window sessions void
+    // wide but replay narrow — 244 refs/4.3M orphaned today. Trigger stays
+    // OFF until the session-wide replay redesign lands.
+    if (String(process.env.RETRO_RECONCILE_DISABLED || '').toLowerCase() === 'true') {
+      throw Object.assign(new Error('retro-reconcile disabled by env'), { _disabled: true });
+    }
     const { reconcileCustomer, eatDayOf } = await import('./late-txn-reconciler.js');
     // 2026-07-22 fix: compare against the day the fire is RUNNING, not asOf.
     // Catch-up/heisenberg windows pin asOf to the row's own day, so the old

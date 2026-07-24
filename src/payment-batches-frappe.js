@@ -618,7 +618,8 @@ export async function runSavFrappeUpload({
   // MANUAL_RECON fires are exempt (operator backfills). Replayed refs are
   // re-added to THIS fire; their payments repost on their ORIGINAL day.
   const savReplayDates = new Map(); // suffixed ref -> original posting day
-  if (!dryRun && !/MANUAL_RECON/i.test(String(tickName || ''))) {
+  if (!dryRun && !/MANUAL_RECON/i.test(String(tickName || ''))
+      && String(process.env.RETRO_RECONCILE_DISABLED || '').toLowerCase() !== 'true') {
     try {
       const { reconcileCustomer } = await import('./late-txn-reconciler.js');
       const fireDay = txnDate;
