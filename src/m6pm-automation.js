@@ -2287,6 +2287,115 @@ async function phoneHeartbeatWatcher({ pool }) {
 }
 
 /**
+ * Kili-day end marker watcher (Frank 2026-07-24).
+ *
+ * Once per day, AFTER kili1615's savcom-post-tick completes for both SAV
+ * channels, paint a YELLOW background line on all 4 sheets (NMB PASSED,
+ * CRDB PASSED, SAV NMB PASSED_SAV_NMB, SAV CRDB PASSED_SAV) at the LAST
+ * row whose bank timestamp is in [prev-day 16:16 EAT → today 16:15 EAT].
+ * Text "kili day <YYYY-MM-DD> done" written on col L (SAV) or col K (QB).
+ *
+ * Idempotent via app_settings.kili_day_marker_painted:<ymd>. Cheap check
+ * (one SELECT) if already done; skips.
+ */
+const KILI_MARKER_YELLOW = { red: 1.0, green: 0.85, blue: 0.2 };
+const KILI_MARKER_SHEETS = [
+  { label: 'NMB main',  sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED',         textCol: 'K' },
+  { label: 'CRDB main', sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED',         textCol: 'K' },
+  { label: 'SAV NMB',   sheetId: '1YchOygtfVyVNgz37sGX_KKud_Wr9KQsIkQKn_tEdbek', tab: 'PASSED_SAV_NMB', textCol: 'L' },
+  { label: 'SAV CRDB',  sheetId: '1rdSRNLdZPT5xXLRgV7wSn1beYwWZp41ZpYoLkbGmt0o', tab: 'PASSED_SAV',     textCol: 'L' },
+];
+function parseKiliSheetTs(s) {
+  if (!s) return null;
+  s = String(s).trim();
+  const m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/);
+  if (m) return new Date(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}T${m[4].padStart(2,'0')}:${m[5].padStart(2,'0')}:${m[6].padStart(2,'0')}+03:00`);
+  const d = new Date(s); return isFinite(d) ? d : null;
+}
+async function kiliDayEndMarkerWatcher({ pool }) {
+  const ymd = todayYmdEat();
+  const gateKey = `kili_day_marker_painted:${ymd}`;
+  const gate = await pool.query('SELECT value FROM app_settings WHERE key=$1', [gateKey]);
+  if (gate.rows[0]?.value === 'done') return;
+  // Only fire after kili1615 savcom-post-tick has completed for both channels
+  const kili = await pool.query('SELECT value FROM app_settings WHERE key=$1', [`savcom_post_tick:${ymd}:kili1615`]);
+  if (!kili.rows.length) return;
+  let kiliValue; try { kiliValue = JSON.parse(kili.rows[0].value || '{}'); } catch { return; }
+  if (!kiliValue.sav_nmb || !kiliValue.sav_crdb) return;
+  // Atomic claim
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ($1, 'painting')
+       ON CONFLICT (key) DO UPDATE SET value='painting', updated_at=now()
+       WHERE app_settings.value != 'done'`,
+    [gateKey],
+  );
+  try {
+    const { google } = await import('googleapis');
+    const { readSheet } = await import('./sheets.js');
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheetsApi = google.sheets({ version: 'v4', auth: await auth.getClient() });
+    // Window: yesterday 16:16 EAT → today 16:15 EAT (UTC = EAT - 3h)
+    const from = new Date(ymd + 'T00:00:00Z');
+    from.setUTCDate(from.getUTCDate() - 1);
+    from.setUTCHours(13, 16, 0, 0); // 16:16 EAT yesterday
+    const to = new Date(ymd + 'T13:15:00Z'); // 16:15 EAT today
+    const markerText = `kili day ${ymd} done`;
+    const results = [];
+    for (const s of KILI_MARKER_SHEETS) {
+      try {
+        const d = await readSheet(s.sheetId, `${s.tab}!A1:L200000`);
+        const rows = d.values || d.data || [];
+        let lastRow = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const b = String(rows[i]?.[1] || '').trim();
+          if (!b) continue;
+          const t = parseKiliSheetTs(b);
+          if (!t) continue;
+          if (t >= from && t <= to) lastRow = i + 1;
+        }
+        if (!lastRow) { results.push(`${s.label}=no-window-rows`); continue; }
+        const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: s.sheetId, fields: 'sheets.properties' });
+        const tabMeta = (meta.data.sheets || []).find(x => x.properties?.title === s.tab);
+        if (!tabMeta) { results.push(`${s.label}=tab-not-found`); continue; }
+        const numericSheetId = tabMeta.properties.sheetId;
+        await sheetsApi.spreadsheets.batchUpdate({
+          spreadsheetId: s.sheetId,
+          requestBody: {
+            requests: [
+              // Yellow background A..L
+              { repeatCell: { range: { sheetId: numericSheetId, startRowIndex: lastRow - 1, endRowIndex: lastRow, startColumnIndex: 0, endColumnIndex: 12 },
+                              cell: { userEnteredFormat: { backgroundColor: KILI_MARKER_YELLOW } }, fields: 'userEnteredFormat.backgroundColor' } },
+              // Text in K or L
+              { updateCells: {
+                  rows: [{ values: [{ userEnteredValue: { stringValue: markerText } }] }],
+                  fields: 'userEnteredValue',
+                  start: { sheetId: numericSheetId, rowIndex: lastRow - 1, columnIndex: s.textCol === 'L' ? 11 : 10 },
+              } },
+            ],
+          },
+        });
+        results.push(`${s.label}=row${lastRow}`);
+      } catch (e) {
+        results.push(`${s.label}=ERR:${e.message.slice(0, 60)}`);
+      }
+    }
+    await pool.query(
+      `UPDATE app_settings SET value='done', updated_at=now() WHERE key=$1`,
+      [gateKey],
+    );
+    console.log(`[kili-day-marker] painted for ${ymd}: ${results.join(', ')}`);
+  } catch (err) {
+    console.error('[kili-day-marker] paint failed:', err.message);
+    // Roll back gate so a retry can pick it up
+    await pool.query(`DELETE FROM app_settings WHERE key=$1 AND value='painting'`, [gateKey]);
+    throw err;
+  }
+}
+
+/**
  * Start all four watchers on BRAIN boot. Each runs every 60s. They're
  * best-effort — exceptions are caught and logged so a watcher hiccup
  * never crashes BRAIN.
@@ -2652,6 +2761,8 @@ export function startM6pmWatchers({ pool, sharedSecret, brainBase }) {
       catch (err) { console.error('[m6pm/scraper-retry watcher]', err.message); }
       try { await savcomPostTickWatcher({ pool, brainSelfBase: brainBase }); }
       catch (err) { console.error('[savcom/post-tick watcher]', err.message); }
+      try { await kiliDayEndMarkerWatcher({ pool }); }
+      catch (err) { console.error('[kili-day-marker watcher]', err.message); }
       // savcomMorningAutoFireWatcher RETIRED (Frank 2026-07-22): ESTHER
       // SAVCOM is now fully inside the main QB-style pipeline — her per-
       // invoice Frappe rows flow through /arrears into the morning debt
