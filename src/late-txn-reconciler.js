@@ -104,7 +104,9 @@ export function eatDayOf(input) {
  */
 export async function findAffectedPayments({ customerId, sinceDay, customerName }) {
   const params = [];
-  const where = [`pu.status = 'created'`];
+  // 2026-07-24 (Frank: "the whole books need retro"): include SAV/Frappe
+  // pushes — their live status is 'pushed_to_frappe', not 'created'.
+  const where = [`pu.status IN ('created','pushed_to_frappe')`];
   if (customerId) {
     params.push(customerId);
     where.push(`pu.customer_id = $${params.length}`);
@@ -137,8 +139,12 @@ export async function voidOne(pu) {
   const isFrappe = /sav_|frappe|apruna/i.test(String(pu.channel || ''));
   try {
     if (isFrappe) {
-      // Frappe expects the ORIGINAL bank txn id (bare, no channel suffix)
-      const txnId = String(pu.bank_ref || '').replace(/[NBP]$/, '');
+      // SAV pipeline ingests with txn_id = <suffixed_ref> + 'V'
+      // (FRAPPE_TXN_MARKER); apruna diverts ingest with the BARE ref.
+      const isSav = /^sav_/i.test(String(pu.channel || ''));
+      const txnId = isSav
+        ? String(pu.bank_ref || '') + 'V'
+        : String(pu.bank_ref || '').replace(/(NS|CS|[NBP])$/, '');
       const r = await reversePayment(txnId);
       return { ok: true, kind: 'frappe_reverse', pu_id: pu.id, txn_id: txnId, response: r };
     }

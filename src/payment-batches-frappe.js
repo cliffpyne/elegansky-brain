@@ -612,6 +612,76 @@ export async function runSavFrappeUpload({
     return { skipped: true, reason: 'all refs already consumed', sheet_diagnostics: diagnostics };
   }
 
+  // 2b. RETRO-RECONCILE (Frank 2026-07-24: "strictly the whole books").
+  // Mirrors the QB path: late txns whose customer already has downstream
+  // payments get void-and-replay so allocation order stays chronological.
+  // MANUAL_RECON fires are exempt (operator backfills). Replayed refs are
+  // re-added to THIS fire; their payments repost on their ORIGINAL day.
+  const savReplayDates = new Map(); // suffixed ref -> original posting day
+  if (!dryRun && !/MANUAL_RECON/i.test(String(tickName || ''))) {
+    try {
+      const { reconcileCustomer } = await import('./late-txn-reconciler.js');
+      const fireDay = txnDate;
+      const lateByCustomer = new Map();
+      for (const t of txnsClean) {
+        if (!t.receivedTimestamp) continue;
+        const ownDay = daysFromTs(t.receivedTimestamp).txnDate;
+        if (!ownDay || ownDay >= fireDay) continue;
+        const name = t._resolvedName || t.customerName || null;
+        if (!name) continue;
+        const cur = lateByCustomer.get(name);
+        if (!cur || ownDay < cur) lateByCustomer.set(name, ownDay);
+      }
+      if (lateByCustomer.size > 0) {
+        const names = [...lateByCustomer.keys()];
+        const q = await db().query(
+          `SELECT customer_name, max((created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date::text) AS max_day
+             FROM payment_uploads
+            WHERE status IN ('created','pushed_to_frappe') AND customer_name = ANY($1::text[])
+            GROUP BY customer_name`, [names]);
+        const maxBy = new Map(q.rows.map((r) => [r.customer_name, r.max_day]));
+        const toRec = names.filter((n) => (maxBy.get(n) || '') > lateByCustomer.get(n));
+        if (toRec.length) console.log(`[sav-retro] ${toRec.length}/${lateByCustomer.size} late-txn customer(s) have downstream payments to reverse (fireDay=${fireDay})`);
+        const released = new Set();
+        for (const name of toRec) {
+          try {
+            const r = await reconcileCustomer({ customerName: name, sinceDay: lateByCustomer.get(name), dryRun: false });
+            const ok = (r.void_results || []).filter((v) => v.ok).length;
+            for (const ref of r.ready_to_replay_refs || []) released.add(ref);
+            console.log(`[sav-retro] ${name} since ${lateByCustomer.get(name)}: reversed=${ok} failed=${r.void_failures?.length || 0} replay_refs=${(r.ready_to_replay_refs || []).length}`);
+          } catch (err) {
+            console.error(`[sav-retro] failed for ${name}: ${err.message}`);
+          }
+        }
+        if (released.size) {
+          const dq = await db().query(
+            `SELECT v.bank_ref, min(b.txn_date::date)::text AS orig
+               FROM payment_uploads v JOIN payment_batches b ON b.id = v.batch_id
+              WHERE v.bank_ref = ANY($1::text[]) AND v.status = 'voided'
+              GROUP BY v.bank_ref`, [[...released]]);
+          for (const row of dq.rows) savReplayDates.set(row.bank_ref, row.orig);
+          const inClean = new Set(txnsClean.map((t) => appendSavSuffix(t.transactionId, channel)));
+          const readd = txns.filter((t) => {
+            const suf = appendSavSuffix(t.transactionId, channel);
+            return released.has(suf) && !inClean.has(suf);
+          });
+          if (readd.length) {
+            txnsClean = txns.filter((t) => {
+              const suf = appendSavSuffix(t.transactionId, channel);
+              return inClean.has(suf) || released.has(suf);
+            });
+            console.log(`[sav-retro] re-added ${readd.length} released row(s) for same-fire replay`);
+          }
+          const inWindow = new Set(txns.map((t) => appendSavSuffix(t.transactionId, channel)));
+          const orphans = [...released].filter((r) => !inWindow.has(r));
+          if (orphans.length) console.error(`[sav-retro] REPLAY ORPHANS outside window: ${orphans.join(',')}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[sav-retro] pre-flight failed (non-fatal): ${err.message}`);
+    }
+  }
+
   // 3. Resolve each txn's customer via savcom-resolver (covers all 292).
   let resolvedCount = 0;
   let notYetInFrappeCount = 0;
@@ -919,6 +989,8 @@ export async function runSavFrappeUpload({
   if (bandByRef.size > 0) {
     console.log(`[sav-frappe band-law] ${bandByRef.size} prior-band ref(s) post on their own kili day`);
   }
+  // Replayed (reversed-and-reposted) refs keep their ORIGINAL posting day.
+  for (const [ref, orig] of savReplayDates.entries()) bandByRef.set(ref, orig);
   const bandDateFor = (ref) => bandByRef.get(ref) || txnDate;
 
   const frappeResults = [];
