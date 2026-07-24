@@ -627,7 +627,7 @@ export async function runSavFrappeUpload({
         if (!t.receivedTimestamp) continue;
         const ownDay = daysFromTs(t.receivedTimestamp).txnDate;
         if (!ownDay || ownDay >= fireDay) continue;
-        const name = t._resolvedName || t.customerName || null;
+        const name = t.contractName || null;
         if (!name) continue;
         const cur = lateByCustomer.get(name);
         if (!cur || ownDay < cur) lateByCustomer.set(name, ownDay);
