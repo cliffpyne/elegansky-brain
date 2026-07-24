@@ -219,8 +219,10 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
       // POSITION RULE (Frank 2026-07-24): only rows AT/BELOW the last K
       // marker (old-band strandlings) post on their own kili day; rows in
       // the current band — retro arrivals included — post on the fire day.
+      const prevBandDay = (() => { const d = new Date(String(fireTxnDate || rowTxnDate) + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
+      const belowMarker = maxKRow > 0 && t.sheet_row_number && t.sheet_row_number <= maxKRow;
       const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''))
-        && maxKRow > 0 && t.sheet_row_number && t.sheet_row_number <= maxKRow;
+        && (belowMarker || rowTxnDate === prevBandDay);
       const postDate = (bandLawApplies && rowTxnDate && fireTxnDate && rowTxnDate < fireTxnDate)
         ? rowTxnDate
         : (fireTxnDate || rowTxnDate);

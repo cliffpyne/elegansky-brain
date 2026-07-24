@@ -978,9 +978,12 @@ export async function runSavFrappeUpload({
   // retro arrivals included — post on the fire day.
   const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ""));
   const savMaxK = Number(diagnostics?.max_k_row || 0);
+  const prevBandDay = (() => { const d = new Date(String(txnDate) + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
   for (const t of (bandLawApplies ? txnsClean : [])) {
     if (!t.receivedTimestamp) continue;
-    if (!savMaxK || !t.sheet_row_number || t.sheet_row_number > savMaxK) continue;
+    const ownBandDay = daysFromTs(t.receivedTimestamp).txnDate;
+    const inBand = !savMaxK || !t.sheet_row_number || t.sheet_row_number > savMaxK;
+    if (inBand && ownBandDay !== prevBandDay) continue;
     const suf = appendSavSuffix(t.transactionId, channel);
     if (!suf) continue;
     const { txnDate: ownBand } = daysFromTs(t.receivedTimestamp);

@@ -6634,9 +6634,16 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     // reconcile handles their voids; as_of stays their own day). Only rows
     // AT/BELOW the marker — strandlings in old band regions — post on
     // their own kili day.
+    // Frank 2026-07-24 (kili-exact): a fire running AFTER the 16:15 cut
+    // must stamp the just-closed band's rows with THEIR band day — only
+    // DEEP retro arrivals (older than the previous band) in the current
+    // band region take the firing day.
+    const prevBandDay = (() => { const d = new Date(String(txnDate) + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
     for (const t of (bandLawApplies ? txnsClean : [])) {
       if (!t.receivedTimestamp) continue;
-      if (!maxKRow || !t.sheet_row_number || t.sheet_row_number > maxKRow) continue; // in-band → today
+      const ownKili = kiliBusinessDayFromUtcMs(new Date(t.receivedTimestamp).getTime());
+      const inBand = !maxKRow || !t.sheet_row_number || t.sheet_row_number > maxKRow;
+      if (inBand && ownKili !== prevBandDay) continue; // in-band deep retro → firing day
       const suf = appendSuf(t.transactionId, channel);
       if (!suf) continue;
       if (replayTxnDateByRef && replayTxnDateByRef[suf]) continue; // replay original date wins
