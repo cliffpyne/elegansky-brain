@@ -2317,11 +2317,15 @@ async function kiliDayEndMarkerWatcher({ pool }) {
   const gateKey = `kili_day_marker_painted:${ymd}`;
   const gate = await pool.query('SELECT value FROM app_settings WHERE key=$1', [gateKey]);
   if (gate.rows[0]?.value === 'done') return;
-  // Only fire after kili1615 savcom-post-tick has completed for both channels
+  // Only fire after kili1615 savcom-post-tick has completed for both channels.
+  // NB (Frank 2026-07-24): the value can exceed the JSON parser's practical
+  // limit because paid_sample / frappe_results arrays balloon on busy ticks.
+  // Substring check on the two channel keys is enough — we only need to know
+  // both fired; we don't consume any nested data below.
   const kili = await pool.query('SELECT value FROM app_settings WHERE key=$1', [`savcom_post_tick:${ymd}:kili1615`]);
   if (!kili.rows.length) return;
-  let kiliValue; try { kiliValue = JSON.parse(kili.rows[0].value || '{}'); } catch { return; }
-  if (!kiliValue.sav_nmb || !kiliValue.sav_crdb) return;
+  const raw = String(kili.rows[0].value || '');
+  if (!raw.includes('"sav_nmb"') || !raw.includes('"sav_crdb"')) return;
   // Atomic claim
   await pool.query(
     `INSERT INTO app_settings (key, value) VALUES ($1, 'painting')
