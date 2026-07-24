@@ -239,7 +239,22 @@ async function readSavSheetWindow({ channel, sinceIso, untilIso, forceSkipMaxKRo
         (pushed.startsWith('Frappe pushed') || pushed.startsWith('Frappe pending') || pushed.startsWith('QB pushed'))
         && !pushed.includes('(DRY_RUN)')
       ) ? pushed : '';
-      if (fetchedReal || pushedReal) { skippedAlreadyPushed++; continue; }
+      if (fetchedReal || pushedReal) {
+        // Frank 2026-07-24: paint is NOT blind truth — the sheet writer has
+        // copied/forged I-K paint onto rows BRAIN never touched (ADAM
+        // FADHILI's 12,500 sat "Frappe pushed" for a payment that never
+        // existed). Only FRESH paint (<60 min) skips — that's the in-flight
+        // race window. Older paint falls through: the consumed filter,
+        // Frappe txn_id idempotency and the QB dup check make re-inclusion
+        // safe, and genuinely stranded rows finally get swept.
+        let fresh = false;
+        const fm = (fetchedReal || '').match(/Fetched at:\s*([0-9TZ:.\-]+)/);
+        if (fm) {
+          const t = Date.parse(fm[1]);
+          if (t && (Date.now() - t) < 60 * 60_000) fresh = true;
+        }
+        if (fresh) { skippedAlreadyPushed++; continue; }
+      }
     }
 
     const dCell = String(sheet[i][1] || '').trim();
@@ -1108,24 +1123,17 @@ export function mountSavFrappeApi(app, { requireSecretOrJwt }) {
         });
       }
 
-      // Default window — "from latest consumed ref's sheet-time" — matches
-      // the QB path's fallback so heisenberg + tick fires behave identically.
+      // Default window (Frank 2026-07-24, "no row left behind"): a fixed
+      // 72-hour lookback, NOT "from latest consumed sheet-time". The
+      // rolling from-last-consumed window permanently skipped any row
+      // appended late with an earlier timestamp (the 4×99k + ADAM/EMMANUEL
+      // strandings). Re-scanning 72h every fire is safe: consumed refs are
+      // filtered, Frappe ingest is idempotent on txn_id, and the band law
+      // dates every straggler by its own kili day.
       let sinceIso = req.body?.since_iso;
       let untilIso = req.body?.until_iso || new Date().toISOString();
       if (!sinceIso) {
-        const r = await db().query(
-          `SELECT MAX(ct.sheet_ts) AS max_ts
-             FROM consumed_transactions ct
-             JOIN payment_batches pb ON pb.id = ct.batch_id
-            WHERE pb.channel = $1`,
-          [channel],
-        );
-        const maxTs = r.rows[0]?.max_ts;
-        if (maxTs) {
-          sinceIso = new Date(new Date(maxTs).getTime() + 1).toISOString();
-        } else {
-          sinceIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-        }
+        sinceIso = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
       }
       const result = await runSavFrappeUpload({
         channel, sinceIso, untilIso,
