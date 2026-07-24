@@ -6373,6 +6373,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     if (toReconcile.length > 0) {
       console.log(`[retro-reconcile] ${toReconcile.length}/${lateByCustomer.size} late-txn customer(s) have downstream payments to void (fireDay=${fireDay}${dryRun ? ', DRY RUN — no voids' : ''})`);
       const replayRefs = new Set();
+      const releasedTs = new Map(); // suffixed ref -> sheet_ts (physical AS_OF source)
       for (const customer of toReconcile) {
         const oldestDay = lateByCustomer.get(customer);
         try {
@@ -6386,55 +6387,47 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
           }
           const okVoids = (r.void_results || []).filter((v) => v.ok).length;
           const failed = r.void_failures?.length || 0;
-          for (const ref of r.ready_to_replay_refs || []) replayRefs.add(ref);
+          for (const ref of r.ready_to_replay_refs || []) {
+            replayRefs.add(ref);
+            if (r.released_sheet_ts && r.released_sheet_ts[ref]) releasedTs.set(ref, r.released_sheet_ts[ref]);
+          }
           console.log(`[retro-reconcile] ${customer} since ${oldestDay}: voided=${okVoids} failed=${failed} consumed_cleared=${r.consumed_rows_deleted} replay_refs=${(r.ready_to_replay_refs || []).length}`);
         } catch (err) {
           console.error(`[retro-reconcile] failed for ${customer}: ${err.message}`);
         }
       }
-      // Same-fire replay (2026-07-23): the refs we just released were
-      // filtered out of txnsClean by the consumed check at selection time.
-      // Re-add their rows NOW so this very fire replays them in sheet
-      // order — "next fire will pick them up" is a lie for old rows, whose
-      // sheet timestamps fall outside every scheduled tick's window (the
-      // noon 07-23 reconciles voided 244k TZS that nothing ever replayed).
+      // REPLAY ENGINE (Frank spec 2026-07-24): session-wide, window-free.
+      // Every released ref replays HERE — chronologically per customer,
+      // AS_OF = its physical sheet day, payment date = its original
+      // kili-adjusted date. No dependence on this fire's windows, so the
+      // void-wide/replay-narrow asymmetry (261 refs / 4.5M orphaned on
+      // 07-24) is structurally impossible.
       if (replayRefs.size > 0) {
-        const cleanKeys = new Set(txnsClean.map((t) => appendSuf(t.transactionId, channel)));
-        const readd = txns.filter((t) => {
-          const suf = appendSuf(t.transactionId, channel);
-          return replayRefs.has(suf) && !cleanKeys.has(suf);
-        });
-        if (readd.length) {
-          txnsClean = txns.filter((t) => {
-            const suf = appendSuf(t.transactionId, channel);
-            return cleanKeys.has(suf) || replayRefs.has(suf);
-          });
-          console.log(`[retro-reconcile] re-added ${readd.length} released row(s) to this fire for same-fire replay`);
-        }
-        const inWindow = new Set(txns.map((t) => appendSuf(t.transactionId, channel)));
-        const orphans = [...replayRefs].filter((r) => !inWindow.has(r));
-        if (orphans.length) {
-          console.error(`[retro-reconcile] REPLAY ORPHANS: ${orphans.length} released ref(s) OUTSIDE this window — fire a manual window covering them or they stay unpaid: ${orphans.join(',')}`);
-        }
-        // Frank 2026-07-23: replayed payments must keep their ORIGINAL
-        // TxnDate — reposting a voided 07-22 payment dated today inflates
-        // today's collections and drains the original day's ledger. Only
-        // the late row itself gets the firing day (e151d0b rule). Map each
-        // released ref to its earliest voided generation's batch txn_date;
-        // the pusher stamps per-ref dates from this map.
         try {
+          const { replayBucket } = await import('./late-txn-reconciler.js');
           const dq = await db().query(
-            `SELECT v.bank_ref, min(b.txn_date::date)::text AS orig
+            `SELECT v.bank_ref, min(b.txn_date::date)::text AS orig,
+                    sum(v.amount)::float AS amount,
+                    max(v.customer_id) AS customer_id, max(v.customer_name) AS customer_name,
+                    max(b.channel) AS channel
                FROM payment_uploads v JOIN payment_batches b ON b.id = v.batch_id
               WHERE v.bank_ref = ANY($1::text[]) AND v.status = 'voided'
               GROUP BY v.bank_ref`,
             [[...replayRefs]],
           );
-          replayTxnDateByRef = {};
-          for (const row of dq.rows) replayTxnDateByRef[row.bank_ref] = row.orig;
-          console.log(`[retro-reconcile] replay TxnDate map: ${dq.rows.map((r) => `${r.bank_ref}→${r.orig}`).join(', ')}`);
+          const items = dq.rows.map((row) => ({
+            bank_ref: row.bank_ref,
+            sheet_ts: releasedTs.get(row.bank_ref) || null,
+            customer_id: row.customer_id, customer_name: row.customer_name,
+            channel: row.channel, amount: row.amount,
+            payment_date: row.orig,
+          })).filter((it) => it.sheet_ts && it.payment_date);
+          const missing = [...replayRefs].filter((ref) => !items.some((it) => it.bank_ref === ref));
+          if (missing.length) console.error(`[retro-reconcile] REPLAY ORPHANS (no sheet_ts/date — manual review): ${missing.join(',')}`);
+          const res = await replayBucket(items, { batchTag: tickName || 'auto' });
+          console.log(`[retro-reconcile] replay engine: replayed=${res.replayed} failed=${res.failed} unapplied=${res.unapplied}`);
         } catch (err) {
-          console.error(`[retro-reconcile] replay TxnDate map failed (replays will use fire txnDate — patch after via /api/admin/patch-batch-txndate): ${err.message}`);
+          console.error(`[retro-reconcile] replay engine failed: ${err.message} — released refs remain mapped; run recovery window`);
         }
       }
     } else if (lateByCustomer.size > 0) {

@@ -118,6 +118,11 @@ export async function findAffectedPayments({ customerId, sinceDay, customerName 
   }
   params.push(sinceDay);
   where.push(`(pu.created_at AT TIME ZONE 'Africa/Dar_es_Salaam')::date > $${params.length}::date`);
+  // Session guard (Frank 2026-07-24): never void a payment pushed in the
+  // last 20 minutes — that's this session's own replay/push work. Without
+  // this, multi-window sessions re-void earlier windows' replays (SULTANI
+  // was reconciled 3× in one session on 07-24).
+  where.push(`pu.created_at < now() - interval '20 minutes'`);
   const q = await db().query(
     `SELECT pu.id, pu.bank_ref, pu.kind, pu.qb_id, pu.amount, pu.invoice_no,
             pu.customer_name, pu.customer_id, pb.channel,
@@ -227,10 +232,16 @@ export async function reconcileCustomer({ customerId, customerName, sinceDay, dr
     if (suffixedRefs.length) {
       const del = await client.query(
         `DELETE FROM consumed_transactions
-          WHERE bank_ref = ANY($1::text[]) OR bank_ref = ANY($2::text[])`,
+          WHERE bank_ref = ANY($1::text[]) OR bank_ref = ANY($2::text[])
+          RETURNING bank_ref, sheet_ts`,
         [bareRefs, suffixedRefs],
       );
       out.consumed_rows_deleted = del.rowCount || 0;
+      // Preserve each released ref's SHEET timestamp — the replay engine
+      // derives AS_OF from the PHYSICAL day (sheet ts), never from the
+      // kili payment date (Frank's dual-date law, 2026-07-24).
+      out.released_sheet_ts = {};
+      for (const row of del.rows) out.released_sheet_ts[row.bank_ref] = row.sheet_ts;
     }
     if (puIds.length) {
       await client.query(
@@ -284,4 +295,147 @@ export function mountLateTxnReconcilerApi(app, { requireSecretOrJwt }) {
       res.status(500).json({ error: err.message });
     }
   });
+}
+
+// ─── REPLAY ENGINE (Frank spec, 2026-07-24 — the dual-date chronological replay) ───
+//
+// Input: released refs with their sheet timestamps + original payment dates.
+// For each customer, payments replay in strict sheet-time order:
+//   - AS_OF        = the payment's PHYSICAL day (EAT day of its sheet ts) —
+//                    NEVER derived from the payment date.
+//   - Payment date = its ORIGINAL kili-adjusted date, unchanged.
+//   - Allocation   = live open invoices, sacred walk: due-today (as_of) →
+//                    arrears ASC → forward ASC. Partial fills stay open for
+//                    the next payment; leftover money spills forward.
+//   - Remainder with no open invoice → unapplied payment (existing rule).
+// Every replay is recorded in payment_uploads + consumed_transactions under
+// a dedicated retro-replay batch so dedup holds forever.
+const REPLAY_DEPOSIT_ACCT = process.env.QB_DEFAULT_DEPOSIT_ACCT_ID || '785';
+
+function eatPhysicalDay(ts) {
+  const d = ts instanceof Date ? ts : new Date(ts);
+  return new Date(d.getTime() + 3 * 3600_000).toISOString().slice(0, 10);
+}
+
+async function qbOpenInvoices(customerId) {
+  const r = await qbQuery(
+    `SELECT Id, Balance, DueDate FROM Invoice WHERE CustomerRef = '${customerId}' AND Balance > '0' MAXRESULTS 1000`,
+  );
+  return (r.QueryResponse?.Invoice || []).map((iv) => ({
+    id: String(iv.Id), balance: Number(iv.Balance || 0), due: String(iv.DueDate || ''),
+  }));
+}
+
+function sacredWalk(invoices, asOfDay) {
+  const today = invoices.filter((iv) => iv.due === asOfDay).sort((a, b) => a.id.localeCompare(b.id));
+  const arrears = invoices.filter((iv) => iv.due < asOfDay).sort((a, b) => a.due.localeCompare(b.due) || a.id.localeCompare(b.id));
+  const forward = invoices.filter((iv) => iv.due > asOfDay).sort((a, b) => a.due.localeCompare(b.due) || a.id.localeCompare(b.id));
+  return [...today, ...arrears, ...forward];
+}
+
+/**
+ * replayBucket(items, { batchTag }) — items: [{ bank_ref, sheet_ts,
+ * customer_id, customer_name, channel, amount, payment_date }]
+ * Returns { replayed, failed, unapplied, details }.
+ */
+export async function replayBucket(items, { batchTag = 'retro-replay' } = {}) {
+  const out = { replayed: 0, failed: 0, unapplied: 0, details: [] };
+  if (!items || !items.length) return out;
+
+  // one batch row per engine invocation
+  const idem = `retro-replay-${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8)}`;
+  const ins = await db().query(
+    `INSERT INTO payment_batches (idempotency_key, status, sheet_id, sheet_tab, channel, bank_refs,
+       sheet_total, paid_total, unused_total, paid_count, unused_count, created_by, txn_date)
+     VALUES ($1,'pending','','','retro_replay',ARRAY[]::text[],0,0,0,0,0,$2,now()::date) RETURNING id`,
+    [idem, `retro-replay:${batchTag}`],
+  );
+  const batchId = ins.rows[0].id;
+
+  // group by customer, replay chronologically inside each
+  const byCustomer = new Map();
+  for (const it of items) {
+    const k = it.customer_id || it.customer_name;
+    if (!byCustomer.has(k)) byCustomer.set(k, []);
+    byCustomer.get(k).push(it);
+  }
+  let paidTotal = 0, paidCount = 0;
+  for (const [, list] of byCustomer.entries()) {
+    list.sort((a, b) => new Date(a.sheet_ts).getTime() - new Date(b.sheet_ts).getTime());
+    for (const it of list) {
+      const asOf = eatPhysicalDay(it.sheet_ts);
+      const payDate = it.payment_date;
+      if (/sav_|frappe|apruna/i.test(String(it.channel || ''))) {
+        out.failed++; out.details.push({ ref: it.bank_ref, error: 'frappe-channel — QB replay path not applicable' });
+        console.error(`[replay-engine] SKIP ${it.bank_ref}: frappe channel '${it.channel}' — SAV replay engine pending`);
+        continue;
+      }
+      if (!it.customer_id || !/^\d+$/.test(String(it.customer_id))) {
+        out.failed++; out.details.push({ ref: it.bank_ref, error: 'no numeric customer_id' });
+        console.error(`[replay-engine] SKIP ${it.bank_ref}: unresolvable customer_id '${it.customer_id}'`);
+        continue;
+      }
+      try {
+        let remain = Number(it.amount);
+        const invoices = sacredWalk(await qbOpenInvoices(it.customer_id), asOf);
+        const made = [];
+        for (const iv of invoices) {
+          if (remain <= 0) break;
+          const alloc = Math.min(remain, iv.balance);
+          if (alloc <= 0) continue;
+          const body = {
+            CustomerRef: { value: String(it.customer_id) }, TotalAmt: alloc,
+            PrivateNote: it.bank_ref, TxnDate: payDate,
+            DepositToAccountRef: { value: REPLAY_DEPOSIT_ACCT },
+            Line: [{ Amount: alloc, LinkedTxn: [{ TxnId: iv.id, TxnType: 'Invoice' }] }],
+          };
+          const json = await qbPost('payment', body);
+          made.push({ qb_id: String(json.Payment?.Id), amount: alloc, invoice: iv.id });
+          remain -= alloc;
+        }
+        if (remain > 0) {
+          const json = await qbPost('payment', {
+            CustomerRef: { value: String(it.customer_id) }, TotalAmt: remain,
+            PrivateNote: it.bank_ref, TxnDate: payDate,
+            DepositToAccountRef: { value: REPLAY_DEPOSIT_ACCT },
+          });
+          made.push({ qb_id: String(json.Payment?.Id), amount: remain, invoice: null });
+          out.unapplied++;
+          remain = 0;
+        }
+        // bookkeeping: uploads + consumed (transactional)
+        const client = await db().connect();
+        try {
+          await client.query('BEGIN');
+          for (const m of made) {
+            await client.query(
+              `INSERT INTO payment_uploads (batch_id, kind, bank_ref, customer_id, customer_name,
+                 invoice_qb_id, amount, memo, qb_id, status)
+               VALUES ($1,'payment',$2,$3,$4,$5,$6,$2,$7,'created')`,
+              [batchId, it.bank_ref, it.customer_id, it.customer_name, m.invoice, m.amount, m.qb_id],
+            );
+          }
+          await client.query(
+            `INSERT INTO consumed_transactions (bank_ref, batch_id, sheet_ts) VALUES ($1,$2,$3)
+             ON CONFLICT DO NOTHING`,
+            [it.bank_ref, batchId, it.sheet_ts],
+          );
+          await client.query('COMMIT');
+        } catch (e2) { await client.query('ROLLBACK'); throw e2; } finally { client.release(); }
+        paidCount += made.length; paidTotal += Number(it.amount);
+        out.replayed++;
+        console.log(`[replay-engine] ${it.bank_ref} ${it.customer_name} ${it.amount} → ${made.length} payment(s), as_of=${asOf}, date=${payDate}`);
+      } catch (err) {
+        out.failed++;
+        out.details.push({ ref: it.bank_ref, error: String(err.message || err).slice(0, 200) });
+        console.error(`[replay-engine] REPLAY FAILURE ${it.bank_ref} ${it.customer_name}: ${err.message}`);
+      }
+    }
+  }
+  await db().query(
+    `UPDATE payment_batches SET status='finalized', finalized_at=now(), paid_count=$2, paid_total=$3 WHERE id=$1`,
+    [batchId, paidCount, paidTotal],
+  );
+  console.log(`[replay-engine] bucket done: replayed=${out.replayed} failed=${out.failed} unapplied=${out.unapplied} batch=${batchId}`);
+  return out;
 }
