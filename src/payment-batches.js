@@ -7059,7 +7059,11 @@ async function runAutoUploadBackground({ batchId, paid, unused, txnDate,
         }
       }
     };
-    await Promise.all(Array.from({ length: CONCURRENCY }, () => sweeper()));
+    // CONCURRENCY was referenced from another function's scope — the
+    // ReferenceError crashed the sweep at the end of large batches and
+    // left them stuck 'pending' (07-21 heisenberg, 07-24 window 5).
+    const SWEEP_CONCURRENCY = 5;
+    await Promise.all(Array.from({ length: SWEEP_CONCURRENCY }, () => sweeper()));
     if (sweepRecovered > 0) {
       await logBatch(batchId, 'info', `sweep ${sweep} recovered ${sweepRecovered} rows, ${failed} still failing`, 'qb-push', { sweep, recovered: sweepRecovered, still_failed: failed });
     }
