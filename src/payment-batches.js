@@ -6198,7 +6198,7 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
     const { divertAprunaTxns } = await import('./apruna-divert.js');
     // Pass the plan-window txnDate so Frappe posting_date matches the row's
     // kili business day (D for sub-window A, D+1 for sub-window B).
-    const divert = await divertAprunaTxns(txns, { channel, sheetId: cfg.sheetId, tab: cfg.tab, tickName, txnDate });
+    const divert = await divertAprunaTxns(txns, { channel, sheetId: cfg.sheetId, tab: cfg.tab, tickName, txnDate, maxKRow });
     if (divert && Array.isArray(divert.qbTxns)) {
       txns.length = 0; txns.push(...divert.qbTxns);
     }
@@ -6628,8 +6628,15 @@ async function prepareAutoUpload({ channel, sinceIso, untilIso, asOf, qbPrefligh
   try {
     // EXCEPTION: operator MANUAL_RECON fires keep their given txn_date.
     const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''));
+    // Frank 2026-07-24 (position rule): the ROW'S POSITION decides, not its
+    // timestamp. Rows ABOVE the last K marker are in the CURRENT drag-drop
+    // band → fire txnDate (today), even old-dated retro arrivals (retro-
+    // reconcile handles their voids; as_of stays their own day). Only rows
+    // AT/BELOW the marker — strandlings in old band regions — post on
+    // their own kili day.
     for (const t of (bandLawApplies ? txnsClean : [])) {
       if (!t.receivedTimestamp) continue;
+      if (!maxKRow || !t.sheet_row_number || t.sheet_row_number > maxKRow) continue; // in-band → today
       const suf = appendSuf(t.transactionId, channel);
       if (!suf) continue;
       if (replayTxnDateByRef && replayTxnDateByRef[suf]) continue; // replay original date wins

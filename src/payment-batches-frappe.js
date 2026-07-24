@@ -903,9 +903,14 @@ export async function runSavFrappeUpload({
   const bandByRef = new Map();
   // EXCEPTION (Frank 2026-07-23 night): operator MANUAL_RECON fires are
   // deliberate backfills — they keep the operator-given txn_date verbatim.
+  // POSITION RULE (Frank 2026-07-24): own-day dating applies ONLY to rows
+  // at/below the last K marker (old-band strandlings); in-band rows —
+  // retro arrivals included — post on the fire day.
   const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ""));
+  const savMaxK = Number(diagnostics?.max_k_row || 0);
   for (const t of (bandLawApplies ? txnsClean : [])) {
     if (!t.receivedTimestamp) continue;
+    if (!savMaxK || !t.sheet_row_number || t.sheet_row_number > savMaxK) continue;
     const suf = appendSavSuffix(t.transactionId, channel);
     if (!suf) continue;
     const { txnDate: ownBand } = daysFromTs(t.receivedTimestamp);

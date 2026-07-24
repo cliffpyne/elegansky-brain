@@ -133,7 +133,7 @@ async function ensureFrappeBatch(channel, txnDate) {
  * If the feature flag is off, this is a no-op: returns everything as qbTxns.
  * Any per-txn failure logs + falls through to qbTxns (safest default).
  */
-export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, txnDate: fireTxnDate }) {
+export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, txnDate: fireTxnDate, maxKRow = 0 }) {
   if (!isEnabled()) return { qbTxns: txns, aprunaResults: null, skipped: 'flag_off' };
   if (!Array.isArray(txns) || txns.length === 0) return { qbTxns: txns, aprunaResults: null, skipped: 'empty' };
 
@@ -216,7 +216,11 @@ export async function divertAprunaTxns(txns, { channel, sheetId, tab, tickName, 
       // precedence dumped prior-band APRUNA money into the rescue day.
       // Same-band rows are unaffected (rowTxnDate === fireTxnDate).
       // EXCEPTION: operator MANUAL_RECON fires keep their given date.
-      const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''));
+      // POSITION RULE (Frank 2026-07-24): only rows AT/BELOW the last K
+      // marker (old-band strandlings) post on their own kili day; rows in
+      // the current band — retro arrivals included — post on the fire day.
+      const bandLawApplies = !/MANUAL_RECON/i.test(String(tickName || ''))
+        && maxKRow > 0 && t.sheet_row_number && t.sheet_row_number <= maxKRow;
       const postDate = (bandLawApplies && rowTxnDate && fireTxnDate && rowTxnDate < fireTxnDate)
         ? rowTxnDate
         : (fireTxnDate || rowTxnDate);

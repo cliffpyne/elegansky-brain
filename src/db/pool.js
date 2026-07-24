@@ -16,13 +16,18 @@ export function db() {
   _pool = new Pool({
     connectionString: url,
     ssl: { rejectUnauthorized: false }, // Supabase requires TLS
-    // 4 was too small once the CDC poller + snapshot refresher run
-    // alongside report endpoints + the agent. Healthcheck would hang
-    // waiting for a connection while CDC held one for >60s, and
-    // Render would restart the dyno. 10 leaves headroom even under
-    // backfill + CDC + reporting concurrency.
-    max: 10,
+    // Frank 2026-07-15: bumped max 10→30 + added statement_timeout=5min after
+    // kili1615 batch orchestrator died at Postgres default timeout while
+    // dashboard requests starved on the small pool. Root cause is a slow
+    // arrears query on qb_invoices (needs index) — mitigation is bigger pool
+    // + longer per-query budget so orchestrator finishes without competing
+    // with API endpoints for slots.
+    max: 30,
     idleTimeoutMillis: 30_000,
+    // Per-session statement_timeout applies to every query on every checked-out
+    // connection — including the async runners. Postgres kills any query
+    // exceeding this. 5 min is enough for full arrears + preflight passes.
+    statement_timeout: 300_000,
   });
   _pool.on('error', (err) => {
     console.error('[db] pool error', err.message);
